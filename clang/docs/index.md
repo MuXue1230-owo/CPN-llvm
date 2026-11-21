@@ -13,6 +13,7 @@ ReleaseNotes
 UsersManual
 Toolchain
 LanguageExtensions
+CPN26
 ClangCommandLineReference
 AttributeReference
 DiagnosticsReference

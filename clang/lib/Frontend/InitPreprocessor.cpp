@@ -444,6 +444,13 @@ static void InitializeStandardPredefinedMacros(const TargetInfo &TI,
     }
     return;
   }
+  // These identify the experimental CPN frontend bootstrap, not CPN26
+  // conformance. The C++ predefines below describe its current parser baseline.
+  if (LangOpts.CPN) {
+    Builder.defineMacro("__CPN__", "26");
+    Builder.defineMacro("__CPN_BOOTSTRAP__", "1");
+  }
+
   // C++ [cpp.predefined]p1:
   //   The following macro names shall be defined by the implementation:
 

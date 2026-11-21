@@ -1,4 +1,19 @@
-# The LLVM Compiler Infrastructure
+# CPN-llvm
+
+CPN-llvm develops a compiler for the
+[CPN26 language standard](https://github.com/MuXue1230-owo/CPN/tree/CPN26)
+using Clang and LLVM.
+
+The current implementation provides the experimental CPN26 frontend entry:
+`.cpn` input, `-x cpn`, `-std=cpn26`, preprocessing round trips, and native
+object generation for a basic foreign-function subset. It uses Clang's C++26
+parser and lowering as bootstrap infrastructure. Full CPN26 language semantics
+remain under development.
+
+See [CPN26 frontend bootstrap](clang/docs/CPN26.md) for supported commands,
+implementation scope, and the C/C++ interoperability smoke test.
+
+## The LLVM Compiler Infrastructure
 
 [![OpenSSF Scorecard](https://api.securityscorecards.dev/projects/github.com/llvm/llvm-project/badge)](https://securityscorecards.dev/viewer/?uri=github.com/llvm/llvm-project)
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/8273/badge)](https://www.bestpractices.dev/projects/8273)

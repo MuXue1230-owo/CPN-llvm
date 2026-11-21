@@ -111,6 +111,7 @@ void LangOptions::setLangDefaults(LangOptions &Opts, Language Lang,
     LangStd = getDefaultLanguageStandard(Lang, T);
   const LangStandard &Std = LangStandard::getLangStandardForKind(LangStd);
   Opts.LangStd = LangStd;
+  Opts.CPN = Lang == Language::CPN;
   Opts.LineComment = Std.hasLineComments();
   Opts.C99 = Std.isC99();
   Opts.C11 = Std.isC11();

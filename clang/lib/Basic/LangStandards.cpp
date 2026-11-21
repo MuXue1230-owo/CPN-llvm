@@ -27,6 +27,8 @@ StringRef clang::languageToString(Language L) {
     return "C";
   case Language::CXX:
     return "C++";
+  case Language::CPN:
+    return "CPN";
   case Language::ObjC:
     return "Objective-C";
   case Language::ObjCXX:
@@ -117,6 +119,8 @@ LangStandard::Kind clang::getDefaultLanguageStandard(clang::Language Lang,
     return LangStandard::lang_gnucxx17;
   case Language::HLSL:
     return LangStandard::lang_hlsl2021;
+  case Language::CPN:
+    return LangStandard::lang_cpn26;
   }
   llvm_unreachable("unhandled Language kind!");
 }

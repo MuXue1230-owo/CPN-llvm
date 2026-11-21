@@ -155,6 +155,7 @@ bool types::isAcceptedByClang(ID Id) {
   case TY_HIP_DEVICE:
   case TY_ObjC: case TY_PP_ObjC: case TY_PP_ObjC_Alias:
   case TY_CXX: case TY_PP_CXX:
+  case TY_CPN: case TY_PP_CPN:
   case TY_ObjCXX: case TY_PP_ObjCXX: case TY_PP_ObjCXX_Alias:
   case TY_CHeader: case TY_PP_CHeader:
   case TY_CLHeader:
@@ -217,6 +218,8 @@ bool types::isDerivedFromC(ID Id) {
   case TY_ObjC:
   case TY_PP_CXX:
   case TY_CXX:
+  case TY_PP_CPN:
+  case TY_CPN:
   case TY_PP_ObjCXX:
   case TY_PP_ObjCXX_Alias:
   case TY_ObjCXX:
@@ -267,6 +270,8 @@ bool types::isCXX(ID Id) {
   default:
     return false;
 
+  // CPN currently uses C++ frontend defaults for its bootstrap implementation.
+  case TY_CPN: case TY_PP_CPN:
   case TY_CXX: case TY_PP_CXX:
   case TY_ObjCXX: case TY_PP_ObjCXX: case TY_PP_ObjCXX_Alias:
   case TY_CXXHeader: case TY_PP_CXXHeader:
@@ -288,6 +293,8 @@ bool types::isCXX(ID Id) {
     return true;
   }
 }
+
+bool types::isCPN(ID Id) { return Id == TY_CPN || Id == TY_PP_CPN; }
 
 bool types::isLLVMIR(ID Id) {
   switch (Id) {
@@ -366,6 +373,8 @@ types::ID types::lookupTypeForExtension(llvm::StringRef Ext) {
       .Case("ast", TY_AST)
       .Case("ccm", TY_CXXModule)
       .Case("cpp", TY_CXX)
+      .Case("cpn", TY_CPN)
+      .Case("cpni", TY_PP_CPN)
       .Case("CPP", TY_CXX)
       .Case("c++", TY_CXX)
       .Case("C++", TY_CXX)
