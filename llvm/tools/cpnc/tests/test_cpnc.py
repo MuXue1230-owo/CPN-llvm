@@ -376,6 +376,170 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stderr)
 
+    def test_binary_floating_literals_operations_and_native_abi(self):
+        self.assertEqual(
+            self.program(
+                """
+            configuration { preset=Release; numeric.float.formats=[f32,f64]; };
+            extern "C" f32 host(f32 n, f64 k);
+            f32 add(f32 x){return x+0x1.8p+1;}
+            i32 main(){
+                f32 a(16_777_217.0); f32 b(16_777_216.0);
+                f64 c(1.0/8.0);
+                if(a==b && c==1.25e-1 && host(add(4.0),c)==7.125){return 42;}
+                return 1;
+            }
+        """,
+                host="float host(float n,double k){return (float)(n+k);}",
+            ),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+            configuration {numeric.literal.real_rounding=toward_negative_infinity;};
+            f32 signed_literal(){return -1.00000001;}
+            i32 main(){f32 n(signed_literal());if(n < -1.0){return 42;}return 1;}
+        """),
+            42,
+        )
+        for source, msg in [
+            ("void f(){f32 n(0x1.8);}", "binary exponent"),
+            ("void f(){f64 n(1.25e+_2);}", "malformed numeric"),
+            ("void f(){f32 n(1e1000);}", "overflows"),
+            (
+                "configuration {numeric.float.formats=[f64];};void f(){f32 n;}",
+                "disabled",
+            ),
+            ("f32 f(f64 n){return n;}", "lossless"),
+        ]:
+            r = self.compile(source, "--check")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(msg, r.stderr)
+
+    def test_closure_captures_and_mutable_receiver(self):
+        self.assertEqual(
+            self.program("""
+            generic<type F> i32 invoke(F& fn,i32 v){return fn(v);}
+            struct Seed {
+              i32 seed;
+              i32 read() const {
+                auto get([this] i32() {return this->seed;});
+                return get();
+              }
+            };
+            i32 main(){
+                i32 x(4);i32 count;
+                auto fn([x,&count,y(x+1)] i32(i32 n) mutable noexcept {
+                    ++x; ++count; return x+y+n;
+                });
+                x=30;
+                Seed base(7);
+                return invoke(fn,3)+invoke(fn,9)+count+base.read();
+            }
+        """),
+            42,
+        )
+        for source, message in [
+            (
+                "i32 f(){i32 x(2);auto g([] i32(){return x;});return g();}",
+                "unknown name",
+            ),
+            ("void f(){i32 x;auto g([x] void(){++x;});}", "writable lvalue"),
+            ("void f(){i32 a;auto g([a,a] void(){});}", "duplicate closure capture"),
+        ]:
+            r = self.compile(source, "--check")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn(message, r.stderr)
+
+    def test_static_local_initializes_at_startup(self):
+        self.assertEqual(
+            self.program("""
+            i32 calls;
+            i32 start(){++calls;return 19;}
+            i32 next(){static i32 n(start());return ++n;}
+            i32 main(){if(calls!=1){return 1;}return next()+next()+calls;}
+        """),
+            42,
+        )
+        r = self.compile("i32 f(i32 x){static i32 n(x);return n;}", "--check")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("unknown name", r.stderr)
+
+    def test_replacement_destroys_current_type_and_invalidates_old_borrows(self):
+        self.assertEqual(
+            self.program("""
+            i32 log;
+            struct A{i32 n;~A(){log=log*10+n;}};
+            struct B{i32 n;~B(){log=log*10+n+1;}};
+            void work(bool change){
+                A a(4);auto storage(storage_of(a));
+                if(change){destroy(a);construct_at<B>(storage,1);}
+            }
+            i32 main(){work(true);return log;}
+        """),
+            42,
+        )
+        self.assertLess(
+            self.program("""
+            i32 main(){i32 a(1);auto old(&a);auto storage(storage_of(a));
+                destroy(a);construct_at<i32>(storage,42);return *old;}
+        """),
+            0,
+        )
+
+    def test_first_assignment_construction_frontier(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            i32 mark(i32 n, i32 value){trace=trace*10+n;return value;}
+            struct Child {
+                i32 value;
+                Child(){mark(8,0);}
+                Child(i32 n){init value(n);}
+            };
+            struct Pair {
+                Child first; i32 second;
+                Pair(i32 n, bool flag){
+                    init second(mark(3,first.value));
+                    if(flag){this->first=Child(mark(1,n));}
+                    else{first=Child(mark(2,n+1));}
+                    mark(4,0);
+                }
+            };
+            i32 main(){
+                Pair a(20,true); Pair b(21,false);
+                if(trace==134234){return a.second+b.second;}return 1;
+            }
+        """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+            i32 count;
+            i32 next(){return ++count;}
+            struct Item {
+                i32 a; i32 b;
+                Item(i32 n){
+                    init b(next());
+                    for(i32 i; i<n; ++i){a=i;}
+                    a=40;
+                }
+            };
+            i32 main(){Item i(2); return i.a+i.b;}
+        """),
+            41,
+        )
+        for body in [
+            "this->second=2;this->first=1;",
+            "if(flag){second=1;first=2;}else{first=3;second=4;}",
+        ]:
+            r = self.compile(
+                "struct Pair{i32 first;i32 second;Pair(bool flag){" + body + "}};",
+                "--check",
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("initialization frontier", r.stderr)
+
     def test_construction_tail_shares_frontier_and_final_storage(self):
         self.assertEqual(
             self.program("""

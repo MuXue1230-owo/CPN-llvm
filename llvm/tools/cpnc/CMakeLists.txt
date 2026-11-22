@@ -7,8 +7,25 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
             "${CMAKE_CURRENT_SOURCE_DIR}/unicode/ucd17.json.gz"
             "${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc"
     DEPENDS utils/native_ucd.py unicode/ucd17.json.gz VERBATIM)
-  add_llvm_tool(cpnc Driver.cpp Lexer.cpp Parser.cpp Sema.cpp Emit.cpp Integer.cpp Tagged.cpp Binding.cpp Construction.cpp Dispatch.cpp Generic.cpp Lifetime.cpp
-    ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc)
+  add_llvm_tool(cpnc
+    Binding.cpp
+    Closure.cpp
+    Construction.cpp
+    Dispatch.cpp
+    Driver.cpp
+    Emit.cpp
+    Floating.cpp
+    Generic.cpp
+    Integer.cpp
+    Lexer.cpp
+    Lifetime.cpp
+    Parser.cpp
+    Reservations.cpp
+    Sema.cpp
+    Storage.cpp
+    Tagged.cpp
+    ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc
+  )
   target_include_directories(cpnc PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
   if(LLVM_INCLUDE_TESTS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
      CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$" AND NOT CMAKE_CROSSCOMPILING)

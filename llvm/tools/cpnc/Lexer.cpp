@@ -129,11 +129,17 @@ bool cpn::identifier(StringRef S) {
   size_t I = 0;
   return xid(decode(S, I, {}), true);
 }
+bool cpn::floating(StringRef S) { return S == "f32" || S == "f64"; }
+bool cpn::realToken(StringRef S) {
+  return S.contains('.') ||
+         (S.starts_with_insensitive("0x") ? S.contains_insensitive("p")
+                                          : S.contains_insensitive("e"));
+}
 bool cpn::builtin(StringRef S) {
-  return S == "void" || S == "bool" || S == "char" || S == "byte" ||
-         S == "nullptr_t" || S == "isize" || S == "usize" || S == "i8" ||
-         S == "i16" || S == "i32" || S == "i64" || S == "u8" || S == "u16" ||
-         S == "u32" || S == "u64";
+  return floating(S) || S == "void" || S == "bool" || S == "char" ||
+         S == "byte" || S == "nullptr_t" || S == "isize" || S == "usize" ||
+         S == "i8" || S == "i16" || S == "i32" || S == "i64" || S == "u8" ||
+         S == "u16" || S == "u32" || S == "u64";
 }
 std::vector<Token> cpn::lex(StringRef S, const Options &Opt) {
   S.consume_front("\xef\xbb\xbf");
@@ -187,43 +193,74 @@ std::vector<Token> cpn::lex(StringRef S, const Options &Opt) {
     uint32_t C = advance();
     if (C < 128 && llvm::isSpace(char(C)))
       continue;
-    if (xid(C, true) || (C >= '0' && C <= '9')) {
+    if (C >= '0' && C <= '9') {
+      size_t End = Begin;
+      unsigned Base = 10;
+      if (Rest.starts_with_insensitive("0x")) {
+        Base = 16;
+        End += 2;
+      } else if (Rest.starts_with_insensitive("0b")) {
+        Base = 2;
+        End += 2;
+      } else if (Rest.starts_with_insensitive("0o")) {
+        Base = 8;
+        End += 2;
+      }
+      auto sequence = [&](unsigned Radix) {
+        bool Digit = false;
+        while (End < S.size()) {
+          char D = S[End];
+          if (llvm::hexDigitValue(D) < Radix) {
+            Digit = true;
+            ++End;
+          } else if (D == '_' && Digit) {
+            Digit = false;
+            ++End;
+          } else
+            break;
+        }
+        if (!Digit)
+          fail(T, "malformed numeric literal");
+      };
+      sequence(Base);
+      bool Point = false;
+      if ((Base == 10 || Base == 16) && End + 1 < S.size() && S[End] == '.' &&
+          llvm::hexDigitValue(S[End + 1]) < Base) {
+        Point = true;
+        ++End;
+        sequence(Base);
+      }
+      if (End < S.size() &&
+          ((Base == 10 && (S[End] == 'e' || S[End] == 'E')) ||
+           (Base == 16 && (S[End] == 'p' || S[End] == 'P')))) {
+        ++End;
+        if (End < S.size() && (S[End] == '+' || S[End] == '-'))
+          ++End;
+        sequence(10);
+      } else if (Base == 16 && Point)
+        fail(T, "hexadecimal real literal requires a binary exponent");
+      if (End < S.size()) {
+        size_t J = End;
+        if (xid(decode(S, J, T), false))
+          fail(T, "malformed numeric literal");
+      }
+      while (I < End)
+        advance();
+      T.Text = S.slice(Begin, End).str();
+    } else if (xid(C, true)) {
       while (I < S.size()) {
         size_t J = I;
         if (!xid(decode(S, J, T), false))
           break;
         advance();
       }
-      StringRef Word = S.slice(Begin, I);
-      if (C >= '0' && C <= '9') {
-        unsigned Radix = 10;
-        auto Digits = Word;
-        if (Digits.consume_front_insensitive("0x"))
-          Radix = 16;
-        else if (Digits.consume_front_insensitive("0b"))
-          Radix = 2;
-        else if (Digits.consume_front_insensitive("0o"))
-          Radix = 8;
-        bool Previous = false;
-        for (char D : Digits) {
-          if (D == '_' && Previous)
-            Previous = false;
-          else if (llvm::hexDigitValue(D) < Radix)
-            Previous = true;
-          else
-            fail(T, "malformed numeric literal");
-        }
-        if (!Previous)
-          fail(T, "malformed numeric literal");
-        T.Text = Word.str();
-      } else {
-        if (Opt.ASCII &&
-            !llvm::all_of(Word, [](unsigned char D) { return D < 128; }))
-          fail(T, "non-ASCII identifier in ASCII source profile");
-        T.Text = normalize(Word, T);
-        if (T.Text != Word)
-          Opt.warn(T, "identifier spelling is not NFC");
-      }
+      auto Word = S.slice(Begin, I);
+      if (Opt.ASCII &&
+          !llvm::all_of(Word, [](unsigned char D) { return D < 128; }))
+        fail(T, "non-ASCII identifier in ASCII source profile");
+      T.Text = normalize(Word, T);
+      if (T.Text != Word)
+        Opt.warn(T, "identifier spelling is not NFC");
     } else if (C == '"' || C == '\'') {
       bool Closed = false;
       while (I < S.size()) {

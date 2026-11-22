@@ -213,6 +213,38 @@ class Parser {
                is("++") || is("--")) {
       N = Node(Node::Unary, take());
       N.Children.push_back(expr(13, InAngle));
+    } else if (eat("[")) {
+      N = Node(Node::Lambda, T);
+      std::set<std::string> Captures;
+      if (!eat("]")) {
+        do {
+          bool Borrow = eat("&");
+          Token Id = is("this") ? take() : name();
+          Node Capture(Node::Capture, Id);
+          Capture.Type = Borrow              ? "borrow"
+                         : Id.Text == "this" ? "this"
+                                             : "copy";
+          if (Id.Text == "this" && Borrow)
+            fail(Id, "this captures its pointer");
+          if (is("(")) {
+            if (Borrow || Id.Text == "this")
+              fail(Id, "invalid initializer capture");
+            Capture.Type = "initializer";
+            Capture.Children = {condition()};
+          }
+          if (!Captures.insert(Id.Text).second)
+            fail(Id, "duplicate closure capture");
+          N.TemplateArgs.push_back(std::move(Capture));
+        } while (eat(","));
+        expect("]");
+      }
+      if (eat("async"))
+        fail(T, "async closures require asynchronous execution");
+      N.Type = type();
+      N.Params = params();
+      N.Const = !eat("mutable");
+      N.Noexcept = eat("noexcept");
+      N.Children = {block()};
     } else if (eat("configured")) {
       N = Node(Node::Configured, T);
       N.Settings = settings(false);
@@ -230,7 +262,7 @@ class Parser {
         N.Children.push_back(expr());
       expect(")");
     } else if (!T.Text.empty() && llvm::isDigit(T.Text[0]))
-      N = Node(Node::Number, take());
+      N = Node(realToken(T.Text) ? Node::Real : Node::Number, take());
     else if (!T.Text.empty() && (T.Text[0] == '\'' || T.Text[0] == '"'))
       N = Node(T.Text[0] == '\'' ? Node::Character : Node::String, take());
     else if (identifier(T.Text)) {
@@ -361,7 +393,8 @@ class Parser {
     O.Type = std::move(Ty);
     O.Const = RO || CX;
     O.Required = CX;
-    if (is("("))
+    O.HasInitializer = is("(");
+    if (O.HasInitializer)
       O.Children = args();
     if (O.Type == "auto" && O.Children.size() != 1)
       fail(T, "auto requires a single initializer");
@@ -382,6 +415,14 @@ class Parser {
     return known(S);
   }
   Node simple() {
+    if (is("static") || is("thread_local")) {
+      auto Storage = take();
+      auto N = simple();
+      if (N.K != Node::Object)
+        fail(Storage, "storage modifier requires an object declaration");
+      N.Settings["storage"] = Storage.Text;
+      return N;
+    }
     if (is(";"))
       return Node(Node::Empty, take());
     bool RO = is("const") && peek(1).Text != "<";
@@ -945,6 +986,7 @@ void cpn::configure(Options &O, const Node &N) {
     if (V != "Debug" && V != "Release" && V != "MinimalDebug" &&
         V != "MinimalRelease")
       fail(N.At, "unknown preset");
+    O.FPProfile = StringRef(V).ends_with("Debug") ? "strict" : "native";
     O.Overflow = StringRef(V).ends_with("Debug") ? "checked" : "native";
   }
   for (auto &KV : N.Settings) {
@@ -952,6 +994,40 @@ void cpn::configure(Options &O, const Node &N) {
     auto &V = KV.second;
     if (K == "preset")
       continue;
+    if (K == "numeric.literal.real_default") {
+      if (!floating(V))
+        fail(N.At, "unsupported real default");
+      O.DefaultReal = V;
+      continue;
+    }
+    if (K == "numeric.literal.real_rounding") {
+      static const std::set<std::string> Modes = {
+          "nearest_ties_even", "nearest_ties_away", "toward_zero",
+          "toward_positive_infinity", "toward_negative_infinity"};
+      if (!Modes.count(V))
+        fail(N.At, "unsupported literal rounding");
+      O.LiteralRounding = V;
+      continue;
+    }
+    if (K == "numeric.fp.profile") {
+      if (V != "strict" && V != "native")
+        fail(N.At, "unavailable floating profile");
+      O.FPProfile = V;
+      continue;
+    }
+    if (K == "numeric.float.formats") {
+      if (V == "[]")
+        O.FloatFormats.clear();
+      else if (V == "[f32]")
+        O.FloatFormats = {"f32"};
+      else if (V == "[f64]")
+        O.FloatFormats = {"f64"};
+      else if (V == "[f32,f64]" || V == "[f64,f32]")
+        O.FloatFormats = {"f32", "f64"};
+      else
+        fail(N.At, "unsupported floating format list");
+      continue;
+    }
     if (K == "numeric.integer.overflow") {
       if (V != "checked" && V != "native" && V != "wrapping" &&
           V != "saturating")
@@ -961,7 +1037,7 @@ void cpn::configure(Options &O, const Node &N) {
       if (V != "ascii" && V != "unicode")
         fail(N.At, "unknown identifier profile");
       O.ASCII = V == "ascii";
-    } else if (K == "numeric.integer.default") {
+    } else if (K == "numeric.literal.integer_default") {
       if (!builtin(V) || V.empty() || V[0] != 'i')
         fail(N.At, "invalid default integer");
       O.DefaultInt = V;

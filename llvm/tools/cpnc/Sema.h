@@ -10,7 +10,9 @@ struct Value {
   std::string Type;
   llvm::Value *IR = nullptr, *Address = nullptr;
   bool Readonly = false, Expiring = false;
-  std::string Storage;
+  std::string Storage, RealText;
+  llvm::Value *Generation = nullptr;
+  bool BaseView = false;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
         bool RO = false)
@@ -62,6 +64,8 @@ struct Context {
   std::map<std::string, std::string> Aliases, Enums;
   std::map<std::string, Record> Records;
   std::map<std::string, Value> Globals;
+  std::map<std::string, llvm::Function *> CleanupEntries;
+  llvm::Function *cleanupEntry(const std::string &);
   std::map<std::string, Case> Cases;
   std::map<std::string, std::vector<std::string>> Variants;
   std::map<std::string, std::string> DefaultCase;
@@ -118,7 +122,12 @@ public:
   std::vector<Local> Scopes;
   std::vector<Loop> Loops;
   std::vector<Value> Temps;
-  std::map<std::string, bool> Active;
+  std::map<std::string, int> Active;
+  struct Registration {
+    llvm::Value *Stamp, *Destructor;
+  };
+  bool TracksStorage = false;
+  std::map<std::string, Registration> Registrations;
   std::map<std::string, Value> Extents;
   std::string StatementLabel;
   std::map<std::string, llvm::BasicBlock *> Labels;
@@ -146,6 +155,10 @@ public:
   Value boolean(const Node &);
   Value eval(const Node &, std::string Expected = "");
   Value constantEval(const Node &);
+  Value floatingConvert(Value, const std::string &, const Token &,
+                        bool Explicit = false);
+  Value floatingBinary(const Node &, Value, Value,
+                       const std::string &Expected = "");
   Value place(const Node &);
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
@@ -162,10 +175,20 @@ public:
   void stmt(const Node &);
   void object(const Node &, bool Global = false);
   void drop(Value);
+  void track(Value &);
+  void ensureLive(const Value &, const Token &);
+  void replaceGeneration(const Value &, const std::string &, const Token &);
+  void retireStorage(const Value &, bool);
+  void forgetStorage();
+  void joinStorage(const std::map<std::string, int> &);
+  static bool usesStorage(const Node &);
   void cleanup(size_t);
   void endExpression(size_t From = 0);
   void consume(Value);
   bool adjust(Value &, const std::string &, const Token &, bool Emit = true);
+  Value closure(const Node &);
+  Value callClosure(Value, const std::vector<Node> &, const Token &);
+  void bindCaptures();
   Value indirect(Value, const std::vector<Node> &, const Token &);
   void guard(llvm::Value *);
   void branch(llvm::BasicBlock *);
@@ -188,6 +211,13 @@ class Construction {
   std::map<Function *, Frame *> Activations;
   std::vector<std::string> Order;
   size_t Frontier = 0;
+  std::set<size_t> Alternatives;
+  std::set<std::string> Reserved;
+  llvm::Value *Cursor = nullptr;
+  const Node *OrdinaryAssignment = nullptr;
+  void findReservations(Frame &);
+  void atEachPosition(Frame &, const std::function<void()> &);
+  void publish(Frame &);
   void advance(Frame &);
   void enter(Frame &, size_t);
 
@@ -195,7 +225,12 @@ public:
   Construction(Frame &, Function &, Value, const Node *, Frame *);
   void run(Frame &);
   void delegate(Frame &, const Node &);
-  bool pending(const std::string &) const;
+  using Positions = std::set<size_t>;
+  Positions positions() const;
+  void restore(const Positions &);
+  Positions loopPositions(const Node &) const;
+  void checkAccess(Frame &, const Token &) const;
+  std::optional<Value> firstWrite(Frame &, const Node &);
   bool needsDelegate(const Frame &) const;
 };
 } // namespace cpn

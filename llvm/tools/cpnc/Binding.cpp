@@ -30,6 +30,25 @@ struct Check {
   }
   void visit(const Node &N, Path &Active) {
     auto &A = N.Children;
+    if (N.K == Node::Lambda) {
+      auto Outer = Names;
+      Scope Captured;
+      for (auto &C : N.TemplateArgs) {
+        if (C.Type == "initializer")
+          visit(C.Children[0], Active);
+        else if (!known(C.Text))
+          fail(C.At, "unknown capture '" + C.Text + "'");
+        Captured.insert(C.Text);
+      }
+      Names = std::move(Captured);
+      for (auto &P : N.Params)
+        Names.insert(P.Text);
+      Path Nested;
+      for (auto &C : N.Children)
+        visit(C, Nested);
+      Names = std::move(Outer);
+      return;
+    }
     if (N.K == Node::Name && !known(N.Text))
       fail(N.At, "unknown name '" + N.Text + "'");
     if (N.K == Node::Object) {
@@ -139,6 +158,8 @@ void Context::validate(const Node &N, const std::string &P,
   Check Flow{*this, P, Owner, {}, {}, {}, {}};
   std::function<void(const Node &, Path &)> walk = [&](const Node &S,
                                                        Path &Live) {
+    if (S.K == Node::Lambda)
+      return;
     if (S.K == Node::Object)
       Live.push_back(&S);
     if (S.K == Node::Label && !Flow.Labels.emplace(S.Text, Live).second)

@@ -25,6 +25,9 @@ struct Diagnostic {
 }
 struct Options {
   std::string Input, Output, Config, RootID;
+  std::string FPProfile = "strict", DefaultReal = "f64",
+              LiteralRounding = "nearest_ties_even";
+  std::set<std::string> FloatFormats{"f32", "f64"};
   std::string Overflow = "checked", DefaultInt = "i32";
   bool ASCII = false, Promote = false, Silence = false, Check = false,
        IR = false;
@@ -34,11 +37,16 @@ std::vector<Token> lex(llvm::StringRef, const Options &);
 std::string unquote(const Token &);
 bool identifier(llvm::StringRef);
 bool builtin(llvm::StringRef);
+bool realToken(llvm::StringRef);
+bool floating(llvm::StringRef);
 struct Node {
   enum Kind {
     Empty,
+    Lambda,
+    Capture,
     Name,
     Number,
+    Real,
     Character,
     String,
     Call,
@@ -91,6 +99,7 @@ struct Node {
   std::string Text, Type;
   std::vector<Node> Children, Params, Generics, TemplateArgs;
   std::map<std::string, std::string> Settings;
+  bool HasInitializer = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,
        Definition = false, Noexcept = false, Pack = false;
   Node() = default;

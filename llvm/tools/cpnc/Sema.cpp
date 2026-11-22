@@ -49,6 +49,10 @@ std::string cpn::element(const std::string &T) {
   return T.empty() ? T : T.substr(0, T.size() - 1);
 }
 llvm::Type *Context::ir(const std::string &T, const Token &At) {
+  if (T == "f32")
+    return llvm::Type::getFloatTy(C);
+  if (T == "f64")
+    return llvm::Type::getDoubleTy(C);
   if (T == "void")
     return llvm::Type::getVoidTy(C);
   if (T == "nullptr_t" || T == "storage" || StringRef(T).ends_with("*") ||
@@ -81,10 +85,11 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
   fail(At, "unsupported or unknown type '" + T + "'");
 }
 Frame::Frame(Context &U, Function *F, llvm::Function *IR, std::string P)
-    : U(U), F(F), B(U.C), Opt(F ? F->Configuration : U.Opt),
+    : U(U), F(F), B(U.M), Opt(F ? F->Configuration : U.Opt),
       Prefix(F ? F->Prefix : std::move(P)), IR(IR),
       Env(F ? F->Env : Substitution()) {
   Scopes.emplace_back();
+  TracksStorage = F && IR && usesStorage(F->Decl);
 }
 llvm::BasicBlock *Frame::block(llvm::StringRef Name) {
   return llvm::BasicBlock::Create(U.C, Name, IR);
@@ -97,13 +102,12 @@ llvm::AllocaInst *Frame::allocate(const std::string &T, const Token &At) {
   auto *Ty = U.ir(T, At);
   if (!Ty->isSized())
     fail(At, "object requires a complete object type");
-  llvm::IRBuilder<> Entry(&IR->getEntryBlock(), IR->getEntryBlock().begin());
+  llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
   return Entry.CreateAlloca(Ty);
 }
 cpn::Value Frame::load(cpn::Value V) {
-  if (V.Type != "storage" && !StringRef(V.Type).ends_with("*") &&
-      !V.Storage.empty() && Active.count(V.Storage) && !Active[V.Storage])
-    fail({}, "ended object generation");
+  if (V.Type != "storage" && !StringRef(V.Type).ends_with("*"))
+    ensureLive(V, {});
   if (V.Address && U.Ready.count(V.Address)) {
     if (!IR)
       fail({}, "dynamic static read is unavailable in a constant expression");
@@ -127,6 +131,8 @@ std::string Frame::resolve(std::string S, const Token &At) {
     U.Signatures[S] = std::move(Sig);
     return S;
   }
+  if (floating(S) && !Opt.FloatFormats.count(S))
+    fail(At, "floating format is disabled");
   if (S == "byte")
     return "u8";
   if (builtin(S) || S == "auto")
@@ -230,6 +236,8 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
             Ty.pop_back();
           }
           if (Formal == P.Text) {
+            if (Ty == "real")
+              Ty = Opt.DefaultReal;
             if (Ty == "integer")
               Ty = Opt.DefaultInt;
             if (S.Types.count(P.Text) && S.Types[P.Text] != Ty)
@@ -498,6 +506,8 @@ void Context::emit(Function &D) {
   Frame F(*this, &D, D.IR);
   F.B.SetInsertPoint(F.block("entry"));
   F.bindParams();
+  if (D.Decl.Settings.count("closure"))
+    F.bindCaptures();
   auto &Body = D.Decl.Children.front();
   if (D.Decl.K == Node::Constructor) {
     Construction Transaction(F, D, F.Self, nullptr, nullptr);

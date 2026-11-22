@@ -7,7 +7,7 @@ const Node *site(const Node &N, bool Conditional = false) {
       fail(N.At, "delegation must be unconditional");
     return &N;
   }
-  if (N.K == Node::Object || N.K == Node::Tail)
+  if (N.K == Node::Object || N.K == Node::Tail || N.K == Node::Lambda)
     return nullptr;
   bool Nested = Conditional || N.K == Node::If || N.K == Node::Switch ||
                 N.K == Node::Match || N.K == Node::For || N.K == Node::While ||
@@ -86,9 +86,11 @@ Construction::Construction(Frame &Em, Function &Root, Value Obj,
     D = Probe.select("$ctor", *Site, Actual, Probe.Self);
     Tmp->eraseFromParent();
   }
-}
-bool Construction::pending(const std::string &S) const {
-  return std::find(Order.begin() + Frontier, Order.end(), S) != Order.end();
+  findReservations(Em);
+  if (!Reserved.empty()) {
+    Cursor = Em.allocate("i32", Root.Decl.At);
+    publish(Em);
+  }
 }
 bool Construction::needsDelegate(const Frame &F) const {
   for (auto &[D, Site] : Chain)
@@ -102,6 +104,8 @@ void Construction::advance(Frame &Current) {
     Current.installTables(Object);
   while (Frontier < Order.size()) {
     auto &F = R.Fields[Frontier];
+    if (Reserved.count(F.Decl.Text))
+      return;
     auto It = Explicit.find(F.Decl.Text);
     Frame *Source = &Current;
     const std::vector<Node> *Args = &F.Decl.Children;
@@ -144,6 +148,7 @@ void Construction::advance(Frame &Current) {
     Source->Transaction = PreviousTxn;
     Current.B.SetInsertPoint(Source->B.GetInsertBlock());
     ++Frontier;
+    publish(Current);
     if (Frontier == R.Bases.size())
       Current.installTables(Object);
   }
@@ -153,14 +158,14 @@ void Construction::enter(Frame &Em, size_t Depth) {
   Activations[D] = &Em;
   auto *Old = Em.Transaction;
   Em.Transaction = this;
-  advance(Em);
+  atEachPosition(Em, [&] { advance(Em); });
   Em.stmt(D->Decl.Children.front());
   Em.Transaction = Old;
   Activations.erase(D);
 }
 void Construction::run(Frame &Root) {
   enter(Root, 0);
-  if (Frontier != Order.size())
+  if (positions() != Positions{Order.size()})
     fail(Root.F->Decl.At, "incomplete construction plan");
 }
 void Construction::delegate(Frame &Em, const Node &N) {
@@ -185,6 +190,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
     if (llvm::StringRef(T).ends_with("&")) {
       if (!V.Address)
         fail(Param.At, "reference requires an lvalue");
+      V.IR = nullptr;
     } else {
       V = Next.convert(V, T, Param.At);
       auto *P = Next.allocate(T, Param.At);

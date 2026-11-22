@@ -64,9 +64,8 @@ Value Frame::member(Value Obj, const Token &T) {
       auto &Field = R.Fields[I];
       if (Obj.Address == PendingObject && PendingSlots.count(T.Text))
         fail(T, "use before initialization");
-      if (Transaction && Obj.Address == Self.Address &&
-          Transaction->pending(T.Text))
-        fail(T, "use before initialization");
+      if (Transaction && Obj.Address == Self.Address)
+        Transaction->checkAccess(*this, T);
       auto Access = Field.Decl.Settings.find("access");
       if (Access != Field.Decl.Settings.end() && Access->second != "public" &&
           (!F || F->Owner != Obj.Type))
@@ -139,8 +138,10 @@ Value Frame::place(const Node &N) {
     auto Base = element(P.Type);
     V = {unconst(Base), nullptr, P.IR, Base != unconst(Base)};
     V.Storage = P.Storage;
-    if (!P.Storage.empty() && Active.count(P.Storage) && !Active[P.Storage])
-      fail(N.At, "ended object generation");
+    V.Generation = P.Generation;
+    V.BaseView = P.BaseView;
+    if (llvm::isa<llvm::ConstantPointerNull>(P.IR))
+      fail(N.At, "null pointer access");
   } else if (N.K == Node::Member) {
     auto Base = N.Definition ? eval(N.Children[0]) : place(N.Children[0]);
     if (N.Definition) {
@@ -170,8 +171,7 @@ Value Frame::place(const Node &N) {
     V = eval(N);
   if (!V.Address)
     fail(N.At, "object lvalue required");
-  if (!V.Storage.empty() && Active.count(V.Storage) && !Active[V.Storage])
-    fail(N.At, "ended object generation");
+  ensureLive(V, N.At);
   return V;
 }
 Value Frame::constantEval(const Node &N) {
@@ -220,6 +220,15 @@ Value Frame::eval(const Node &N, std::string Expected) {
     fail(N.At, "constant assignment requires a local variable");
   }
   switch (N.K) {
+  case Node::Lambda:
+    return closure(N);
+  case Node::Real: {
+    Value V{"real"};
+    for (char C : N.Text)
+      if (C != '_')
+        V.RealText += C;
+    return floating(Expected) ? floatingConvert(V, Expected, N.At) : V;
+  }
   case Node::Number: {
     std::string Digits;
     for (char C : Op)
@@ -335,6 +344,8 @@ Value Frame::eval(const Node &N, std::string Expected) {
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
       P.Storage = V.Storage;
+      P.Generation = V.Generation;
+      P.BaseView = V.BaseView;
       return P;
     }
     if (Op == "*")
@@ -351,11 +362,21 @@ Value Frame::eval(const Node &N, std::string Expected) {
       return N.Definition ? Value(V.Type, V.IR)
                           : Value(Next.Type, Next.IR, D.Address);
     }
-    auto V = eval(A[0], Expected);
+    auto V = eval(A[0], Op == "-" && A[0].K == Node::Real ? "" : Expected);
     if (Op == "!") {
       if (V.Type != "bool")
         fail(N.At, "logical negation requires bool");
       return {"bool", B.CreateNot(V.IR)};
+    }
+    if ((floating(V.Type) || V.Type == "real") && (Op == "+" || Op == "-")) {
+      if (V.Type == "real") {
+        if (Op == "-")
+          V.RealText = llvm::StringRef(V.RealText).starts_with("-")
+                           ? V.RealText.substr(1)
+                           : "-" + V.RealText;
+        return floating(Expected) ? floatingConvert(V, Expected, N.At) : V;
+      }
+      return {V.Type, Op == "-" ? B.CreateFNeg(V.IR) : V.IR};
     }
     if (!integer(V.Type))
       fail(N.At, "integer operand required");
@@ -426,6 +447,9 @@ Value Frame::eval(const Node &N, std::string Expected) {
       return V;
     }
     if (assignment(Op)) {
+      if (Transaction && Op == "=")
+        if (auto V = Transaction->firstWrite(*this, N))
+          return *V;
       auto D = place(A[0]);
       if (D.Readonly)
         fail(N.At, "writable lvalue required");
@@ -440,8 +464,29 @@ Value Frame::eval(const Node &N, std::string Expected) {
       B.CreateStore(R.IR, D.Address);
       return {D.Type, R.IR, D.Address};
     }
-    auto L = eval(A[0]);
-    auto R = eval(A[1]);
+    // Only all-literal floating subexpressions inherit the destination's
+    // format. A typed operand is a rounding boundary of its own.
+    auto LiteralTree = [](const Node &E, auto &&Visit) -> bool {
+      if (E.K == Node::Number || E.K == Node::Real)
+        return true;
+      if (E.K != Node::Unary && E.K != Node::Binary)
+        return false;
+      return llvm::all_of(E.Children, [&](auto &C) { return Visit(C, Visit); });
+    };
+    bool Propagate = floating(Expected) && LiteralTree(N, LiteralTree);
+    auto L = eval(A[0], Propagate ? Expected : "");
+    auto R = eval(A[1], Propagate ? Expected : "");
+    if (L.Type == "integer" && R.Type == "integer" &&
+        (Op == "&" || Op == "|" || Op == "^" || Op == "<<" || Op == ">>")) {
+      auto T = integer(Expected) && Expected != "integer" ? Expected
+                                                          : Opt.DefaultInt;
+      L = convert(L, T, N.At);
+      if (Op != "<<" && Op != ">>")
+        R = convert(R, T, N.At);
+    }
+    if (floating(L.Type) || floating(R.Type) || L.Type == "real" ||
+        R.Type == "real")
+      return floatingBinary(N, L, R, Expected);
     return binary(N, L, R);
   }
   default:
@@ -527,6 +572,14 @@ Function *Frame::select(std::string Name, const Node &N,
           !V.Address) {
         OK = false;
         break;
+      }
+      if (V.Type == "real" && floating(T)) {
+        Rank += T != Opt.DefaultReal;
+        continue;
+      }
+      if (V.Type == "f32" && T == "f64") {
+        ++Rank;
+        continue;
       }
       if (V.Type == T)
         continue;
@@ -668,11 +721,16 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
+  if (C.K != Node::Unary && C.K != Node::Name && C.K != Node::Member)
+    return callClosure(eval(C), Args, C.At);
   if (C.K == Node::Unary && C.Text == "*" && C.Children.size() == 1)
     return indirect(eval(C.Children[0]), Args, C.At);
   if (C.K == Node::Name) {
     for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
       auto V = I->Names.find(C.Text);
+      if (V != I->Names.end() && U.Records.count(V->second.Type) &&
+          U.Records.at(V->second.Type).Decl.K == Node::Lambda)
+        return callClosure(V->second, Args, C.At);
       if (V != I->Names.end() && ends(V->second.Type, "*") &&
           U.Signatures.count(element(V->second.Type)))
         return indirect(load(V->second), Args, C.At);
@@ -732,37 +790,43 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       S.Storage = V.Storage;
       return S;
     }
-    if (Name == "destroy") {
-      if (Extents.count(V.Storage) && Extents.at(V.Storage).Type != V.Type) {
-        if (!U.Records.count(V.Type) || !U.Records.at(V.Type).VirtualDestructor)
-          fail(C.At, "complete destruction through a base requires virtual "
-                     "destruction");
-        drop(Extents.at(V.Storage));
-      } else
-        drop(V);
-    }
-    Active[V.Storage] = false;
+    if (!Extents.count(V.Storage))
+      fail(C.At, "local storage extent required");
+    if (V.BaseView && Extents.at(V.Storage).Type != V.Type &&
+        (!U.Records.count(V.Type) || !U.Records.at(V.Type).VirtualDestructor))
+      fail(C.At,
+           "complete destruction through a base requires virtual destruction");
+    retireStorage(V, Name == "destroy");
     return {"void"};
   }
   if (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1) {
     auto S = eval(Args[0]);
     if (S.Type != "storage" || S.Storage.empty())
       fail(C.At, "storage view required");
-    if (Active[S.Storage])
+    if (Active[S.Storage] == 1)
       fail(C.At, "storage contains a live generation");
+    if (Active[S.Storage] < 0 && Registrations.count(S.Storage))
+      guard(B.CreateTrunc(
+          B.CreateLoad(B.getInt64Ty(), Registrations.at(S.Storage).Stamp),
+          B.getInt1Ty()));
     auto T = resolve(C.TemplateArgs[0].Type, C.At);
     auto *Alloca =
         Extents.count(S.Storage)
             ? llvm::dyn_cast<llvm::AllocaInst>(Extents.at(S.Storage).Address)
             : nullptr;
     auto &DL = U.M.getDataLayout();
-    if (!Alloca || DL.getTypeAllocSize(Alloca->getAllocatedType()) <
-                       DL.getTypeAllocSize(U.ir(T)))
+    if (!Alloca ||
+        DL.getABITypeAlign(Alloca->getAllocatedType()) <
+            DL.getABITypeAlign(U.ir(T)) ||
+        DL.getTypeAllocSize(Alloca->getAllocatedType()) <
+            DL.getTypeAllocSize(U.ir(T)))
       fail(C.At, "insufficient storage capacity");
     construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR);
-    Active[S.Storage] = true;
+    replaceGeneration(S, T, C.At);
     Value V{T + "*", S.IR};
     V.Storage = S.Storage;
+    V.Generation =
+        B.CreateLoad(B.getInt64Ty(), Registrations.at(S.Storage).Stamp);
     return V;
   }
   if (C.K == Node::Name &&
@@ -798,6 +862,21 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail) {
   if (T == "void")
     fail(At, "object cannot have void type");
+  if (floating(T)) {
+    if (Args.size() > 1)
+      fail(At, "invalid scalar construction");
+    Value V = Args.empty() ? Value{T, llvm::ConstantFP::get(U.ir(T), 0.0)}
+                           : floatingConvert(eval(Args[0], T), T, At, true);
+    if (Dest)
+      B.CreateStore(V.IR, Dest);
+    if (Tail) {
+      Scopes.emplace_back();
+      Scopes.back().Names["this"] = {T + "*", Dest};
+      stmt(*Tail);
+      Scopes.pop_back();
+    }
+    return V;
+  }
   auto *Ty = U.ir(T, At);
   if (!Ty->isSized())
     fail(At, "construction requires a complete object type");
@@ -995,6 +1074,12 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
 void Frame::drop(Value V) {
   if (!IR || !V.Address)
     return;
+  if (!V.Storage.empty() && Extents.count(V.Storage) &&
+      Extents.at(V.Storage).Address == V.Address &&
+      Registrations.count(V.Storage)) {
+    retireStorage(V, true);
+    return;
+  }
   if (!V.Storage.empty() && Active.count(V.Storage) && !Active[V.Storage])
     return;
   if (ends(V.Type, "]")) {
@@ -1041,6 +1126,28 @@ void Frame::endExpression(size_t From) {
 }
 void Frame::object(const Node &N, bool Global) {
   std::string Name = Global ? Prefix + N.Text : N.Text;
+  if (Global && N.Settings.count("identity"))
+    Name = N.Settings.at("identity");
+  if (!Global && N.Settings.count("storage")) {
+    if (N.Settings.at("storage") != "static")
+      fail(N.At, "thread-local storage is unavailable on this configuration");
+    if (!F)
+      fail(N.At, "block static requires a function");
+    if (Scopes.back().Names.count(N.Text))
+      fail(N.At, "duplicate declaration '" + N.Text + "'");
+    auto ID = F->Name + ".$static." + std::to_string(N.At.Line) + "." +
+              std::to_string(N.At.Column) + "." + N.Text;
+    if (!U.Globals.count(ID)) {
+      Node D = N;
+      D.Settings["identity"] = ID;
+      Frame Init(U, nullptr, nullptr, Prefix);
+      Init.Env = Env;
+      Init.object(D, true);
+      U.Statics.emplace_back(ID, D);
+    }
+    Scopes.back().Names[N.Text] = U.Globals.at(ID);
+    return;
+  }
   auto names = [&]() -> std::map<std::string, Value> & {
     return Global ? U.Globals : Scopes.back().Names;
   };
@@ -1066,6 +1173,8 @@ void Frame::object(const Node &N, bool Global) {
     }
     if (Ty == "auto") {
       Ty = constantEval(Args.at(0)).Type;
+      if (Ty == "real")
+        Ty = Opt.DefaultReal;
       if (Ty == "integer")
         Ty = Opt.DefaultInt;
     }
@@ -1083,13 +1192,13 @@ void Frame::object(const Node &N, bool Global) {
       return;
     }
     G->setInitializer(llvm::Constant::getNullValue(LT));
-    bool Simple =
-        !Tail && !U.Records.count(Ty) && !ends(Ty, "]") &&
-        (Args.empty() ||
-         (Args.size() == 1 &&
-          (Args[0].K == Node::Number || Args[0].K == Node::Character ||
-           Args[0].K == Node::Name &&
-               (Args[0].Text == "true" || Args[0].Text == "false"))));
+    bool Simple = !Tail && !U.Records.count(Ty) && !ends(Ty, "]") &&
+                  (Args.empty() ||
+                   (Args.size() == 1 &&
+                    (Args[0].K == Node::Number || Args[0].K == Node::Real ||
+                     Args[0].K == Node::Character ||
+                     (Args[0].K == Node::Name &&
+                      (Args[0].Text == "true" || Args[0].Text == "false")))));
     if (Simple) {
       auto V = construct(Ty, Args, N.At);
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
@@ -1101,6 +1210,7 @@ void Frame::object(const Node &N, bool Global) {
     auto *Fn = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                       "cpn.static.init", U.M);
     Frame Init(U, nullptr, Fn, Prefix);
+    Init.Env = Env;
     Init.B.SetInsertPoint(Init.block("entry"));
     Init.construct(Ty, Args, N.At, G, Tail);
     Init.endExpression();
@@ -1137,6 +1247,8 @@ void Frame::object(const Node &N, bool Global) {
   if (!IR) {
     auto V =
         Ty == "auto" ? constantEval(Args.at(0)) : construct(Ty, Args, N.At);
+    if (V.Type == "real")
+      V = floatingConvert(V, Opt.DefaultReal, N.At);
     if (V.Type == "integer")
       V = convert(V, Opt.DefaultInt, N.At);
     V.Readonly = N.Const;
@@ -1147,10 +1259,18 @@ void Frame::object(const Node &N, bool Global) {
   llvm::Value *Ptr = nullptr;
   if (Ty == "auto") {
     V = eval(Args.at(0));
-    Ty = V.Type == "integer" ? Opt.DefaultInt : V.Type;
+    Ty = V.Type == "integer" ? Opt.DefaultInt
+         : V.Type == "real"  ? Opt.DefaultReal
+                             : V.Type;
     V = convert(V, Ty, N.At);
-    Ptr = allocate(Ty, N.At);
-    B.CreateStore(V.IR, Ptr);
+    if (llvm::any_of(Temps,
+                     [&](auto &Tmp) { return Tmp.Address == V.Address; })) {
+      Ptr = V.Address;
+      consume(V);
+    } else {
+      Ptr = allocate(Ty, N.At);
+      B.CreateStore(V.IR, Ptr);
+    }
   } else {
     Ptr = allocate(Ty, N.At);
     V = construct(Ty, Args, N.At, Ptr, Tail);
@@ -1159,9 +1279,12 @@ void Frame::object(const Node &N, bool Global) {
     fail(N.At, "constexpr initializer requires a constant");
   Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, N.Const};
   Cell.Storage = V.Storage;
+  Cell.Generation = V.Generation;
+  Cell.BaseView = V.BaseView;
   if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {
     Cell.Storage = "local." + std::to_string(U.Serial++);
     Active[Cell.Storage] = true;
+    track(Cell);
     Extents[Cell.Storage] = Cell;
   }
   names()[Name] = Cell;
@@ -1229,6 +1352,8 @@ void Frame::stmt(const Node &N) {
       V = eval(A[0], F ? F->Result : "");
     if (!F)
       fail(N.At, "return requires a function");
+    if (ends(F->Result, "*") && !V.Storage.empty() && Extents.count(V.Storage))
+      fail(N.At, "borrow of automatic storage escapes the function");
     if (F->Result == "void" && V.Type != "void")
       fail(N.At, "void function cannot return a value");
     if (F->Result != "void")
@@ -1266,16 +1391,32 @@ void Frame::stmt(const Node &N) {
     B.CreateCondBr(C.IR, Then, Else);
     B.SetInsertPoint(Then);
     auto Prior = Active;
+    auto EntryPositions =
+        Transaction ? Transaction->positions() : Construction::Positions{};
     stmt(A[1]);
     bool Y = Live;
     branch(End);
     auto TrueState = Active;
+    auto YesPositions =
+        Transaction ? Transaction->positions() : Construction::Positions{};
+    if (Transaction)
+      Transaction->restore(EntryPositions);
     B.SetInsertPoint(Else);
     Live = Before;
     Active = Prior;
     if (A.size() > 2)
       stmt(A[2]);
     bool Z = Live;
+    if (Transaction) {
+      auto NoPositions = Transaction->positions();
+      if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR))
+        Transaction->restore(K->isZero() ? NoPositions : YesPositions);
+      else if (Y && Z) {
+        NoPositions.insert(YesPositions.begin(), YesPositions.end());
+        Transaction->restore(NoPositions);
+      } else if (Y)
+        Transaction->restore(YesPositions);
+    }
     branch(End);
     if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR)) {
       if (!K->isZero()) {
@@ -1283,8 +1424,13 @@ void Frame::stmt(const Node &N) {
         Active = TrueState;
       } else
         Live = Z;
-    } else
+    } else {
+      if (Y && Z)
+        joinStorage(TrueState);
+      else if (Y)
+        Active = std::move(TrueState);
       Live = Y || Z;
+    }
     B.SetInsertPoint(End);
     return;
   }
@@ -1322,6 +1468,10 @@ void Frame::stmt(const Node &N) {
     Scopes.emplace_back();
     if (For)
       stmt(A[0]);
+    auto Header =
+        Transaction ? Transaction->loopPositions(N) : Construction::Positions{};
+    if (Transaction)
+      Transaction->restore(Header);
     auto *Cond = block("loop.test"), *Body = block("loop.body"),
          *Next = block("loop.next"), *End = block("loop.end");
     branch(Do ? Body : Cond);
@@ -1337,10 +1487,13 @@ void Frame::stmt(const Node &N) {
     if (For && A[2].K != Node::Empty)
       eval(A[2]);
     branch(Cond);
+    if (Transaction && !Do)
+      Transaction->restore(Header);
     auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR);
     Live = Loops.back().BreakUsed || !K || K->isZero();
     Loops.pop_back();
     B.SetInsertPoint(End);
+    forgetStorage();
     cleanup(Scopes.size() - 1);
     Scopes.pop_back();
     return;

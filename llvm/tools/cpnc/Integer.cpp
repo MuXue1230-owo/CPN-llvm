@@ -42,6 +42,8 @@ bool fits(const APInt &N, const std::string &T) {
 cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
   if (V.Type == T)
     return V;
+  if (floating(T))
+    return floatingConvert(V, T, At);
   if (StringRef(V.Type).ends_with("*") && StringRef(T).ends_with("*")) {
     auto A = element(V.Type), D = element(T);
     auto unqualified = [](const std::string &S) {
@@ -53,6 +55,7 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
     if ((A == unqualified(A) || D != unqualified(D)) &&
         adjust(View, unqualified(D), At)) {
       auto *Null = ConstantPointerNull::get(B.getPtrTy());
+      V.BaseView |= unqualified(A) != unqualified(D);
       V.IR = B.CreateSelect(B.CreateICmpEQ(V.IR, Null), Null, View.Address);
       V.Type = T;
       V.Address = nullptr;
@@ -95,6 +98,9 @@ void Frame::guard(llvm::Value *Bad) {
   B.SetInsertPoint(OK);
 }
 cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
+  if (floating(A.Type) || floating(D.Type) || A.Type == "real" ||
+      D.Type == "real")
+    return floatingBinary(N, A, D);
   auto Op = N.Text;
   const Token &At = N.At;
   bool Cmp = Op == "==" || Op == "!=" || Op == "<" || Op == "<=" || Op == ">" ||
