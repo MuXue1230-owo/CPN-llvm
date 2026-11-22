@@ -610,6 +610,29 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
 
+    def test_qualified_definition_with_multiple_applied_owner_scopes(self):
+        self.assertEqual(
+            self.program("""
+          generic<type T> struct Outer{
+            generic<type U> struct Inner{T a;U b;declare U get(T arg) const;};
+          };
+          i32 early(){Outer<i16>::Inner<i32> item(2,20);return item.get(4);}
+          generic<type A,type B> B Outer<A>::Inner<B>::get(A ignored) const{return b;}
+          i32 main(){Outer<i32>::Inner<i16> item(1,22);return early()+i32(item.get(2));}
+        """),
+            42,
+        )
+        for definition in (
+            "generic<type A,type B> B Outer<B>::Inner<A>::get(A ignored) const{return b;}",
+            "generic<type A> A Outer<A>::Inner::get(A ignored) const{return b;}",
+        ):
+            with self.subTest(definition=definition):
+                source = (
+                    "generic<type T> struct Outer{generic<type U> struct Inner{T a;U b;declare U get(T arg) const;};};"
+                    + definition
+                )
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
     def test_never_paths_and_nullptr_object_representation(self):
         program = """
           never diverge(){for(;;){}}
@@ -700,6 +723,67 @@ class CompilerTests(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constexpr_call_targets_argument_order_and_reference_results(self):
+        self.assertEqual(
+            self.program("""
+          constexpr i32 select(i32 a,i32 b){return a*10+b;}
+          constexpr i32 select(bool a,bool b){return 7;}
+          constexpr i32 via(function<i32(i32,i32)>* f,i32& n){return f(n,++n);}
+          constexpr function<i32(i32,i32)>* fp(&select);
+          [[returns_borrowed_from(n)]] constexpr i32& borrow(i32& n){return n;}
+          constexpr i32 compute(){
+            i32 n(1);i32 a(select(n,++n));i32 b(via(fp,n));
+            i32& r(borrow(n));r+=4;return a+b+n;
+          }
+          constexpr i32 answer(compute());
+          i32 main(){return compute()==answer?answer:0;}
+        """),
+            42,
+        )
+        for source in (
+            'extern "C" i32 external(i32);constexpr function<i32(i32)>* p(&external);constexpr i32 n(p(1));',
+            "constexpr function<i32(i32)>* p(nullptr);constexpr i32 n(p(1));",
+            "constexpr i32& invalid(){i32 n(7);return n;}constexpr i32 n(invalid());",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constexpr_temporary_destruction_and_final_destination(self):
+        declarations = """
+          i32 calls;
+          struct Guard {i32 value;~Guard(){if(value!=42){++calls;}}};
+          constexpr i32 get(const<Guard>& g){return g.value;}
+          constexpr Guard make(i32 n){return Guard(n);}
+        """
+        self.assertEqual(
+            self.program(
+                declarations
+                + """
+          constexpr i32 valid(){Guard(42);return get(make(42));}
+          constexpr Guard staticGuard(make(1));
+          constexpr i32 answer(valid());
+          i32 main(){return calls==0 && staticGuard.value==1?answer:0;}
+        """
+            ),
+            42,
+        )
+        for body in (
+            "Guard(1);return 42;",
+            "return get(Guard(1));",
+            "if(get(Guard(1))==1){return 42;}return 0;",
+            "Guard g(make(1));return 42;",
+        ):
+            with self.subTest(body=body):
+                result = self.compile(
+                    declarations
+                    + "constexpr i32 invalid(){"
+                    + body
+                    + "}constexpr i32 bad(invalid());",
+                    "--check",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("writable local", result.stderr)
 
     def test_constexpr_references_special_members_and_switch(self):
         self.assertEqual(
@@ -1847,6 +1931,27 @@ class CompilerTests(unittest.TestCase):
           i32 main(){return after;}
         """
             ),
+            42,
+        )
+
+    def test_automatic_borrows_in_returned_records_and_static_cells(self):
+        for source in (
+            "struct H{i32* p;};H f(){i32 a(42);return H(&a);}",
+            "struct N{i32 n;};struct H{i32* p;};H f(N a){return H(&a.n);}",
+            "i32* retained;void f(){i32 a;retained=&a;}",
+            "struct H{i32* p;H(const<H>& h)=default;};H f(){i32 n;H h(&n);return h;}",
+        ):
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("automatic storage", r.stderr)
+        self.assertEqual(
+            self.program("""
+          struct H{i32* p;}; i32* retained;i32 global(42);
+          H wrap(i32& n){return H(&n);}
+          void transient(){i32 n;retained=&n;retained=&global;}
+          i32 main(){transient();H h(wrap(global));return *h.p;}
+        """),
             42,
         )
 

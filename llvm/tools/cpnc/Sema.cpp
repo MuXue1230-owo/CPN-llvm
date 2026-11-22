@@ -132,8 +132,15 @@ llvm::AllocaInst *Frame::allocate(const std::string &T, const Token &At) {
   return Ptr;
 }
 cpn::Value Frame::load(cpn::Value V) {
-  if (!IR && V.Location)
-    V = V.Location->read(*this, {});
+  if (!IR && V.Location) {
+    auto Current = V.Location->read(*this, {});
+    Current.Readonly |= V.Readonly;
+    Current.Expiring = V.Expiring;
+    Current.Prvalue = V.Prvalue;
+    Current.Location = V.Location;
+    Current.ConstantTemporary = V.ConstantTemporary;
+    V = std::move(Current);
+  }
   if (V.Type != "storage" && !StringRef(V.Type).ends_with("*"))
     ensureLive(V, {});
   if (V.Address && U.Ready.count(V.Address)) {
@@ -913,6 +920,7 @@ void Context::record(const Node &N, const std::string &Name,
     return;
   }
   R.Decl = N;
+  R.EnclosingScope = StringRef(P).rtrim(':').str();
   R.Env = E;
   R.Env.Types[N.Text] = Name;
   Frame Check(*this, nullptr, nullptr, Name + "::");
@@ -1419,6 +1427,7 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     U.enableStorage();
   U.unit(AST);
   U.checkWholeContracts();
+  U.checkBorrowEscapes();
   for (auto &F : U.Functions)
     for (auto *Entry : {F.IR, F.BaseIR})
       if (Entry && Entry->isDeclaration() && !F.Decl.Foreign) {

@@ -33,74 +33,107 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
       scopeKey(Prefix, Base, [&](const auto &S) { return Families.count(S); });
   if (Key.empty())
     fail(D.At, "qualified member definition requires a declared owner family");
-  unsigned Depth = 1;
-  size_t End = 0;
-  for (; End < Arguments.size(); ++End) {
-    if (Arguments[End] == '<')
-      ++Depth;
-    if (Arguments[End] == '>' && !--Depth)
-      break;
-  }
-  if (End == Arguments.size())
+  auto application = [&](StringRef &Text) {
+    unsigned Depth = 1, Parens = 0;
+    for (size_t I = 0; I < Text.size(); ++I) {
+      char C = Text[I];
+      if (C == '(')
+        ++Parens;
+      else if (C == ')' && Parens)
+        --Parens;
+      else if (!Parens && C == '<')
+        ++Depth;
+      else if (!Parens && C == '>' && !--Depth) {
+        auto Args = splitArguments(Text.take_front(I));
+        Text = Text.drop_front(I + 1);
+        return Args;
+      }
+    }
     fail(D.At, "unterminated owner application");
-  auto Args = splitArguments(Arguments.take_front(End));
-  auto Suffix = Arguments.drop_front(End + 1);
-  const Node *Generic = nullptr;
-  auto matchOwner = [&](const Node &Decl) {
-    if (Decl.Generics.size() != D.Generics.size())
-      return;
+  };
+  Node Formals;
+  std::vector<SourcePosition> GenericOwners;
+  auto matches = [&](const Node &Decl, const std::vector<std::string> &Args) {
+    size_t Begin = Formals.Generics.size(), Count = Decl.Generics.size();
+    if (Begin + Count > D.Generics.size())
+      return false;
+    Node Binders;
+    Binders.Generics.assign(D.Generics.begin() + Begin,
+                            D.Generics.begin() + Begin + Count);
     std::vector<std::string> Pattern;
     if (Decl.Settings.count("specialize")) {
       for (const auto &P : Decl.Pattern) {
         if (P.K != Node::TypeArg && P.K != Node::Name && P.K != Node::Number)
-          return;
-        Pattern.push_back(
-            rebindTypeNames(P.K == Node::TypeArg ? P.Type : P.Text, Decl, D));
+          return false;
+        Pattern.push_back(rebindTypeNames(
+            P.K == Node::TypeArg ? P.Type : P.Text, Decl, Binders));
       }
     } else {
-      for (const auto &G : D.Generics)
+      for (const auto &G : Binders.Generics)
         Pattern.push_back(G.Text + (G.Pack ? "..." : ""));
     }
-    if (Pattern != Args)
-      return;
-    if (Generic)
-      fail(D.At, "ambiguous qualified owner pattern");
-    Generic = &Decl;
+    return Pattern == Args;
   };
-  matchOwner(Families.at(Key).Decl);
+  auto addOwner = [&](const Node &Owner) {
+    GenericOwners.push_back(position(Owner));
+    Formals.Generics.insert(Formals.Generics.end(), Owner.Generics.begin(),
+                            Owner.Generics.end());
+    Formals.Params.insert(Formals.Params.end(), Owner.Params.begin(),
+                          Owner.Params.end());
+  };
+  auto Args = application(Arguments);
+  const Node *Class = nullptr;
+  auto matchRoot = [&](const Node &Decl) {
+    if (!matches(Decl, Args))
+      return;
+    if (Class)
+      fail(D.At, "ambiguous qualified owner pattern");
+    Class = &Decl;
+  };
+  matchRoot(Families.at(Key).Decl);
   if (auto It = Specializations.find(Key); It != Specializations.end())
     for (const auto &S : It->second)
-      matchOwner(S.Decl);
-  if (!Generic)
+      matchRoot(S.Decl);
+  if (!Class)
     fail(D.At,
          "owner application must identify a declared family or specialization");
-  for (const auto &G : D.Generics)
-    if (!G.Children.empty())
-      fail(G.At, "a definition cannot redeclare a generic default");
-  const Node *Class = Generic;
-  while (Suffix.consume_front("::")) {
-    auto Part = Suffix.split("::").first;
+  addOwner(*Class);
+  while (Arguments.consume_front("::")) {
+    auto Part = Arguments.take_front(Arguments.find_first_of("<:"));
     auto Inner = llvm::find_if(Class->Children, [&](const Node &N) {
       return (N.K == Node::Record || N.K == Node::Union) && N.Text == Part &&
              !N.Prototype;
     });
-    if (Inner == Class->Children.end() || !Inner->Generics.empty())
+    if (Inner == Class->Children.end())
       fail(D.At, "unknown nested owning declaration");
     Class = &*Inner;
-    Suffix = Suffix.drop_front(Part.size());
+    Arguments = Arguments.drop_front(Part.size());
+    if (Arguments.consume_front("<")) {
+      if (Class->Generics.empty() || !matches(*Class, application(Arguments)))
+        fail(D.At, "invalid nested owner application");
+      addOwner(*Class);
+    } else if (!Class->Generics.empty())
+      fail(D.At, "nested owner family requires an application");
   }
-  if (!Suffix.empty() || (Class->K != Node::Record && Class->K != Node::Union))
+  if (!Arguments.empty() ||
+      (Class->K != Node::Record && Class->K != Node::Union))
     fail(D.At, "qualified definition requires a record or union owner");
+  if (Formals.Generics.size() != D.Generics.size())
+    fail(D.At,
+         "owner application must match its declaration's generic parameters");
+  for (const auto &G : D.Generics)
+    if (!G.Children.empty())
+      fail(G.At, "a definition cannot redeclare a generic default");
   const auto &Owner = *Class;
   const Node *Selected = nullptr;
   for (const auto &Member : Owner.Children) {
     if (Member.K != D.K || Member.Text != D.Text || !Member.Generics.empty())
       continue;
     Node Public = Member;
-    Public.Generics = Generic->Generics;
+    Public.Generics = Formals.Generics;
     // Omitting the owner's already established constraint retains that bound.
     if (!D.TemplateArgs.empty())
-      Public.TemplateArgs = Generic->Params;
+      Public.TemplateArgs = Formals.Params;
     if (!sameGenericSignature(Public, D))
       continue;
     if (!sameGenericResult(Public, D) || D.Noexcept != Member.Noexcept ||
@@ -126,20 +159,20 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
   Node Domain = Owner;
   Domain.K = Node::Record;
   Domain.Generics = D.Generics;
-  Domain.Params = Generic->Params;
+  Domain.Params = Formals.Params;
   for (auto &Q : Domain.Params)
-    rebindCondition(Q, *Generic, D);
+    rebindCondition(Q, Formals, D);
   Domain.Children.clear();
   for (auto Field : Owner.Children)
     if (Field.K == Node::Field) {
-      Field.Type = rebindTypeNames(Field.Type, *Generic, D);
+      Field.Type = rebindTypeNames(Field.Type, Formals, D);
       Domain.Children.push_back(std::move(Field));
     }
   Domain.Children.push_back(D);
   checkDomain(Domain, Families.at(Key).Prefix);
   auto &Definitions = OwnerBodies[position(Owner)];
-  auto [Bound, New] = Definitions.emplace(
-      position(*Selected), MemberBody{position(*Generic), D, site()});
+  auto [Bound, New] = Definitions.emplace(position(*Selected),
+                                          MemberBody{GenericOwners, D, site()});
   if (!New)
     fail(D.At, "family member is already defined");
   std::vector<std::string> Existing;
@@ -155,28 +188,35 @@ void Context::bindFamilyMember(const std::string &Name,
   const auto &Owner = Records.at(Name);
   Node D = Saved.Definition;
   auto Env = Owner.Env;
-  auto *Generic = &Owner.Decl;
-  auto Parent = Name;
-  while (position(*Generic) != Saved.GenericOwner) {
-    auto P = MemberTypes.find(Parent);
-    if (P == MemberTypes.end())
+  std::vector<const Record *> Instances;
+  const Record *Current = &Owner;
+  for (auto Site : llvm::reverse(Saved.GenericOwners)) {
+    while (Current && position(Current->Decl) != Site) {
+      auto P = Records.find(Current->EnclosingScope);
+      Current = P == Records.end() ? nullptr : &P->second;
+    }
+    if (!Current)
       fail(D.At, "missing enclosing owner instance");
-    Parent = P->second.first;
-    Generic = &Records.at(Parent).Decl;
+    Instances.push_back(Current);
   }
+  size_t Count = 0;
+  for (auto *R : Instances)
+    Count += R->Decl.Generics.size();
   if (!D.Generics.empty() && D.Generics.back().Pack) {
     Family Source{D, "", Saved.Site};
-    D = expand(Source, Generic->Generics.size() - (D.Generics.size() - 1), D.At)
-            .Decl;
+    D = expand(Source, Count - (D.Generics.size() - 1), D.At).Decl;
   }
-  for (size_t I = 0; I < D.Generics.size(); ++I) {
-    auto &Old = Generic->Generics[I];
-    auto &New = D.Generics[I].Text;
-    if (Old.K == Node::TypeParam)
-      Env.Types[New] = Owner.Env.Types.at(Old.Text);
-    else
-      Env.Values[New] = Owner.Env.Values.at(Old.Text);
-  }
+  if (D.Generics.size() != Count)
+    fail(D.At, "owner binder arity mismatch");
+  size_t I = 0;
+  for (auto *R : llvm::reverse(Instances))
+    for (const auto &Old : R->Decl.Generics) {
+      const auto &New = D.Generics[I++].Text;
+      if (Old.K == Node::TypeParam)
+        Env.Types[New] = R->Env.Types.at(Old.Text);
+      else
+        Env.Values[New] = R->Env.Values.at(Old.Text);
+    }
   D.Generics.clear();
   D.TemplateArgs.clear();
   D.Settings["qualifier"] = "::" + Name + "::";

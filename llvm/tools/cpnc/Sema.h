@@ -14,6 +14,7 @@ std::string qualifyConst(const std::string &T);
 struct ConstantPlace;
 struct Value {
   std::shared_ptr<ConstantPlace> Location;
+  std::shared_ptr<Value> ConstantTemporary;
   SourcePosition DeclaredAt;
   std::string Type;
   llvm::Value *IR = nullptr, *Address = nullptr;
@@ -105,6 +106,7 @@ struct DispatchTable {
 };
 struct Record {
   Node Decl;
+  std::string EnclosingScope;
   llvm::StructType *IR = nullptr, *Layer = nullptr;
   std::vector<Field> Fields;
   std::map<SpecialOperation, SpecialMember> Special;
@@ -229,7 +231,7 @@ struct Context {
   void defineQualified(const Node &, const std::string &,
                        const Substitution * = nullptr);
   struct MemberBody {
-    SourcePosition GenericOwner;
+    std::vector<SourcePosition> GenericOwners;
     Node Definition;
     DefinitionSite Site;
   };
@@ -240,6 +242,7 @@ struct Context {
   bool Whole = false;
   std::vector<std::pair<Function *, Token>> RestrictedPointers;
   void checkWholeContracts();
+  void checkBorrowEscapes();
   std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
   llvm::Function *coordinator(const std::string &);
   llvm::Function *baseCleanup(const std::string &);
@@ -511,6 +514,11 @@ public:
   void enterOwnerLayer(Value);
   bool containsPointerField(const std::string &) const;
   Value constantAssignment(const Node &);
+  Value constantCall(Function &, const std::vector<Node> &, const Token &,
+                     Value Receiver = {});
+  Function *constantOverload(const std::string &, const Node &,
+                             const std::vector<Node> &, Value, Function *);
+  Value constantTemporary(Value);
   Value constantSelf(const Token &);
   Value constantCopy(Value, const Token &);
   Value constantConstructor(Function &, const std::vector<Value> &,

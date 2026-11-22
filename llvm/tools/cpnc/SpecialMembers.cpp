@@ -157,9 +157,12 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
 Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
   if (!IR) {
     Source = load(Source);
+    if (Source.Prvalue)
+      consume(Source);
     if (!Source.Prvalue && U.aggregate(Source.Type))
       return constantCopy(Source, At);
     Source.Location.reset();
+    Source.ConstantTemporary.reset();
     Source.Address = nullptr;
     return Source;
   }

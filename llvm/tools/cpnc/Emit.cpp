@@ -417,6 +417,7 @@ Value Frame::constantEval(const Node &N) {
     CF.Env = Env;
     return CF.constantEval(N);
   }
+  ConstantActivation Activation(U, N.At);
   auto V = eval(N);
   if (!llvm::isa_and_nonnull<llvm::Constant>(V.IR))
     fail(N.At, "constant expression required");
@@ -520,6 +521,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     return load(place(N));
   case Node::Call: {
     auto V = call(A[0], std::vector<Node>(A.begin() + 1, A.end()));
+    if (!IR)
+      return constantTemporary(V);
     if (Dest && V.Address == Dest && U.aggregate(V.Type))
       V.Prvalue = V.Expiring = true;
     return V;
@@ -1264,6 +1267,18 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     F->Calls.insert(&D);
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
+  if (TypeQuery && D.Decl.Settings.count("mode")) {
+    if (D.Result == "void" || D.Result == "never")
+      return {D.Result};
+    auto Base = unconst(baseRef(D.Result));
+    Value V{Base, llvm::PoisonValue::get(U.ir(Base, T))};
+    V.Prvalue = !ends(D.Result, "&");
+    V.Expiring = V.Prvalue || ends(D.Result, "&&");
+    V.Readonly = baseRef(D.Result) != Base;
+    if (!V.Prvalue)
+      V.Address = llvm::PoisonValue::get(B.getPtrTy());
+    return V;
+  }
   if (!IR || D.Decl.Settings.count("mode")) {
     if (!D.Decl.Required || D.Decl.Prototype)
       fail(T, "constant expression requires a constexpr function");
@@ -1398,6 +1413,73 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                                 Actual[I].Origins.end());
   return pointerCallResult(Returned, Metadata, D.Result);
 }
+// Resolve the declaration using the normal overload rules before any argument
+// is executed. Native type probes retain literal values and give local objects
+// private storage so increments, calls and assignments have their real types.
+Function *Frame::constantOverload(const std::string &Name, const Node &C,
+                                  const std::vector<Node> &Args, Value Receiver,
+                                  Function *Hint) {
+  if (Args.empty())
+    return select(Name, C, {}, Receiver);
+  auto *Tmp = llvm::Function::Create(
+      llvm::FunctionType::get(B.getVoidTy(), false),
+      llvm::GlobalValue::InternalLinkage, "cpn.constant.arguments", U.M);
+  struct Discard {
+    llvm::Function *F;
+    ~Discard() { F->eraseFromParent(); }
+  } Guard{Tmp};
+  Function Owner;
+  if (F)
+    Owner = *F;
+  Frame Probe(U, F ? &Owner : nullptr, Tmp, Prefix);
+  Probe.TypeQuery = true;
+  Probe.Env = Env;
+  Probe.Opt = Opt;
+  Probe.LookupLimit = LookupLimit;
+  Probe.B.SetInsertPoint(Probe.block("entry"));
+  Probe.Scopes = Scopes;
+  for (auto &Scope : Probe.Scopes)
+    for (auto &[Key, V] : Scope.Names) {
+      if (V.Type.empty() || V.Type == "integer" || V.Type == "real" ||
+          !U.ir(V.Type, C.At)->isSized())
+        continue;
+      if (!llvm::isa_and_nonnull<llvm::GlobalVariable>(V.Address))
+        V.Address = Probe.allocate(V.Type, C.At);
+      V.Location.reset();
+      if (!V.Readonly)
+        V.IR = nullptr;
+    }
+  if (ConstantReceiver) {
+    Probe.Self = {ConstantReceiver->Type, nullptr,
+                  Probe.allocate(ConstantReceiver->Type, C.At),
+                  ConstantReceiver->Readonly};
+    Probe.Scopes.front().Names["this"] = {(Probe.Self.Readonly
+                                               ? qualifyConst(Probe.Self.Type)
+                                               : Probe.Self.Type) +
+                                              "*",
+                                          Probe.Self.Address};
+  }
+  auto Shapes = Probe.evaluateArguments(Args, Hint);
+  return select(Name, C, Shapes.Values, Receiver);
+}
+
+Value Frame::constantCall(Function &D, const std::vector<Node> &Args,
+                          const Token &At, Value Receiver) {
+  std::vector<Value> Actual;
+  for (size_t I = 0; I < Args.size(); ++I) {
+    const auto &Ty = D.Params[I];
+    auto V = eval(Args[I], Ty);
+    if (ends(Ty, "&"))
+      V = bindReference(V, Ty, Args[I].At);
+    else {
+      V = materialize(convert(V, Ty, Args[I].At), Args[I].At);
+      V.Prvalue = V.Expiring = true;
+    }
+    Actual.push_back(V);
+  }
+  return invoke(D, std::move(Actual), At, Receiver, true);
+}
+
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
   if (C.K != Node::Name && C.K != Node::Member &&
@@ -1421,6 +1503,19 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
         return indirect(load(V->second), Args, C.At);
       if (V != I->Names.end())
         fail(C.At, "object is not callable");
+    }
+  }
+  if (C.K == Node::Name && !typeCallee(C.Text, C.At) &&
+      methodOwner(ConstantReceiver ? ConstantReceiver->Type : Self.Type, C.At)
+          .empty()) {
+    auto Key = scopeKey(Prefix, C.Text,
+                        [&](const auto &K) { return U.Globals.count(K); });
+    if (!Key.empty()) {
+      auto V = lookup(C.At);
+      if (ends(V.Type, "*") && U.Signatures.count(element(V.Type)))
+        return indirect(load(V), Args, C.At);
+      if (U.Records.count(V.Type))
+        return callClosure(V, Args, C.At);
     }
   }
   if (C.K == Node::Member) {
@@ -1511,9 +1606,14 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       Name = Owner + "::" + Name;
   auto Key = callKey(Name, Receiver.Type);
   auto Group = visibleOverloads(Key);
-  auto A = evaluateArguments(
-      Args, Group.size() == 1 && !U.FunctionFamilies.count(Key) ? Group.front()
-                                                                : nullptr);
+  auto *Hint = Group.size() == 1 && !U.FunctionFamilies.count(Key)
+                   ? Group.front()
+                   : nullptr;
+  if (!IR) {
+    auto *D = constantOverload(Name, C, Args, Receiver, Hint);
+    return constantCall(*D, Args, C.At, Receiver);
+  }
+  auto A = evaluateArguments(Args, Hint);
   auto *D = select(Name, C, A.Values, Receiver);
   admitArguments(A, D, C.At);
   return invoke(*D, std::move(A.Values), C.At, Receiver, IR != nullptr);
@@ -1978,6 +2078,12 @@ void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
     }
 }
 void Frame::consume(Value V) {
+  if (!IR && V.ConstantTemporary) {
+    llvm::erase_if(Temps, [&](const Value &T) {
+      return T.ConstantTemporary == V.ConstantTemporary;
+    });
+    return;
+  }
   if (V.Address)
     Temps.erase(std::remove_if(Temps.begin(), Temps.end(),
                                [&](auto &T) { return T.Address == V.Address; }),
@@ -1987,6 +2093,10 @@ void Frame::endExpression(size_t From) {
   while (Temps.size() > From) {
     auto V = Temps.back();
     Temps.pop_back();
+    if (!IR && V.ConstantTemporary) {
+      constantDrop(*V.ConstantTemporary, F ? F->Decl.At : Token{});
+      continue;
+    }
     if (V.OptionalTemp) {
       auto *Run = block("temporary.drop"), *Done = block("temporary.done");
       B.CreateCondBr(B.CreateIsNotNull(V.Address), Run, Done);
@@ -2117,6 +2227,7 @@ void Frame::object(const Node &N, bool Global) {
     Simple |= N.Required;
     if (Simple) {
       auto V = construct(Ty, Args, N.At, nullptr, Tail);
+      endExpression();
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
       G->setConstant(Readonly);
       StaticConstant = N.Required ? V.IR : nullptr;
@@ -2216,13 +2327,16 @@ void Frame::object(const Node &N, bool Global) {
       V = floatingConvert(V, Opt.DefaultReal, N.At);
     if (V.Type == "integer")
       V = convert(V, Opt.DefaultInt, N.At);
+    consume(V);
     V.Readonly = Readonly;
     V.Location.reset();
+    V.ConstantTemporary.reset();
     V.Prvalue = V.Expiring = false;
     V.Address = nullptr;
     names()[Name] = V;
     if (U.aggregate(V.Type))
       Scopes.back().ConstantDrops.push_back(Name);
+    endExpression();
     return;
   }
   Value V;
@@ -2389,14 +2503,25 @@ void Frame::stmt(const Node &N) {
       fail(N.At, "borrow of automatic storage escapes the function");
     if (F->Result == "void" && V.Type != "void")
       fail(N.At, "void function cannot return a value");
-    if (ends(F->Result, "&")) {
+    if (ends(F->Result, "&") && !IR && V.Location) {
+      if (!conversionRank(V, F->Result, N.At) ||
+          llvm::any_of(Scopes, [&](const Local &S) {
+            return llvm::any_of(S.Names, [&](const auto &P) {
+              return &P.second == V.Location->Root;
+            });
+          }))
+        fail(N.At, "invalid reference return or borrow of automatic storage");
+      V.Readonly |= baseRef(F->Result) != unconst(baseRef(F->Result));
+      V.Expiring = ends(F->Result, "&&");
+    } else if (ends(F->Result, "&")) {
       if (!V.Address || !conversionRank(V, F->Result, N.At) ||
           llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(V.Address)))
         fail(N.At, "invalid reference return or borrow of automatic storage");
       auto Base = unconst(baseRef(F->Result));
       if (!adjust(V, Base, N.At))
         fail(N.At, "incompatible reference return");
-      V.IR = V.Address;
+      if (IR)
+        V.IR = V.Address;
     } else if (F->Result != "void") {
       V = convert(V, F->Result, N.At);
       V = materialize(V, N.At, Result);
@@ -2410,8 +2535,10 @@ void Frame::stmt(const Node &N) {
       publishPointerResult(V);
     if (Transaction && Live)
       Transaction->checkReturn(N.At);
-    if (!IR)
-      throw ConstantTransfer{Node::Return, V};
+    if (!IR) {
+      endExpression();
+      throw ConstantTransfer{Node::Return, V, {}};
+    }
     endExpression();
     cleanup(0);
     if (V.Type == "void" || Result)
@@ -2490,6 +2617,7 @@ void Frame::stmt(const Node &N) {
     auto S = eval(A[0]);
     if (S.Type == "integer")
       S = convert(S, Opt.DefaultInt, N.At);
+    endExpression();
     if (!integer(S.Type) && !U.Enums.count(S.Type))
       fail(N.At, "switch requires an integer");
     auto *End = IR ? block("switch.end") : nullptr;
@@ -2585,9 +2713,13 @@ void Frame::stmt(const Node &N) {
         for (bool First = true;; First = false) {
           U.chargeConstant(N.At);
           auto &Test = A[For || Do ? 1 : 0];
-          if (!(Do && First) && Test.K != Node::Empty &&
-              llvm::cast<llvm::ConstantInt>(boolean(Test).IR)->isZero())
-            break;
+          if (!(Do && First) && Test.K != Node::Empty) {
+            bool Stop =
+                llvm::cast<llvm::ConstantInt>(boolean(Test).IR)->isZero();
+            endExpression();
+            if (Stop)
+              break;
+          }
           try {
             stmt(A[For ? 3 : Do ? 0 : 1]);
           } catch (const ConstantTransfer &C) {
@@ -2598,8 +2730,10 @@ void Frame::stmt(const Node &N) {
             if (C.Kind != Node::Continue)
               throw;
           }
-          if (For && A[2].K != Node::Empty)
+          if (For && A[2].K != Node::Empty) {
             eval(A[2]);
+            endExpression();
+          }
         }
       } catch (const ConstantTransfer &) {
         endConstantScope();

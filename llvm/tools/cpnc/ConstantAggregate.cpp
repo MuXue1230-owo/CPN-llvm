@@ -17,6 +17,17 @@ ConstantActivation::ConstantActivation(Context &U, const Token &At)
     throw ResourceExhausted{{At, "constant invocation depth exhausted"}};
   U.chargeConstant(At);
 }
+Value Frame::constantTemporary(Value V) {
+  if (!V.Prvalue || !U.aggregate(V.Type) || V.ConstantTemporary)
+    return V;
+  V.Location.reset();
+  V.ConstantTemporary = std::make_shared<Value>(V);
+  V.Location = std::make_shared<ConstantPlace>(
+      ConstantPlace{V.ConstantTemporary.get(), {}, V.Type, V.Readonly});
+  Temps.push_back(V);
+  return V;
+}
+
 Value Frame::constantSelf(const Token &At) {
   auto Place = ConstantReceiver->Location
                    ? *ConstantReceiver->Location
@@ -54,6 +65,9 @@ Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
   if (D.Decl.Prototype || D.Decl.Children.empty())
     fail(At, "constant construction requires a constructor definition");
   Frame Root(U, &D, nullptr);
+  for (size_t I = 0; I < Args.size(); ++I)
+    if (!StringRef(D.Params[I]).ends_with("&") && Args[I].Prvalue)
+      consume(Args[I]);
   Root.bindInlineParams(Args);
   Value Object{D.Owner, llvm::Constant::getNullValue(U.ir(D.Owner))};
   if (U.Variants.count(D.Owner)) {
@@ -141,6 +155,7 @@ Value Frame::constantCopy(Value Source, const Token &At) {
   Source.IR = C;
   Source.Address = nullptr;
   Source.Location.reset();
+  Source.ConstantTemporary.reset();
   Source.Prvalue = Source.Expiring = true;
   Source.Readonly = false;
   return Source;
@@ -185,6 +200,11 @@ Value Frame::constantAggregate(const std::string &T,
     auto V = Input.front();
     if (!V.Prvalue)
       V = constantCopy(V, At);
+    else {
+      consume(V);
+      V.Location.reset();
+      V.ConstantTemporary.reset();
+    }
     if (!Producers.empty())
       fail(At, "unknown initialization target");
     return finishTail(V);
@@ -275,6 +295,7 @@ Value Frame::constantAggregate(const std::string &T,
     if (!C || C->getType() != U.ir(Type, At))
       fail(At, "constant aggregate element required");
     Fields.push_back(C);
+    Init.endExpression();
     if (Record)
       Init.Scopes[0].Names[Record->Fields[I].Decl.Text] = V;
   }
@@ -392,6 +413,7 @@ void ConstantPlace::write(Frame &F, Value V, const Token &At) const {
   if (Steps.empty()) {
     V.Prvalue = V.Expiring = false;
     V.Location.reset();
+    V.ConstantTemporary.reset();
     *Root = V;
     return;
   }

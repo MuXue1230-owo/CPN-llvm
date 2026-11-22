@@ -10,6 +10,7 @@ void Context::tagged(const Node &D, const std::string &Name,
   if (R.Complete)
     fail(D.At, "duplicate union definition");
   R.Decl = D;
+  R.EnclosingScope = llvm::StringRef(P).rtrim(':').str();
   if (!R.IR)
     R.IR = llvm::StructType::create(C, "cpn." + Name);
   if (D.Prototype)
@@ -190,6 +191,8 @@ void Frame::constantMatch(const Node &N) {
   auto Subject = Place ? Place->read(*this, N.At) : eval(SubjectExpr);
   if (!Place && Subject.Location)
     Place = *Subject.Location;
+  if (Subject.Prvalue)
+    consume(Subject);
   auto Alternatives = U.Variants.find(Subject.Type);
   if (Alternatives == U.Variants.end())
     fail(N.At, "match requires a union value");
@@ -257,7 +260,8 @@ void Frame::constantMatch(const Node &N) {
     endConstantScope();
     Scopes.pop_back();
     if (Subject.Prvalue)
-      constantDrop(Subject, N.At);
+      constantDrop(load(Subject), N.At);
+    endExpression();
   };
   try {
     stmt(*Body);

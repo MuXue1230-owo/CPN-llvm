@@ -88,6 +88,11 @@ void Frame::constantDrop(Value Object, const Token &At) {
   if (!U.aggregate(Type))
     return;
   ConstantActivation Activation(U, At);
+  Object = load(Object);
+  Object.Type = Type;
+  Object.Location.reset();
+  Object.ConstantTemporary.reset();
+  Object.Address = nullptr;
   auto *C = llvm::dyn_cast_or_null<llvm::Constant>(Object.IR);
   if (!C)
     fail(At, "constant object required for destruction");

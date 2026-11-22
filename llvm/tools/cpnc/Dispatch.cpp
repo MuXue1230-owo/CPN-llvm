@@ -342,6 +342,16 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto &Sig = U.Signatures.at(T);
   if (Sig.size() != Args.size() + 1)
     fail(At, "wrong argument count");
+  if (!IR) {
+    auto *Target = llvm::dyn_cast_or_null<llvm::Function>(Ptr.IR);
+    if (!Target)
+      fail(At, "constant call requires a designated function");
+    auto Decl = llvm::find_if(
+        U.Functions, [&](const Function &D) { return D.IR == Target; });
+    if (Decl == U.Functions.end())
+      fail(At, "constant call requires a CPN function definition");
+    return constantCall(*Decl, Args, At);
+  }
   std::vector<llvm::Type *> Types;
   std::vector<llvm::Value *> Vals;
   auto *Storage = resultAddress(Sig.front(), At);

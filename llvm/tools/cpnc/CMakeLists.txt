@@ -15,6 +15,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
   configure_file(StorageRuntime.inc.in StorageRuntime.inc @ONLY)
   add_llvm_tool(cpnc
     Binding.cpp
+    BorrowChecks.cpp
     Closure.cpp
     ConstantAggregate.cpp
     Construction.cpp
