@@ -97,7 +97,7 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     if (Default)
       construct(C.Types[I], {}, At, Slot);
     else if (!directConstruction(Args[I], C.Types[I], Slot)) {
-      auto V = convert(eval(Args[I], C.Types[I]), C.Types[I], Args[I].At);
+      auto V = convert(eval(Args[I], C.Types[I], Slot), C.Types[I], Args[I].At);
       materialize(V, Args[I].At, Slot);
     }
   }

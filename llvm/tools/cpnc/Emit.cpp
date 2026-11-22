@@ -126,7 +126,7 @@ Value Frame::member(Value Obj, const Token &T) {
   fail(T, "unknown member '" + T.Text + "'");
 }
 void Frame::bindParams() {
-  size_t I = 0;
+  size_t I = U.aggregate(F->Result) ? 1 : 0;
   if (!F->Owner.empty() && !F->isStatic()) {
     Self = {F->Owner, nullptr, IR->getArg(I++), F->Decl.Const};
     Scopes[0].Names["this"] = {
@@ -147,8 +147,11 @@ void Frame::bindParams() {
                                     {V.Slot, B.getFalse()});
       }
     } else {
-      auto *Ptr = allocate(T, P.At);
-      B.CreateStore(A, Ptr);
+      llvm::Value *Ptr = A;
+      if (!U.aggregate(T)) {
+        Ptr = allocate(T, P.At);
+        B.CreateStore(A, Ptr);
+      }
       V = {T, nullptr, Ptr, P.Const};
       if (TracksStorage && !ends(T, "*")) {
         V.Storage = "parameter." + std::to_string(U.Serial++);
@@ -239,7 +242,9 @@ Value Frame::constantEval(const Node &N) {
     fail(N.At, "constant expression required");
   return V;
 }
-Value Frame::eval(const Node &N, std::string Expected) {
+Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
+  llvm::SaveAndRestore Destination(ExpressionDestination,
+                                   Value{Expected, nullptr, Dest});
   auto &A = N.Children;
   auto Op = N.Text;
   if (!IR && U.ConstantDepth && ++U.ConstantSteps > 100000)
@@ -331,12 +336,16 @@ Value Frame::eval(const Node &N, std::string Expected) {
     return load(subscript(N));
   case Node::Member:
     return load(place(N));
-  case Node::Call:
-    return call(A[0], std::vector<Node>(A.begin() + 1, A.end()));
+  case Node::Call: {
+    auto V = call(A[0], std::vector<Node>(A.begin() + 1, A.end()));
+    if (Dest && V.Address == Dest && U.aggregate(V.Type))
+      V.Prvalue = V.Expiring = true;
+    return V;
+  }
   case Node::Configured: {
     auto Old = Opt;
     configure(Opt, N);
-    auto V = eval(A[0], Expected);
+    auto V = eval(A[0], Expected, Dest);
     Opt = Old;
     return V;
   }
@@ -470,40 +479,76 @@ Value Frame::eval(const Node &N, std::string Expected) {
       auto *Yes = block("then"), *No = block("else"), *Done = block("end");
       B.CreateCondBr(C.IR, Yes, No);
       size_t Mark = Temps.size();
-      B.SetInsertPoint(Yes);
-      Value X = N.K == Node::Conditional ? eval(A[1], Expected)
-                : Op == "&&"             ? boolean(A[1])
-                                         : literal(1, "bool");
-      if (N.K != Node::Conditional)
-        endExpression(Mark);
+      auto arm = [&](unsigned I, llvm::BasicBlock *Entry,
+                     std::vector<Value> &Owned) {
+        B.SetInsertPoint(Entry);
+        auto V = N.K == Node::Conditional   ? eval(A[I], Expected, Dest)
+                 : (I == 1) == (Op == "&&") ? boolean(A[1])
+                                            : literal(I == 1, "bool");
+        Owned.assign(Temps.begin() + Mark, Temps.end());
+        Temps.resize(Mark);
+        return V;
+      };
+      std::vector<Value> YesTemps, NoTemps;
+      auto X = arm(1, Yes, YesTemps);
       auto *EndYes = B.GetInsertBlock();
-      B.SetInsertPoint(No);
-      Value Y = N.K == Node::Conditional ? eval(A[2], Expected)
-                : Op == "||"             ? boolean(A[1])
-                                         : literal(0, "bool");
-      if (N.K != Node::Conditional)
-        endExpression(Mark);
+      auto Y = arm(2, No, NoTemps);
       auto *EndNo = B.GetInsertBlock();
       auto T = X.Type == "integer" ? Y.Type : X.Type;
       if (T == "integer")
         T = Expected.empty() ? Opt.DefaultInt : Expected;
-      B.SetInsertPoint(EndNo);
-      Y = convert(Y, T, N.At);
-      branch(Done);
-      B.SetInsertPoint(EndYes);
-      X = convert(X, T, N.At);
-      branch(Done);
+      bool OwnedResult = U.aggregate(T) && (X.Prvalue || Y.Prvalue);
+      auto finishArm = [&](Value V, std::vector<Value> &Owned,
+                           llvm::BasicBlock *&Exit) {
+        B.SetInsertPoint(Exit);
+        V = convert(V, T, N.At);
+        if (OwnedResult) {
+          auto Source = V;
+          if (!V.Prvalue || Dest)
+            V = materialize(V, N.At, Dest);
+          llvm::erase_if(Owned, [&](const Value &Temp) {
+            return Source.Prvalue && Temp.Address == Source.Address;
+          });
+          if (Dest)
+            V.Address = Dest;
+        }
+        Exit = B.GetInsertBlock();
+        branch(Done);
+        return V;
+      };
+      X = finishArm(X, YesTemps, EndYes);
+      Y = finishArm(Y, NoTemps, EndNo);
       B.SetInsertPoint(Done);
-      auto *P = B.CreatePHI(U.ir(T), 2);
-      P->addIncoming(X.IR, EndYes);
-      P->addIncoming(Y.IR, EndNo);
-      Value V{T, P};
+      auto merge = [&](llvm::Value *L, llvm::Value *R) -> llvm::Value * {
+        if (L == R)
+          return L;
+        auto *Phi = B.CreatePHI(L->getType(), 2);
+        Phi->addIncoming(L, EndYes);
+        Phi->addIncoming(R, EndNo);
+        return Phi;
+      };
+      // Only the evaluated arm's temporaries exist. Keep their guarded
+      // addresses until the enclosing full-expression has finished.
+      auto selectedTemps = [&](std::vector<Value> &Owned, bool TrueArm) {
+        auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
+        for (auto Temp : Owned) {
+          Temp.Address =
+              TrueArm ? merge(Temp.Address, Null) : merge(Null, Temp.Address);
+          Temp.IR = nullptr;
+          Temp.OptionalTemp = true;
+          Temps.push_back(Temp);
+        }
+      };
+      selectedTemps(YesTemps, true);
+      selectedTemps(NoTemps, false);
+      Value V{T, T == "void" ? nullptr : merge(X.IR, Y.IR)};
       if (X.Address && Y.Address) {
-        auto *L = B.CreatePHI(B.getPtrTy(), 2);
-        L->addIncoming(X.Address, EndYes);
-        L->addIncoming(Y.Address, EndNo);
-        V.Address = L;
+        V.Address = merge(X.Address, Y.Address);
         V.Readonly = X.Readonly || Y.Readonly;
+        V.Expiring = OwnedResult || (X.Expiring && Y.Expiring);
+        V.Prvalue = OwnedResult;
+        if (V.Prvalue && V.Address != Dest)
+          Temps.push_back(V);
       }
       return V;
     }
@@ -850,7 +895,8 @@ Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
 // Bind all argument types before connecting their executable blocks. Each
 // argument's parameter initialization then precedes its successor expression.
 CallArguments Frame::evaluateArguments(const std::vector<Node> &Args,
-                                       Function *Context) {
+                                       Function *Context,
+                                       Value SingleDestination) {
   CallArguments A;
   for (size_t I = 0; I < Args.size(); ++I) {
     if (IR) {
@@ -858,9 +904,13 @@ CallArguments Frame::evaluateArguments(const std::vector<Node> &Args,
         B.SetInsertPoint(block("argument"));
       A.Entries.push_back(B.GetInsertBlock());
     }
-    A.Values.push_back(eval(Args[I], Context && I < Context->Params.size()
-                                         ? Context->Params[I]
-                                         : ""));
+    auto Expected =
+        Context && I < Context->Params.size() ? Context->Params[I] : "";
+    if (Args.size() == 1 && SingleDestination.Address)
+      A.Values.push_back(
+          eval(Args[I], SingleDestination.Type, SingleDestination.Address));
+    else
+      A.Values.push_back(eval(Args[I], Expected));
     if (IR)
       A.Exits.push_back(B.GetInsertBlock());
   }
@@ -888,6 +938,9 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
   std::vector<llvm::Value *> Values;
+  auto *ResultStorage = resultAddress(D.Result, T);
+  if (ResultStorage)
+    Values.push_back(ResultStorage);
   if (!D.Owner.empty() && !D.isStatic())
     Values.push_back(Receiver.Address);
   auto Original = std::move(Scopes);
@@ -912,7 +965,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if (!Prepared || I >= Actual.size())
       V = ends(Ty, "&") ? bindReference(V, Ty, P.At)
                         : materialize(convert(V, Ty, T), T);
-    if (!ends(Ty, "&") && Defaults && !Constant) {
+    if (!ends(Ty, "&") && !U.aggregate(Ty) && Defaults && !Constant) {
       auto *Addr = allocate(Ty, P.At);
       B.CreateStore(V.IR, Addr);
       V = {Ty, nullptr, Addr};
@@ -925,8 +978,10 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto &P = D.DefaultParams[I];
     auto V =
         Defaults && !P.Text.empty() ? Scopes.back().Names.at(P.Text) : Cells[I];
-    Values.push_back(ends(D.Params[I], "&") && !Constant ? V.Address
-                                                         : load(V).IR);
+    Values.push_back((ends(D.Params[I], "&") || U.aggregate(D.Params[I])) &&
+                             !Constant
+                         ? V.Address
+                         : load(V).IR);
   }
   Scopes = std::move(Original);
   Prefix = std::move(OldPrefix);
@@ -971,7 +1026,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto *Delta =
         B.CreateLoad(B.getInt64Ty(),
                      B.CreateGEP(B.getInt64Ty(), Deltas, B.getInt64(D.Slot)));
-    Values[0] = B.CreateGEP(B.getInt8Ty(), Receiver.Address, Delta);
+    Values[ResultStorage ? 1 : 0] =
+        B.CreateGEP(B.getInt8Ty(), Receiver.Address, Delta);
     Call = B.CreateCall(D.IR->getFunctionType(),
                         B.CreateLoad(B.getPtrTy(), Slot), Values);
   } else
@@ -987,7 +1043,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if ((ends(D.Params[I], "&") || ends(D.Params[I], "*")) &&
         !Actual[I].Storage.empty() && Active.count(Actual[I].Storage))
       Active[Actual[I].Storage] = -1;
-  return callResult(D.Result, Call, T);
+  return callResult(D.Result, Call, T, ResultStorage);
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
@@ -1015,7 +1071,11 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     fail(C.At, "callable expression required");
   auto Name = C.Text;
   if (const auto *Case = findCase(Name, C.At))
-    return variant(*Case, Args, C.At);
+    return variant(*Case, Args, C.At,
+                   (Case->Owner == ExpressionDestination.Type ||
+                    ExpressionDestination.Type.empty())
+                       ? ExpressionDestination.Address
+                       : nullptr);
   if (Name == "std::forward" && C.TemplateArgs.size() == 1 &&
       Args.size() == 1) {
     auto Ty = resolve(C.TemplateArgs[0].Type, C.At);
@@ -1048,8 +1108,14 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
        Args.size() == 1) ||
       (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1))
     return storageCall(C, Args);
-  if (C.K == Node::Name && typeCallee(Name))
-    return construct(resolve(Name, C.At), Args, C.At);
+  if (C.K == Node::Name && typeCallee(Name)) {
+    auto T = resolve(Name, C.At);
+    return construct(
+        T, Args, C.At,
+        (T == ExpressionDestination.Type || ExpressionDestination.Type.empty())
+            ? ExpressionDestination.Address
+            : nullptr);
+  }
   if (Receiver.Type.empty() && !Self.Type.empty() &&
       !methodOwner(Self.Type, C.At).empty())
     Receiver = Self;
@@ -1165,10 +1231,10 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Args.size() != 1)
       fail(At, "union construction requires a selected case");
     const auto &Arg = Args.front();
-    auto V = convert(eval(Arg), T, At);
     if (!IR)
       fail(At, "union construction requires object storage");
     auto *Ptr = Dest ? Dest : allocate(T, At);
+    auto V = convert(eval(Arg, T, Ptr), T, At);
     materialize(V, At, Ptr);
     Value Result{T, B.CreateLoad(Ty, Ptr), Ptr};
     if (!Dest) {
@@ -1186,7 +1252,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     Obj.BaseView = AsBase;
     if (!AsBase)
       bindVirtualLayout(Obj);
-    auto Arguments = evaluateArguments(Args);
+    auto Arguments = evaluateArguments(Args, nullptr, AsBase ? Value{} : Obj);
     auto &Actual = Arguments.Values;
     std::map<std::string, const Node *> Producers;
     if (Tail)
@@ -1411,7 +1477,15 @@ void Frame::endExpression(size_t From) {
   while (Temps.size() > From) {
     auto V = Temps.back();
     Temps.pop_back();
-    drop(V);
+    if (V.OptionalTemp) {
+      auto *Run = block("temporary.drop"), *Done = block("temporary.done");
+      B.CreateCondBr(B.CreateIsNotNull(V.Address), Run, Done);
+      B.SetInsertPoint(Run);
+      drop(V);
+      branch(Done);
+      B.SetInsertPoint(Done);
+    } else
+      drop(V);
   }
 }
 void Frame::object(const Node &N, bool Global) {
@@ -1661,8 +1735,9 @@ void Frame::stmt(const Node &N) {
   }
   if (N.K == Node::Return) {
     Value V{"void"};
+    auto *Result = IR && F && U.aggregate(F->Result) ? IR->getArg(0) : nullptr;
     if (!A.empty())
-      V = eval(A[0], F ? F->Result : "");
+      V = eval(A[0], F ? F->Result : "", Result);
     if (!F)
       fail(N.At, "return requires a function");
     if (ends(F->Result, "*") && !V.Storage.empty() && Extents.count(V.Storage))
@@ -1680,13 +1755,13 @@ void Frame::stmt(const Node &N) {
     } else if (F->Result != "void") {
       V = convert(V, F->Result, N.At);
       if (IR)
-        V = materialize(V, N.At);
+        V = materialize(V, N.At, Result);
     }
     if (!IR)
       throw Transfer{Node::Return, V};
     endExpression();
     cleanup(0);
-    if (V.Type == "void")
+    if (V.Type == "void" || Result)
       B.CreateRetVoid();
     else
       B.CreateRet(V.IR);

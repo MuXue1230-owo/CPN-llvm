@@ -2041,6 +2041,79 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_final_storage_through_calls_and_indirect_aggregate_abi(self):
+        self.assertEqual(
+            self.program("""
+            i32 copies; i32 moves;
+            struct Self {
+                Self* address; i32 n;
+                Self(i32 v){init address(this);init n(v);}
+                Self(const<Self>& other){init address(this);init n(other.n);++copies;}
+                Self(Self&& other){init address(this);init n(other.n);++moves;}
+                bool same() const {return address==this;}
+            };
+            Self make(i32 n){return Self(n);}
+            Self local(){Self a(10);return a;}
+            Self moved(){Self a(12);return std::move(a);}
+            i32 read(Self s){if(!s.same()){return 0;}return s.n;}
+            struct Factory{virtual Self get(){return Self(1);}};
+            struct Derived:Factory{Self get() override{return make(20);}};
+            i32 main(){
+                function<Self(i32)>* f(&make); Self s(f(10));
+                if(!s.same() || read(s)!=10 || copies!=1 || moves!=0){return 1;}
+                function<i32(Self)>* take(&read); if(take(make(30))!=30){return 2;}
+                Self a(local()); Self b(moved());
+                Derived d; Factory& factory(d);
+                Self c(factory.get());
+                if(!a.same() || !b.same() || !c.same() || copies!=2 || moves!=1){return 3;}
+                return a.n+b.n+c.n;
+            }"""),
+            42,
+        )
+
+    def test_conditional_results_and_owning_captures_use_final_storage(self):
+        self.assertEqual(
+            self.program("""
+            i32 drops; i32 copies;
+            struct S {S* addr;i32 n;
+                S(i32 v){init addr(this);init n(v);}
+                S(const<S>& s){init addr(this);init n(s.n);++copies;}
+                ~S(){++drops;}
+                bool valid() const{return this==addr;}
+            };
+            S make(i32 n){return S(n);}
+            S choose(bool b, S& other){return b ? make(10) : other;}
+            i32 main(){
+                { S local(32);S a(choose(true,local));S b(choose(false,local));
+                  if(!a.valid() || !b.valid() || drops!=0 || copies!=1){return 1;}
+                  auto fn([local,k(make(10))] i32(){
+                      if(!local.valid() || !k.valid()){return 0;} return local.n+k.n;
+                  });
+                  if(fn()!=42 || copies!=2){return 2;}
+                  auto selected(false ? make(1) : make(7));
+                  if(!selected.valid() || selected.n!=7){return 3;}
+                }
+                if(drops!=6){return 4;}return 42;
+            }"""),
+            42,
+        )
+
+    def test_returned_union_and_array_fields_keep_their_addresses(self):
+        self.assertEqual(
+            self.program("""
+            struct T{T* self; T(){init self(this);}};
+            union U{case A(T value);};
+            U build(){return U::A(T());}
+            T make(){return T();}
+            struct Holder{T[2] array(make(),make());U item(build());};
+            i32 main(){Holder h;
+                if(h.array[0].self!=&h.array[0] || h.array[1].self!=&h.array[1]){return 1;}
+                match(h.item){case U::A(ref v){if(v.self==&v){return 42;}}}
+                return 0;}
+            """),
+            42,
+        )
+
     def test_value_parameters_returns_and_elided_results(self):
         self.assertEqual(
             self.program("""

@@ -14,7 +14,7 @@ struct Value {
   std::string Storage, RealText;
   llvm::Value *Generation = nullptr, *Slot = nullptr;
   std::string ExtentType;
-  bool Subobject = false;
+  bool Subobject = false, OptionalTemp = false;
   void borrow(const Value &V) {
     Generation = V.Generation;
     Slot = V.Slot;
@@ -121,6 +121,9 @@ struct Context {
   std::map<std::string, Value> Globals, ExternalObjects;
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
+  bool aggregate(const std::string &T) const {
+    return Records.count(T) || llvm::StringRef(T).ends_with("]");
+  }
   llvm::StructType *SlotType = nullptr;
   std::map<std::string, llvm::Constant *> TypeIDs;
   void enableStorage();
@@ -247,6 +250,8 @@ public:
   std::string directField(const Node &) const;
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
+  Value ExpressionDestination;
+  llvm::Value *resultAddress(const std::string &, const Token &);
   bool Live = true, RequireNoexcept = false, BaseLayer = false;
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
@@ -256,13 +261,15 @@ public:
   void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &,
                 bool AsBase = false);
   Value bindReference(Value, const std::string &, const Token &);
-  Value callResult(const std::string &, llvm::Value *, const Token &);
+  Value callResult(const std::string &, llvm::Value *, const Token &,
+                   llvm::Value *Storage);
   Value constant(llvm::APInt, std::string Type = "integer");
   Value literal(int64_t, const std::string &Ty = "integer");
   Value convert(Value, const std::string &, const Token &);
   Value binary(const Node &, Value, Value);
   Value boolean(const Node &);
-  Value eval(const Node &, std::string Expected = "");
+  Value eval(const Node &, std::string Expected = "",
+             llvm::Value *Dest = nullptr);
   Value constantEval(const Node &);
   Value floatingConvert(Value, const std::string &, const Token &,
                         bool Explicit = false);
@@ -274,7 +281,8 @@ public:
   std::string resolve(std::string, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
   CallArguments evaluateArguments(const std::vector<Node> &,
-                                  Function *Context = nullptr);
+                                  Function *Context = nullptr,
+                                  Value SingleDestination = {});
   void admitArguments(CallArguments &, Function *, const Token &);
   Value invoke(Function &, std::vector<Value>, const Token &,
                Value Receiver = {}, bool Prepared = false);

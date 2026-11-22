@@ -130,6 +130,13 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   bool Cmp = Op == "==" || Op == "!=" || Op == "<" || Op == "<=" || Op == ">" ||
              Op == ">=";
   if (!integer(A.Type) || !integer(D.Type)) {
+    if ((Op == "==" || Op == "!=") && A.Type != D.Type &&
+        StringRef(A.Type).ends_with("*") && StringRef(D.Type).ends_with("*")) {
+      if (conversionRank(A, D.Type, At))
+        A = convert(A, D.Type, At);
+      else if (conversionRank(D, A.Type, At))
+        D = convert(D, A.Type, At);
+    }
     if (Cmp && (Op == "==" || Op == "!=") &&
         (A.Type == D.Type || A.Type == "nullptr_t" || D.Type == "nullptr_t") &&
         A.IR->getType() == D.IR->getType())

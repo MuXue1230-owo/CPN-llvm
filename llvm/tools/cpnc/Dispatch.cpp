@@ -257,18 +257,26 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
     fail(At, "wrong argument count");
   std::vector<llvm::Type *> Types;
   std::vector<llvm::Value *> Vals;
+  auto *Storage = resultAddress(Sig.front(), At);
+  if (Storage) {
+    Types.push_back(B.getPtrTy());
+    Vals.push_back(Storage);
+  }
   for (size_t I = 0; I < Args.size(); ++I) {
-    Types.push_back(U.ir(Sig[I + 1]));
+    Types.push_back(U.aggregate(Sig[I + 1]) ? B.getPtrTy() : U.ir(Sig[I + 1]));
     auto &Param = Sig[I + 1];
     auto V = eval(Args[I], Param);
     if (llvm::StringRef(Param).ends_with("&"))
       Vals.push_back(bindReference(V, Param, At).Address);
-    else
-      Vals.push_back(materialize(convert(V, Param, At), At).IR);
+    else {
+      V = materialize(convert(V, Param, At), At);
+      Vals.push_back(U.aggregate(Param) ? V.Address : V.IR);
+    }
   }
-  auto *FT = llvm::FunctionType::get(U.ir(Sig.front()), Types, false);
+  auto *FT = llvm::FunctionType::get(
+      Storage ? B.getVoidTy() : U.ir(Sig.front()), Types, false);
   auto *Before = wholeEpoch();
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
   propagateWhole(Before);
-  return callResult(Sig[0], Call, At);
+  return callResult(Sig[0], Call, At, Storage);
 }

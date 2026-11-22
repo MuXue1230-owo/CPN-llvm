@@ -136,8 +136,9 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
 }
 
 Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
-  bool Aggregate = U.Records.count(Source.Type) ||
-                   llvm::StringRef(Source.Type).ends_with("]");
+  bool Aggregate = U.aggregate(Source.Type);
+  if (Dest && Dest == Source.Address)
+    return Source;
   if (!Aggregate || !Source.Address || Source.Prvalue) {
     if (Source.Prvalue)
       consume(Source);
@@ -154,8 +155,16 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
   return {Source.Type, B.CreateLoad(U.ir(Source.Type, At), Dest), Dest};
 }
 
+llvm::Value *Frame::resultAddress(const std::string &T, const Token &At) {
+  if (!IR || !U.aggregate(T))
+    return nullptr;
+  if (ExpressionDestination.Address &&
+      (ExpressionDestination.Type.empty() || ExpressionDestination.Type == T))
+    return ExpressionDestination.Address;
+  return allocate(T, At);
+}
 Value Frame::callResult(const std::string &T, llvm::Value *IRValue,
-                        const Token &At) {
+                        const Token &At, llvm::Value *Storage) {
   if (llvm::StringRef(T).ends_with("&")) {
     auto Base = T.substr(0, T.find_last_not_of('&') + 1);
     bool RO = llvm::StringRef(Base).starts_with("const<") && Base.back() == '>';
@@ -164,12 +173,11 @@ Value Frame::callResult(const std::string &T, llvm::Value *IRValue,
     Ref.Expiring = llvm::StringRef(T).ends_with("&&");
     return load(Ref);
   }
-  if (!U.Records.count(T) && !llvm::StringRef(T).ends_with("]"))
+  if (!Storage)
     return {T, IRValue};
-  auto *Ptr = allocate(T, At);
-  B.CreateStore(IRValue, Ptr);
-  Value V{T, IRValue, Ptr};
+  Value V{T, B.CreateLoad(U.ir(T, At), Storage), Storage};
   V.Expiring = V.Prvalue = true;
-  Temps.push_back(V);
+  if (Storage != ExpressionDestination.Address)
+    Temps.push_back(V);
   return V;
 }

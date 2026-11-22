@@ -363,6 +363,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
                  ? "void"
                  : Resolver.resolve(N.Type, N.At);
   std::vector<llvm::Type *> Types;
+  if (aggregate(D.Result))
+    Types.push_back(llvm::PointerType::getUnqual(C));
   if (!Owner.empty() && !D.isStatic())
     Types.push_back(llvm::PointerType::getUnqual(C));
   bool HasDefault = false;
@@ -379,7 +381,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
     else if (HasDefault)
       fail(Arg.At, "default arguments must form a trailing suffix");
     D.Params.push_back(Resolver.resolve(Arg.Type, Arg.At));
-    Types.push_back(ir(D.Params.back(), Arg.At));
+    Types.push_back(aggregate(D.Params.back()) ? llvm::PointerType::getUnqual(C)
+                                               : ir(D.Params.back(), Arg.At));
   }
   if (operatorSpelling(N.Text))
     checkOperator(D, *this);
@@ -448,7 +451,9 @@ Function *Context::declare(const Node &N, const std::string &Name,
   bool Export = N.Foreign || Name == "main";
   if (Name == "main" && (D.Result != "i32" || !D.Params.empty()))
     fail(N.At, "the hosted entry point must be i32 main()");
-  auto *FT = llvm::FunctionType::get(ir(D.Result, N.At), Types, false);
+  auto *FT = llvm::FunctionType::get(
+      aggregate(D.Result) ? llvm::Type::getVoidTy(C) : ir(D.Result, N.At),
+      Types, false);
   std::string Symbol = N.Foreign ? N.Text
                        : Export
                            ? Name

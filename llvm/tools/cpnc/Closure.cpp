@@ -7,9 +7,14 @@ Value Frame::closure(const Node &N) {
                      std::to_string(N.At.Line) + "." +
                      std::to_string(N.At.Column);
   std::vector<Value> Values;
+  std::vector<llvm::AllocaInst *> Slots;
   for (auto &C : N.TemplateArgs) {
-    Value V =
-        C.Type == "initializer" ? eval(C.Children[0]) : load(lookup(C.At));
+    // Capture types determine the closure layout. Redirect this opaque
+    // address to its final field as soon as all capture types are known.
+    auto *Slot = B.CreateAlloca(B.getInt8Ty());
+    Slots.push_back(Slot);
+    Value V = C.Type == "initializer" ? eval(C.Children[0], "", Slot)
+                                      : load(lookup(C.At));
     if (C.Type == "borrow") {
       if (!V.Address)
         fail(C.At, "borrow capture requires an object lvalue");
@@ -24,8 +29,10 @@ Value Frame::closure(const Node &N) {
         V = convert(V, Opt.DefaultInt, C.At);
       if (V.Type == "real")
         V = floatingConvert(V, Opt.DefaultReal, C.At);
-      V = materialize(V, C.At);
+      materialize(V, C.At, Slot);
     }
+    if (C.Type == "borrow" || C.Type == "this")
+      B.CreateStore(V.IR, Slot);
     Values.push_back(V);
   }
   if (!U.Records.count(Type)) {
@@ -50,14 +57,22 @@ Value Frame::closure(const Node &N) {
     U.emit(*D);
   }
   auto &R = U.Records.at(Type);
-  auto *Ptr = allocate(Type, N.At);
+  auto *Ptr =
+      ExpressionDestination.Address && (ExpressionDestination.Type == Type ||
+                                        ExpressionDestination.Type.empty())
+          ? ExpressionDestination.Address
+          : allocate(Type, N.At);
   if (Values.empty())
     B.CreateStore(llvm::Constant::getNullValue(R.IR), Ptr);
-  for (size_t I = 0; I < Values.size(); ++I)
-    B.CreateStore(Values[I].IR, B.CreateStructGEP(R.IR, Ptr, I));
+  for (size_t I = 0; I < Slots.size(); ++I) {
+    llvm::IRBuilder<> Field(Slots[I]);
+    Slots[I]->replaceAllUsesWith(Field.CreateStructGEP(R.IR, Ptr, I));
+    Slots[I]->eraseFromParent();
+  }
   Value V{Type, B.CreateLoad(R.IR, Ptr), Ptr};
   V.Expiring = V.Prvalue = true;
-  Temps.push_back(V);
+  if (Ptr != ExpressionDestination.Address)
+    Temps.push_back(V);
   return V;
 }
 void Frame::bindCaptures() {
