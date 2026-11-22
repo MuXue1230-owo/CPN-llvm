@@ -626,6 +626,27 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_unary_and_comparison_constraint_witnesses(self):
+        for definition in [
+            "generic<type T> T neg(T v){return -v;}",
+            "generic<type T> bool less(T a,T b){return a<b;}",
+            "constraint Prefix<type T>{expression(T& a){++a->T&;}};"
+            "generic<type T> requires(Prefix<T>) T next(T v){return v++;}",
+        ]:
+            r = self.compile(definition, "--check")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("not established", r.stderr)
+        self.assertEqual(
+            self.program("""
+            constraint Ordered<type X>{expression(X v,X w){v<w->bool;-v->X;}}
+            ;
+            generic<type T> requires(Ordered<T>) T positive(T v){
+              if(v<T(0)){return -v;}return v;}
+            i32 main(){return positive(i32(-42));}
+        """),
+            42,
+        )
+
     def test_uninstantiated_dependent_arithmetic_requires_evidence(self):
         for definition in (
             "generic<type T> T plus(T a, T b){return a+b;}",

@@ -10,6 +10,21 @@ struct Domain {
 };
 using Alternatives = std::vector<Domain>;
 
+bool needsWitness(const Node &N) {
+  static const std::set<std::string> Binary = {
+      "+",   "-",   "*",  "/",  "%",  "|",  "&",  "^",  "<<",
+      ">>",  "+=",  "-=", "*=", "/=", "%=", "|=", "&=", "^=",
+      "<<=", ">>=", "==", "!=", "<",  ">",  "<=", ">="};
+  static const std::set<std::string> Unary = {"+", "-", "~", "!", "++", "--"};
+  return N.K == Node::Binary ? Binary.count(N.Text)
+                             : N.K == Node::Unary && Unary.count(N.Text);
+}
+std::string operatorKey(const Node &N) {
+  if (N.K == Node::Unary)
+    return std::string(N.Definition ? "postfix " : "prefix ") + N.Text;
+  return N.Text;
+}
+
 std::string valueType(std::string T) {
   while (llvm::StringRef(T).ends_with("&"))
     T.pop_back();
@@ -119,9 +134,10 @@ struct Checker {
       for (auto &P : R.Params)
         Locals[P.Text] = substitute(P.Type, Actual);
       for (auto &E : R.Children)
-        if (E.K == Node::Binary) {
-          Operation Op{E.Text, operand(E.Children[0], Locals),
-                       operand(E.Children[1], Locals)};
+        if (needsWitness(E)) {
+          Operation Op{operatorKey(E), operand(E.Children[0], Locals),
+                       E.K == Node::Binary ? operand(E.Children[1], Locals)
+                                           : ""};
           for (auto &D : Alts)
             D.Operations[Op] = substitute(E.Type, Actual);
         }
@@ -152,15 +168,16 @@ struct Checker {
     if (N.K == Node::Object)
       Variables[N.Text] =
           N.Type == "auto" && !Types.empty() ? Types.front() : N.Type;
-    static const std::set<std::string> Arithmetic = {
-        "+",  "-",  "*",  "/",  "%",  "|",  "&",  "^",  "<<",  ">>",
-        "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>="};
-    if (N.K != Node::Binary || !Arithmetic.count(N.Text) || Types[0].empty() ||
-        Types[1].empty())
+    if (!needsWitness(N) || Types[0].empty() ||
+        (N.K == Node::Binary && Types[1].empty()))
       return operand(N, Variables);
-    auto A = Types[0], B = Types[1];
+    auto A = Types[0], B = N.K == Node::Binary ? Types[1] : "";
+    bool Boolean = N.Text == "!" || N.Text == "==" || N.Text == "!=" ||
+                   N.Text == "<" || N.Text == ">" || N.Text == "<=" ||
+                   N.Text == ">=";
     if (!Parameters.count(A) && !Parameters.count(B))
-      return A == "integer" ? B : A;
+      return Boolean ? "bool" : A == "integer" && !B.empty() ? B : A;
+    auto OpKey = operatorKey(N);
     std::string Result;
     for (const auto &D : Alts) {
       auto X = representative(A, D), Y = representative(B, D);
@@ -169,7 +186,7 @@ struct Checker {
         continue;
       auto W = llvm::find_if(D.Operations, [&](auto &Entry) {
         auto &[Op, Left, Right] = Entry.first;
-        return Op == N.Text && representative(Left, D) == X &&
+        return Op == OpKey && representative(Left, D) == X &&
                representative(Right, D) == Y;
       });
       if (W == D.Operations.end())
@@ -177,7 +194,9 @@ struct Checker {
                        "' is not established by the declared constraints");
       Result = W->second;
     }
-    return Result.empty() ? (Parameters.count(A) ? A : B) : Result;
+    if (!Result.empty())
+      return Result;
+    return Boolean ? "bool" : Parameters.count(A) ? A : B;
   }
 };
 } // namespace
