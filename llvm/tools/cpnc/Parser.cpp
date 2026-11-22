@@ -270,11 +270,12 @@ class Parser {
           T.Text != "nullptr" && T.Text != "this")
         fail(T, "expected expression");
       N = Node(Node::Name, qualified());
-      if (is("<") && (Families.count(N.Text) || N.Text == "SameType" ||
-                      N.Text == "ObjectType" || N.Text == "CompleteType" ||
+      if (is("<") && (Families.count(N.Text) || builtinPredicate(N.Text) ||
                       N.Text == "destroy_base" || N.Text == "abandon_base" ||
-                      N.Text == "construct_at" || N.Text == "std::forward"))
+                      N.Text == "construct_at" || N.Text == "std::forward")) {
+        N.ExplicitApplication = true;
         N.TemplateArgs = templateArgs(N.Text);
+      }
     } else
       fail(T, "expected expression");
     for (;;) {
@@ -658,6 +659,13 @@ class Parser {
   Node declaration(bool Foreign = false, bool Member = false) {
     Nest Guard(Depth, peek());
     auto T = peek();
+    if (eat("configured")) {
+      Node Policy(Node::Configured, T);
+      Policy.Settings = settings(false);
+      auto D = declaration(Foreign, Member);
+      D.Policies.insert(D.Policies.begin(), std::move(Policy));
+      return D;
+    }
     if (is("[") && peek(1).Text == "[") {
       std::map<std::string, std::string> Attr;
       while (eat("[")) {
@@ -701,11 +709,16 @@ class Parser {
         N.Children.push_back(declaration(true));
       else
         fail(T, "expected '{'");
-      if (NS)
-        for (auto &C : N.Children)
+      if (NS) {
+        for (auto &C : N.Children) {
+          auto Key = N.Text + "::" + C.Text;
           if (C.K == Node::Record || C.K == Node::Alias ||
-              C.K == Node::Enumeration)
-            Types.insert(N.Text + "::" + C.Text);
+              C.K == Node::Enumeration || C.K == Node::Union)
+            Types.insert(Key);
+          if (!C.Generics.empty())
+            Families[Key] = C.Generics;
+        }
+      }
       return N;
     }
     if (eat("constraint")) {
@@ -1032,6 +1045,19 @@ void cpn::configure(Options &O, const Node &N) {
     auto &V = KV.second;
     if (K == "preset")
       continue;
+    if (K == "generic.max_normalization_nodes" ||
+        K == "generic.max_solver_steps" || K == "generic.max_instantiations") {
+      uint64_t Limit;
+      if (StringRef(V).getAsInteger(10, Limit) || !Limit)
+        fail(N.At, "CFG001: generic resource limit must be a positive integer");
+      if (K == "generic.max_normalization_nodes")
+        O.MaxNormalNodes = Limit;
+      else if (K == "generic.max_solver_steps")
+        O.MaxSolverSteps = Limit;
+      else
+        O.MaxInstantiations = Limit;
+      continue;
+    }
     if (K == "numeric.literal.real_default") {
       if (!floating(V))
         fail(N.At, "unsupported real default");

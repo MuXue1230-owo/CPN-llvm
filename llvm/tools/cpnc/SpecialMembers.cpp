@@ -24,6 +24,35 @@ const char *operationName(SpecialOperation Op) {
 }
 } // namespace
 
+bool Frame::constructible(const std::string &T, SpecialOperation Op,
+                          const Token &At) {
+  if (llvm::StringRef(T).ends_with("]"))
+    return constructible(element(T), Op, At);
+  auto I = U.Records.find(T);
+  if (I == U.Records.end())
+    return U.ir(T, At)->isSized();
+  auto &R = I->second;
+  if (!R.Complete)
+    return false;
+  if (R.Decl.K != Node::Lambda) {
+    auto Member = R.Special.find(Op);
+    if (Member == R.Special.end())
+      return false;
+    auto &Decl = Member->second.Decl;
+    try {
+      checkAccess(Decl, T, At);
+    } catch (const Diagnostic &) {
+      return false;
+    }
+    if (auto C = Decl.Settings.find("control");
+        C != Decl.Settings.end() && C->second == "delete")
+      return false;
+    if (Member->second.Body)
+      return true;
+  }
+  return llvm::all_of(
+      R.Fields, [&](auto &Field) { return constructible(Field.Type, Op, At); });
+}
 void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
                      const Token &At) {
   auto *Ty = U.ir(Source.Type, At);

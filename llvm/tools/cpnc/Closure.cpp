@@ -88,9 +88,8 @@ Value Frame::callClosure(Value Receiver, const std::vector<Node> &Args,
     fail(At, "callable expression required");
   Node Designator(Node::Name, At);
   Designator.Text = "$call";
-  std::vector<Value> Actual;
-  for (auto &A : Args)
-    Actual.push_back(eval(A));
-  auto *Op = select("$call", Designator, Actual, Receiver);
-  return invoke(*Op, Actual, At, Receiver);
+  auto Actual = evaluateArguments(Args);
+  auto *Op = select("$call", Designator, Actual.Values, Receiver);
+  admitArguments(Actual, Op, At);
+  return invoke(*Op, std::move(Actual.Values), At, Receiver, true);
 }

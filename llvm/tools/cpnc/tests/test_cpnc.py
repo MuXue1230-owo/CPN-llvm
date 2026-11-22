@@ -191,6 +191,122 @@ class CompilerTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("no viable overload", r.stderr)
 
+    def test_definition_site_overloads_and_policies(self):
+        self.assertEqual(
+            self.program("""
+            i32 choose(i64 n) {return 40;}
+            generic<type T> i32 bound(T n) {return choose(n);}
+            declare i32 defaulted(i32 n(choose(i8(0))));
+            i32 choose(i8 n) {return 2;}
+            i32 defaulted(i32 n){return n;}
+            configured(numeric.integer.overflow=saturating)
+            generic<type T> T increment(T n){return n+1;}
+            configured(numeric.integer.overflow=saturating)
+            generic<type T> struct Counter {T increment(T n){return n+1;}};
+            i32 main(){
+                Counter<i8> c;
+                if(increment(i8(127))==127 && c.increment(i8(127))==127 &&
+                   defaulted()==40) {return bound(i8(0))+choose(i8(0));}
+                return 0;
+            }"""),
+            42,
+        )
+
+    def test_generic_and_nongeneric_candidates(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T> i32 which(T v){return 1;}
+            generic<type T> i32 which(T* v){return 2;}
+            i32 which(i32 v){return 4;}
+            generic<type T> requires (SameType<T,u8>) i32 width(T v){return 8;}
+            i32 width(i64 v){return 16;}
+            generic<type T> requires (ObjectType<T>) i32 size(T n){return 9;}
+            generic<type U> requires (ObjectType<U> && SameType<U,i8>) i32 size(U n){return 11;}
+            i32 main(){i32 x; return which(x)+which<>(&x)+which<i32>(x)+
+                                      width(u8(0))+width(i32(0))+size(i8(0));}
+            """),
+            42,
+        )
+        for source, diagnostic in (
+            (
+                "generic<const i32 N> requires(N>0) i32 a(){return 1;} "
+                "generic<const i32 M> requires(M>=1) i32 a(){return 2;} "
+                "i32 main(){return a<2>();}",
+                "ambiguous",
+            ),
+            (
+                "generic<type T> i32 a(T x){return 1;} "
+                "generic<type U> i32 a(U x){return 2;}",
+                "duplicate generic signature",
+            ),
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_generic_resource_limits_and_constant_parameter_domains(self):
+        for source, diagnostic in (
+            (
+                "configuration {generic.max_instantiations=1;}; "
+                "generic<type T> i32 value(T n){return 1;} "
+                "i32 main(){return value(i8(2))+value(i16(3));}",
+                "instantiation resource exhausted",
+            ),
+            (
+                "configuration {generic.max_solver_steps=1;}; "
+                "generic<type T> requires(ObjectType<T> && CompleteType<T>) "
+                "i32 f(T n){return 1;} i32 main(){return f(1);}",
+                "solver step resource exhausted",
+            ),
+            (
+                "configuration {generic.max_normalization_nodes=1;}; "
+                "generic<type T> requires(ObjectType<T> && CompleteType<T>) "
+                "i32 f(T n){return 1;}",
+                "normalization resource exhausted",
+            ),
+            ("generic<const f64 X> i32 f(){return 0;}", "constant parameter type"),
+            (
+                "generic<type T, const T N> i32 f(){return 0;} "
+                "i32 main(){return f<f32,2.0>();}",
+                "constant parameter type",
+            ),
+            (
+                "constraint Broken<type T> {requires(unknown());};",
+                "unknown name",
+            ),
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_structural_result_categories_effects_and_special_members(self):
+        self.assertEqual(
+            self.program("""
+            namespace checks {
+                constraint Borrow<type T>{
+                    expression(T& v){v.get()->i32& noexcept;}
+                };
+                generic<type T> requires(Borrow<T>) i32 get(T& v){return v.get();}
+            }
+            i32 n(42);
+            struct Good{i32& get() noexcept {return n;}};
+            struct Throws{i32& get(){return n;}};
+            struct Value{i32 get() noexcept {return n;}};
+            struct Only{Only(Only&& x)=default;};
+            struct Nested{Only x; Nested(const<Nested>& x)=default;};
+            i32 main(){
+                Good x;
+                if(!checks::Borrow<Throws> && !checks::Borrow<Value> &&
+                   !CopyConstructible<Nested> && MoveConstructible<Only> &&
+                   CopyConstructible<i32>){return checks::get<Good>(x);}
+                return 0;
+            }
+            """),
+            42,
+        )
+
     def test_linkage_regions_and_external_symbol_identity(self):
         self.assertEqual(
             self.program(
@@ -1235,6 +1351,32 @@ class CompilerTests(unittest.TestCase):
                 if (calls==12121212 && first.value[0].n==0 &&
                     second.value[1].n==0 && third.value[1].n==2) {return 42;}
                 return 0;
+            }"""),
+            42,
+        )
+
+    def test_parameter_construction_precedes_the_next_argument(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Box {
+                i32 n;
+                Box(i32 a){init n(a);}
+                Box(const<Box>& b){init n(b.n); trace=trace*10+n;}
+            };
+            i32 change(Box& b){b.n=7; trace=trace*10+7; return 0;}
+            i32 first(Box b, i32 unused){return b.n;}
+            struct Hold {i32 n; Hold(Box b, i32 unused){init n(b.n);} };
+            i32 main(){
+                Box a(3);
+                if(first(a,change(a))!=3 || trace!=37){return 1;}
+                a.n=4; trace=0;
+                Hold h(a,change(a));
+                if(h.n!=4 || trace!=47){return 2;}
+                a.n=5; trace=0;
+                auto read([] i32(Box b,i32 unused){return b.n;});
+                if(read(a,change(a))==5 && trace==57){return 42;}
+                return 3;
             }"""),
             42,
         )

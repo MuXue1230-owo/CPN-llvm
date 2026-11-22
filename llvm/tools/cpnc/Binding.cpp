@@ -17,7 +17,7 @@ struct Check {
         "this",      "nullptr",      "true",         "false",
         "SameType",  "ObjectType",   "CompleteType"};
     if (Names.count(S) || Intrinsics.count(S) || builtin(S) ||
-        U.Aliases.count(S) || U.Cases.count(S))
+        builtinPredicate(S) || U.Aliases.count(S) || U.Cases.count(S))
       return true;
     if (!Owner.empty() && U.Records.count(Owner))
       return true;
@@ -30,6 +30,15 @@ struct Check {
   }
   void visit(const Node &N, Path &Active) {
     auto &A = N.Children;
+    if (N.K == Node::Requirement) {
+      auto Saved = Names;
+      for (auto &P : N.Params)
+        Names.insert(P.Text);
+      for (auto &C : N.Children)
+        visit(C, Active);
+      Names = std::move(Saved);
+      return;
+    }
     if (N.K == Node::Lambda) {
       auto Outer = Names;
       Scope Captured;
@@ -108,9 +117,12 @@ void Context::validate(const Node &N, const std::string &P,
       check(C, false);
   }
   for (auto &G : N.Generics) {
-    if (G.K == Node::ValueParam &&
-        (llvm::StringRef(G.Type).ends_with("*") || G.Type == "void"))
-      fail(G.At, "invalid generic constant parameter type");
+    if (G.K == Node::ValueParam && !Ch.Names.count(G.Type)) {
+      Frame Resolver(*this, nullptr, nullptr, P);
+      auto T = Resolver.resolve(G.Type, G.At);
+      if (!integer(T) && T != "bool" && T != "char" && !Enums.count(T))
+        fail(G.At, "invalid generic constant parameter type");
+    }
     for (auto &D : G.Children)
       Ch.visit(D, Scope);
     Ch.Names.insert(G.Text);
@@ -148,7 +160,8 @@ void Context::validate(const Node &N, const std::string &P,
     for (auto &C : S.Children)
       collect(C);
   };
-  if (N.K == Node::Function && !N.Generics.empty()) {
+  if ((N.K == Node::Function || N.K == Node::Constraint) &&
+      !N.Generics.empty()) {
     for (auto &C : N.Children)
       Ch.visit(C, Scope);
   } else if (N.K == Node::Function) {

@@ -131,6 +131,8 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto T = element(Ptr.Type);
   if (!U.Signatures.count(T))
     fail(At, "function-pointer contract required");
+  if (RequireNoexcept && !llvm::StringRef(T).ends_with(" noexcept>"))
+    fail(At, "expression requires a nonthrowing call");
   auto &Sig = U.Signatures.at(T);
   if (Sig.size() != Args.size() + 1)
     fail(At, "wrong argument count");

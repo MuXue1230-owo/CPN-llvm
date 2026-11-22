@@ -175,9 +175,9 @@ void Construction::delegate(Frame &Em, const Node &N) {
   if (I + 1 >= Chain.size())
     fail(N.At, "unresolved delegation");
   auto *D = Chain[I + 1].first;
-  std::vector<Value> Args;
-  for (auto &A : N.Children)
-    Args.push_back(Em.eval(A));
+  auto Actual = Em.evaluateArguments(N.Children, D);
+  Em.admitArguments(Actual, D, N.At);
+  auto &Args = Actual.Values;
   Frame Next(Em.U, D, Em.IR);
   Next.B.SetInsertPoint(Em.B.GetInsertBlock());
   Next.Self = Object;
@@ -194,7 +194,10 @@ void Construction::delegate(Frame &Em, const Node &N) {
     } else {
       V = Next.convert(V, T, Param.At);
       auto *P = Next.allocate(T, Param.At);
-      Next.materialize(V, Param.At, P);
+      if (J < Args.size())
+        Next.B.CreateStore(V.IR, P);
+      else
+        Next.materialize(V, Param.At, P);
       V = {T, nullptr, P, Param.Const};
       Next.Scopes[0].Drops.push_back(V);
     }

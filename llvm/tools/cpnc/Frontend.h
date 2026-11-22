@@ -23,7 +23,10 @@ struct Diagnostic {
 [[noreturn]] inline void fail(const Token &At, const std::string &Message) {
   throw Diagnostic{At, Message};
 }
+struct ResourceExhausted : Diagnostic {};
 struct Options {
+  uint64_t MaxNormalNodes = 100000, MaxSolverSteps = 1000000,
+           MaxInstantiations = 1000000;
   std::string Input, Output, Config, RootID;
   std::string FPProfile = "strict", DefaultReal = "f64",
               LiteralRounding = "nearest_ties_even";
@@ -37,6 +40,7 @@ std::vector<Token> lex(llvm::StringRef, const Options &);
 std::string unquote(const Token &);
 bool identifier(llvm::StringRef);
 bool builtin(llvm::StringRef);
+bool builtinPredicate(llvm::StringRef);
 bool realToken(llvm::StringRef);
 bool floating(llvm::StringRef);
 struct Node {
@@ -97,9 +101,9 @@ struct Node {
   } K = Empty;
   Token At;
   std::string Text, Type;
-  std::vector<Node> Children, Params, Generics, TemplateArgs;
+  std::vector<Node> Children, Params, Generics, TemplateArgs, Policies;
   std::map<std::string, std::string> Settings;
-  bool HasInitializer = false;
+  bool HasInitializer = false, ExplicitApplication = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,
        Definition = false, Noexcept = false, Pack = false;
   Node() = default;

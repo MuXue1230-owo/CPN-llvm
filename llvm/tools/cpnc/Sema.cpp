@@ -85,7 +85,8 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
   fail(At, "unsupported or unknown type '" + T + "'");
 }
 Frame::Frame(Context &U, Function *F, llvm::Function *IR, std::string P)
-    : U(U), F(F), B(U.M), Opt(F ? F->Configuration : U.Opt),
+    : U(U), F(F), B(U.M), Opt(F ? F->Definition.Configuration : U.Opt),
+      LookupLimit(F ? F->Definition.Through : U.site().Through),
       Prefix(F ? F->Prefix : std::move(P)), IR(IR),
       Env(F ? F->Env : Substitution()) {
   Scopes.emplace_back();
@@ -178,6 +179,13 @@ std::string Frame::resolve(std::string S, const Token &At) {
       auto E = bind(Fam, Explicit, {}, At);
       auto Full = appliedName(Key, Fam, E);
       if (!U.Records.count(Full)) {
+        EnterDefinition Site(U, Fam.Site);
+        llvm::SaveAndRestore Depth(U.SpecializationDepth,
+                                   U.SpecializationDepth + 1);
+        if (U.SpecializationDepth > 128)
+          throw ResourceExhausted{
+              {At, "generic specialization nesting resource exhausted"}};
+        U.chargeInstance(At);
         Frame Probe(U, nullptr, nullptr, Fam.Prefix);
         Probe.Env = E;
         if (!Fam.Decl.Params.empty() &&
@@ -204,17 +212,24 @@ std::string Frame::resolve(std::string S, const Token &At) {
 Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
                          const std::vector<cpn::Value> &Actual,
                          const Token &At) {
+  auto Reject = [&](const std::string &Why) {
+    throw DeductionFailure{{At, Why}};
+  };
   Substitution S;
   auto &G = Fam.Decl.Generics;
   if (Explicit.size() > G.size())
-    fail(At, "too many generic arguments");
+    Reject("too many generic arguments");
   for (size_t I = 0; I < G.size(); ++I) {
     auto &P = G[I];
+    Frame Defaults(U, nullptr, nullptr, Fam.Prefix);
+    Defaults.Env = S;
+    Defaults.Opt = Fam.Site.Configuration;
+    Defaults.LookupLimit = Fam.Site.Through;
     const Node *A = I < Explicit.size() ? &Explicit[I] : nullptr;
     if (P.K == Node::TypeParam) {
       if (A) {
         if (A->K != Node::TypeArg)
-          fail(At, "expected a type argument");
+          Reject("expected a type argument");
         S.Types[P.Text] = resolve(A->Type, At);
       } else {
         for (size_t J = 0; J < Actual.size() && J < Fam.Decl.Params.size();
@@ -241,27 +256,30 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
             if (Ty == "integer")
               Ty = Opt.DefaultInt;
             if (S.Types.count(P.Text) && S.Types[P.Text] != Ty)
-              fail(At, "conflicting deduction");
+              Reject("conflicting deduction");
             S.Types[P.Text] = Ty;
           }
         }
         if (!S.Types.count(P.Text) && !P.Children.empty()) {
           auto Ty = P.Children[0].Type;
-          S.Types[P.Text] = S.Types.count(Ty) ? S.Types[Ty] : resolve(Ty, At);
+          S.Types[P.Text] = Defaults.resolve(Ty, At);
         }
         if (!S.Types.count(P.Text))
-          fail(At, "cannot deduce generic type");
+          Reject("cannot deduce generic type");
       }
     } else {
+      if (A && A->K == Node::TypeArg)
+        Reject("expected a constant argument");
       if (!A && !P.Children.empty())
         A = &P.Children[0];
       if (!A)
-        fail(At, "missing generic constant");
-      Frame Defaults(U, nullptr, nullptr, Fam.Prefix);
-      Defaults.Env = S;
+        Reject("missing generic constant");
+      auto Ty = Defaults.resolve(P.Type, At);
+      if (!integer(Ty) && Ty != "bool" && Ty != "char" && !U.Enums.count(Ty))
+        fail(P.At, "invalid generic constant parameter type");
       auto V =
           I < Explicit.size() ? constantEval(*A) : Defaults.constantEval(*A);
-      S.Values[P.Text] = convert(V, Defaults.resolve(P.Type, At), At);
+      S.Values[P.Text] = convert(V, Ty, At);
     }
   }
   return S;
@@ -279,7 +297,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
   D.Owner = Owner;
   D.Prefix = D.DefaultPrefix = P;
   D.Env = E;
-  D.Configuration = Opt;
+  D.Definition = D.Defaults = site();
+  D.DeclaredAt = Sequence;
   D.Result = N.K == Node::Constructor || N.K == Node::Destructor
                  ? "void"
                  : Resolver.resolve(N.Type, N.At);
@@ -345,7 +364,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
       auto Defaults = Prev->Decl.Params;
       Prev->Decl = N;
       Prev->Prefix = P;
-      Prev->Configuration = Opt;
+      Prev->Definition = site();
       for (size_t I = 0; I < Defaults.size(); ++I)
         if (!Defaults[I].Children.empty())
           Prev->Decl.Params[I].Children = Defaults[I].Children;
@@ -445,6 +464,9 @@ void Context::record(const Node &N, const std::string &Name,
   for (auto &D : N.Children)
     if (D.K == Node::Constructor || D.K == Node::Destructor ||
         D.K == Node::Function) {
+      llvm::SaveAndRestore Policy(Opt);
+      for (const auto &PrefixPolicy : D.Policies)
+        configure(Opt, PrefixPolicy);
       bool Assign = D.Text == "operator=";
       bool Defaulted =
           D.Settings.count("control") && D.Settings.at("control") == "default";
@@ -485,24 +507,42 @@ void Context::record(const Node &N, const std::string &Name,
 }
 void Context::unit(const std::vector<Node> &Decls, std::string P) {
   for (auto &D : Decls) {
+    ++Sequence;
     auto Name = P + D.Text;
     if (D.K == Node::Config) {
       configure(Opt, D);
       continue;
     }
+    llvm::SaveAndRestore Policy(Opt);
+    for (const auto &PrefixPolicy : D.Policies)
+      configure(Opt, PrefixPolicy);
     if (D.K == Node::Linkage || D.K == Node::Namespace) {
       unit(D.Children, D.K == Node::Linkage ? P : Name + "::");
       continue;
     }
     if (D.K == Node::Constraint) {
-      Constraints[Name] = {D, P};
+      checkNormalForm(D);
+      if (!Constraints.emplace(Name, Family{D, P, site()}).second)
+        fail(D.At, "duplicate constraint declaration");
+      validate(D, P);
       continue;
     }
     if (!D.Generics.empty()) {
+      for (auto &Req : D.TemplateArgs)
+        checkNormalForm(Req);
       validate(D, P);
-      if (Families.count(Name))
+      auto [It, New] = Families.emplace(Name, Family{D, P, site()});
+      if (!New &&
+          (D.K != Node::Function || It->second.Decl.K != Node::Function))
         fail(D.At, "duplicate generic declaration");
-      Families[Name] = {D, P};
+      if (D.K == Node::Function) {
+        auto &Group = FunctionFamilies[Name];
+        if (llvm::any_of(Group, [&](auto &F) {
+              return sameGenericSignature(F.Decl, D);
+            }))
+          fail(D.At, "duplicate generic signature");
+        Group.push_back({D, P, site()});
+      }
       continue;
     }
     if (D.K == Node::Function) {

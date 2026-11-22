@@ -3,6 +3,7 @@
 #include "Frontend.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <deque>
 #include <optional>
 namespace cpn {
@@ -22,13 +23,20 @@ struct Substitution {
   std::map<std::string, std::string> Types;
   std::map<std::string, Value> Values;
 };
+struct DefinitionSite {
+  Options Configuration;
+  size_t Through;
+};
+struct Family;
 struct Function {
   Node Decl;
   std::string Name, Result, Owner, Prefix, DefaultPrefix;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
   Substitution Env;
-  Options Configuration;
+  DefinitionSite Definition, Defaults;
+  size_t DeclaredAt = 0;
+  const Family *Origin = nullptr;
   llvm::Function *IR = nullptr;
   bool Emitting = false, Emitted = false;
   int Slot = -1;
@@ -64,9 +72,11 @@ struct Case {
   Node Decl;
   std::vector<std::string> Types;
 };
+struct DeductionFailure : Diagnostic {};
 struct Family {
   Node Decl;
   std::string Prefix;
+  DefinitionSite Site;
 };
 struct Context {
   llvm::Module &M;
@@ -83,8 +93,14 @@ struct Context {
   std::map<std::string, std::string> DefaultCase;
   std::map<llvm::Value *, llvm::GlobalVariable *> Ready;
   std::vector<std::pair<std::string, Node>> Statics;
-  unsigned ConstantSteps = 0, ConstantDepth = 0;
+  unsigned ConstantSteps = 0, ConstantDepth = 0, SpecializationDepth = 0;
+  uint64_t Instantiations = 0, SolverSteps = 0;
+  void chargeInstance(const Token &);
+  void chargeSolver(const Token &);
+  void checkNormalForm(const Node &);
+
   std::map<std::string, Family> Families;
+  std::map<std::string, std::deque<Family>> FunctionFamilies;
   std::map<std::string, std::vector<std::string>> Signatures;
   std::map<std::string, Family> Constraints;
   std::map<std::string, std::vector<Function *>> Overloads;
@@ -92,6 +108,8 @@ struct Context {
   std::map<std::string, Function *> Instances;
   std::vector<llvm::Function *> Startup, Shutdown;
   unsigned Serial = 0;
+  size_t Sequence = 0, LookupLimit = SIZE_MAX;
+  DefinitionSite site() const { return {Opt, std::min(Sequence, LookupLimit)}; }
   explicit Context(llvm::Module &M, Options O)
       : M(M), C(M.getContext()), Opt(std::move(O)) {}
   llvm::Type *ir(const std::string &T, const Token &At = {});
@@ -106,6 +124,15 @@ struct Context {
   void validate(const Node &, const std::string &,
                 const std::string &Owner = "");
 };
+struct EnterDefinition {
+  llvm::SaveAndRestore<Options> OptionsScope;
+  llvm::SaveAndRestore<size_t> LookupScope;
+  EnterDefinition(Context &U, const DefinitionSite &Site)
+      : OptionsScope(U.Opt, Site.Configuration),
+        LookupScope(U.LookupLimit, Site.Through) {}
+};
+bool sameGenericSignature(const Node &, const Node &);
+bool betterPattern(const Node &, const Node &);
 Family expand(const Family &, size_t, const Token &);
 std::string element(const std::string &T);
 bool integer(const std::string &T);
@@ -122,6 +149,10 @@ struct Loop {
   std::string Name;
   bool BreakUsed = false;
 };
+struct CallArguments {
+  std::vector<Value> Values;
+  std::vector<llvm::BasicBlock *> Entries, Exits;
+};
 class Construction;
 class Frame {
 public:
@@ -129,6 +160,7 @@ public:
   Function *F;
   llvm::IRBuilder<> B;
   Options Opt;
+  size_t LookupLimit;
   std::string Prefix;
   llvm::Function *IR;
   Substitution Env;
@@ -156,7 +188,7 @@ public:
   std::string directField(const Node &) const;
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
-  bool Live = true;
+  bool Live = true, RequireNoexcept = false;
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
@@ -180,12 +212,19 @@ public:
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
+  CallArguments evaluateArguments(const std::vector<Node> &,
+                                  Function *Context = nullptr);
+  void admitArguments(CallArguments &, Function *, const Token &);
   Value invoke(Function &, std::vector<Value>, const Token &,
-               Value Receiver = {});
+               Value Receiver = {}, bool Prepared = false);
   std::optional<unsigned> conversionRank(Value, const std::string &,
                                          const Token &);
+  std::vector<Function *> visibleOverloads(const std::string &) const;
+  std::string callKey(const std::string &, const std::string &Owner = "") const;
   Function *select(std::string, const Node &, const std::vector<Value> &,
                    Value Receiver = {});
+  Function *prepareCandidate(const Family &, const std::string &, const Node &,
+                             const std::vector<Value> &);
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
@@ -213,7 +252,9 @@ public:
   Value indirect(Value, const std::vector<Node> &, const Token &);
   void guard(llvm::Value *);
   void branch(llvm::BasicBlock *);
+  const Family *constraint(const std::string &) const;
   bool predicate(const Node &);
+  bool constructible(const std::string &, SpecialOperation, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &);
   void match(const Node &);
   void installTables(Value);

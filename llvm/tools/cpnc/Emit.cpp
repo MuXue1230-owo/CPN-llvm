@@ -196,6 +196,7 @@ Value Frame::constantEval(const Node &N) {
   if (IR) {
     Frame CF(U, F, nullptr, Prefix);
     CF.Opt = Opt;
+    CF.LookupLimit = LookupLimit;
     CF.Scopes = Scopes;
     CF.Env = Env;
     return CF.constantEval(N);
@@ -289,13 +290,8 @@ Value Frame::eval(const Node &N, std::string Expected) {
       return literal(Op == "true", "bool");
     else if (Op == "nullptr")
       return {"nullptr_t", llvm::ConstantPointerNull::get(B.getPtrTy())};
-    else if (U.Constraints.count(Op) || Op == "ObjectType" ||
-             Op == "CompleteType")
+    else if (builtinPredicate(Op) || constraint(Op))
       return literal(predicate(N), "bool");
-    else if (Op == "SameType" && N.TemplateArgs.size() == 2)
-      return literal(resolve(N.TemplateArgs[0].Type, N.At) ==
-                         resolve(N.TemplateArgs[1].Type, N.At),
-                     "bool");
     else
       return load(lookup(N.At));
   case Node::Index:
@@ -339,12 +335,14 @@ Value Frame::eval(const Node &N, std::string Expected) {
           "usize");
     }
     if (Op == "&") {
-      if (A[0].K == Node::Name && U.Overloads.count(A[0].Text)) {
+      auto Group = A[0].K == Node::Name ? visibleOverloads(callKey(A[0].Text))
+                                        : std::vector<Function *>{};
+      if (!Group.empty()) {
         if (!ends(Expected, "*") || !U.Signatures.count(element(Expected)))
           fail(N.At, "target function-pointer type required");
         auto &Sig = U.Signatures.at(element(Expected));
         Function *Match = nullptr;
-        for (auto *Candidate : U.Overloads.at(A[0].Text)) {
+        for (auto *Candidate : Group) {
           if (Candidate->Result != Sig.front() ||
               Candidate->Params !=
                   std::vector<std::string>(Sig.begin() + 1, Sig.end()) ||
@@ -576,56 +574,85 @@ std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
   }
   return {};
 }
+std::vector<Function *> Frame::visibleOverloads(const std::string &Key) const {
+  std::vector<Function *> Group;
+  if (auto It = U.Overloads.find(Key); It != U.Overloads.end())
+    for (auto *D : It->second)
+      if (!D->Owner.empty() || D->DeclaredAt <= LookupLimit)
+        Group.push_back(D);
+  return Group;
+}
+std::string Frame::callKey(const std::string &Name,
+                           const std::string &Owner) const {
+  if (!Owner.empty())
+    return Owner + "::" + Name;
+  for (std::string P = Prefix; !P.empty();) {
+    auto Key = P + Name;
+    auto Fam = U.Families.find(Key);
+    if (!visibleOverloads(Key).empty() ||
+        (Fam != U.Families.end() && Fam->second.Site.Through <= LookupLimit))
+      return Key;
+    P.resize(P.size() - 2);
+    auto Sep = P.rfind("::");
+    P = Sep == std::string::npos ? "" : P.substr(0, Sep + 2);
+  }
+  return Name;
+}
+Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
+                                  const Node &N,
+                                  const std::vector<Value> &Args) {
+  Family Fam = Source;
+  if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack) {
+    size_t Fixed = Fam.Decl.Generics.size() - 1;
+    size_t FixedParams =
+        std::count_if(Fam.Decl.Params.begin(), Fam.Decl.Params.end(),
+                      [](auto &P) { return !P.Pack; });
+    size_t Count = N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed
+                   : Args.size() > FixedParams   ? Args.size() - FixedParams
+                                                 : 0;
+    Fam = expand(Fam, Count, N.At);
+  }
+  if (Args.size() > Fam.Decl.Params.size() ||
+      (Args.size() < Fam.Decl.Params.size() &&
+       Fam.Decl.Params[Args.size()].Children.empty()))
+    throw DeductionFailure{{N.At, "no viable overload"}};
+  auto S = bind(Fam, N.TemplateArgs, Args, N.At);
+  std::string ID = Key + "$" + std::to_string(Fam.Site.Through) + "<";
+  for (auto &P : Fam.Decl.Generics) {
+    if (P.K == Node::TypeParam)
+      ID += S.Types.at(P.Text);
+    else {
+      llvm::SmallString<32> V;
+      llvm::cast<llvm::ConstantInt>(S.Values.at(P.Text).IR)
+          ->getValue()
+          .toString(V, 10, signedType(P.Type));
+      ID += V.str();
+    }
+    ID += ",";
+  }
+  ID += ">";
+  if (auto I = U.Instances.find(ID); I != U.Instances.end())
+    return I->second;
+  EnterDefinition Site(U, Fam.Site);
+  if (!Fam.Decl.TemplateArgs.empty()) {
+    Frame Probe(U, nullptr, nullptr, Fam.Prefix);
+    Probe.Env = S;
+    auto V = Probe.constantEval(Fam.Decl.TemplateArgs.front());
+    if (V.Type != "bool")
+      fail(N.At, "a generic requirement must have Boolean type");
+    if (llvm::cast<llvm::ConstantInt>(V.IR)->isZero())
+      throw DeductionFailure{{N.At, "constraint is not satisfied"}};
+  }
+  U.chargeInstance(N.At);
+  auto *D = U.declare(Fam.Decl, ID, Fam.Prefix, S);
+  D->Origin = &Source;
+  U.Instances[ID] = D;
+  return D;
+}
+
 Function *Frame::select(std::string Name, const Node &N,
                         const std::vector<Value> &Args, Value Receiver) {
-  std::string Key =
-      !Receiver.Type.empty() ? Receiver.Type + "::" + Name
-      : U.Overloads.count(Prefix + Name) || U.Families.count(Prefix + Name)
-          ? Prefix + Name
-          : Name;
-  if (auto It = U.Families.find(Key);
-      It != U.Families.end() && It->second.Decl.K == Node::Function) {
-    Family Fam = It->second;
-    if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack) {
-      size_t Fixed = Fam.Decl.Generics.size() - 1;
-      size_t FixedParams =
-          std::count_if(Fam.Decl.Params.begin(), Fam.Decl.Params.end(),
-                        [](auto &P) { return !P.Pack; });
-      size_t Count = N.TemplateArgs.size() > Fixed
-                         ? N.TemplateArgs.size() - Fixed
-                     : Args.size() > FixedParams ? Args.size() - FixedParams
-                                                 : 0;
-      Fam = expand(Fam, Count, N.At);
-    }
-    auto S = bind(Fam, N.TemplateArgs, Args, N.At);
-    std::string ID = Key + "<";
-    for (auto &P : Fam.Decl.Generics) {
-      if (P.K == Node::TypeParam)
-        ID += S.Types.at(P.Text);
-      else {
-        llvm::SmallString<32> V;
-        llvm::cast<llvm::ConstantInt>(S.Values.at(P.Text).IR)
-            ->getValue()
-            .toString(V, 10, signedType(P.Type));
-        ID += V.str();
-      }
-      ID += ",";
-    }
-    ID += ">";
-    if (!U.Instances.count(ID)) {
-      auto *D = U.declare(Fam.Decl, ID, Fam.Prefix, S);
-      U.Instances[ID] = D;
-      if (!Fam.Decl.TemplateArgs.empty()) {
-        Frame Probe(U, D, nullptr);
-        if (llvm::cast<llvm::ConstantInt>(
-                Probe.constantEval(Fam.Decl.TemplateArgs[0]).IR)
-                ->isZero())
-          fail(N.At, "constraint is not satisfied");
-      }
-      U.emit(*D);
-    }
-    return checkSelected(U.Instances.at(ID), N.At);
-  }
+  auto Key = callKey(Name, Receiver.Type);
   struct Candidate {
     Function *Decl;
     std::vector<unsigned> Ranks;
@@ -637,13 +664,30 @@ Function *Frame::select(std::string Name, const Node &N,
         return false;
       Strict |= A.Ranks[I] < B.Ranks[I];
     }
-    return Strict;
+    return Strict ||
+           betterPattern(A.Decl->Origin ? A.Decl->Origin->Decl : A.Decl->Decl,
+                         B.Decl->Origin ? B.Decl->Origin->Decl : B.Decl->Decl);
   };
   std::vector<Candidate> Best;
-  auto It = U.Overloads.find(Key);
-  if (It == U.Overloads.end())
+  auto Group =
+      N.ExplicitApplication ? std::vector<Function *>{} : visibleOverloads(Key);
+  std::optional<Diagnostic> Rejection;
+  if (auto It = U.FunctionFamilies.find(Key); It != U.FunctionFamilies.end())
+    for (auto &Fam : It->second) {
+      if (Fam.Site.Through > LookupLimit)
+        continue;
+      try {
+        Group.push_back(prepareCandidate(Fam, Key, N, Args));
+      } catch (const DeductionFailure &D) {
+        Rejection = D;
+      }
+    }
+  if (Group.empty()) {
+    if (Rejection)
+      throw *Rejection;
     fail(N.At, "unknown name '" + Name + "'");
-  for (auto *D : It->second) {
+  }
+  for (auto *D : Group) {
     if (!Receiver.Type.empty()) {
       auto Q = D->Decl.Settings.find("category");
       if (Q != D->Decl.Settings.end() && !Q->second.empty() &&
@@ -673,7 +717,17 @@ Function *Frame::select(std::string Name, const Node &N,
   }
   if (Best.size() != 1)
     fail(N.At, Best.empty() ? "no viable overload" : "ambiguous overload");
-  return checkSelected(Best.front().Decl, N.At);
+  auto *Selected = checkSelected(Best.front().Decl, N.At);
+  if (Selected->Origin && !Selected->Emitted && !Selected->Emitting) {
+    llvm::SaveAndRestore Depth(U.SpecializationDepth,
+                               U.SpecializationDepth + 1);
+    if (U.SpecializationDepth > 128)
+      throw ResourceExhausted{
+          {N.At, "generic specialization nesting resource exhausted"}};
+    EnterDefinition Site(U, Selected->Definition);
+    U.emit(*Selected);
+  }
+  return Selected;
 }
 Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
   if (!conversionRank(V, Ty, At))
@@ -688,8 +742,44 @@ Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
   V.Readonly |= T != baseRef(Ty);
   return V;
 }
+// Bind all argument types before connecting their executable blocks. Each
+// argument's parameter initialization then precedes its successor expression.
+CallArguments Frame::evaluateArguments(const std::vector<Node> &Args,
+                                       Function *Context) {
+  CallArguments A;
+  for (size_t I = 0; I < Args.size(); ++I) {
+    if (IR) {
+      if (I)
+        B.SetInsertPoint(block("argument"));
+      A.Entries.push_back(B.GetInsertBlock());
+    }
+    A.Values.push_back(eval(Args[I], Context && I < Context->Params.size()
+                                         ? Context->Params[I]
+                                         : ""));
+    if (IR)
+      A.Exits.push_back(B.GetInsertBlock());
+  }
+  return A;
+}
+void Frame::admitArguments(CallArguments &A, Function *D, const Token &At) {
+  if (!IR)
+    return;
+  for (size_t I = 0; I < A.Values.size(); ++I) {
+    B.SetInsertPoint(A.Exits[I]);
+    if (D) {
+      auto &Ty = D->Params[I];
+      auto &V = A.Values[I];
+      V = ends(Ty, "&") ? bindReference(V, Ty, At)
+                        : materialize(convert(V, Ty, At), At);
+    }
+    if (I + 1 < A.Entries.size())
+      branch(A.Entries[I + 1]);
+  }
+}
 Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
-                    Value Receiver) {
+                    Value Receiver, bool Prepared) {
+  if (RequireNoexcept && !D.Decl.Noexcept)
+    fail(T, "expression requires a nonthrowing call");
   std::vector<llvm::Value *> Values;
   if (!D.Owner.empty())
     Values.push_back(Receiver.Address);
@@ -703,19 +793,22 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   for (size_t I = 0; I < D.Params.size(); ++I) {
     auto &P = D.DefaultParams[I];
     auto Ty = D.Params[I];
-    auto V = I < Actual.size()
-                 ? Actual[I]
-                 : construct(unconst(baseRef(Ty)), P.Children, P.At);
-    if (ends(Ty, "&")) {
-      V = bindReference(V, Ty, P.At);
-    } else {
-      V = convert(V, Ty, T);
-      V = materialize(V, T);
-      if (Defaults && !Constant) {
-        auto *Addr = allocate(Ty, P.At);
-        B.CreateStore(V.IR, Addr);
-        V = {Ty, nullptr, Addr};
-      }
+    Value V;
+    if (I < Actual.size())
+      V = Actual[I];
+    else {
+      llvm::SaveAndRestore Policy(Opt, D.Defaults.Configuration);
+      llvm::SaveAndRestore Lookup(LookupLimit, D.Defaults.Through);
+      llvm::SaveAndRestore Bindings(Env, D.Env);
+      V = construct(unconst(baseRef(Ty)), P.Children, P.At);
+    }
+    if (!Prepared || I >= Actual.size())
+      V = ends(Ty, "&") ? bindReference(V, Ty, P.At)
+                        : materialize(convert(V, Ty, T), T);
+    if (!ends(Ty, "&") && Defaults && !Constant) {
+      auto *Addr = allocate(Ty, P.At);
+      B.CreateStore(V.IR, Addr);
+      V = {Ty, nullptr, Addr};
     }
     Cells.push_back(V);
     if (!P.Text.empty())
@@ -898,20 +991,14 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     if (!Owner.empty() && Owner != Receiver.Type)
       adjust(Receiver, Owner, C.At);
   }
-  std::vector<Value> V;
-  auto Key = Receiver.Type.empty()
-                 ? (U.Overloads.count(Prefix + Name) ? Prefix + Name : Name)
-                 : Receiver.Type + "::" + Name;
-  auto Group = U.Overloads.find(Key);
-  for (size_t I = 0; I < Args.size(); ++I) {
-    std::string Expected;
-    if (Group != U.Overloads.end() && Group->second.size() == 1 &&
-        I < Group->second[0]->Params.size())
-      Expected = Group->second[0]->Params[I];
-    V.push_back(eval(Args[I], Expected));
-  }
-  auto *D = select(Name, C, V, Receiver);
-  return invoke(*D, V, C.At, Receiver);
+  auto Key = callKey(Name, Receiver.Type);
+  auto Group = visibleOverloads(Key);
+  auto A = evaluateArguments(
+      Args, Group.size() == 1 && !U.FunctionFamilies.count(Key) ? Group.front()
+                                                                : nullptr);
+  auto *D = select(Name, C, A.Values, Receiver);
+  admitArguments(A, D, C.At);
+  return invoke(*D, std::move(A.Values), C.At, Receiver, IR != nullptr);
 }
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail) {
@@ -978,15 +1065,15 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     auto *Ptr = Dest ? Dest : allocate(T, At);
     Value Obj{T, nullptr, Ptr};
     auto &R = U.Records.at(T);
-    std::vector<Value> Actual;
-    for (auto &A : Args)
-      Actual.push_back(eval(A));
+    auto Arguments = evaluateArguments(Args);
+    auto &Actual = Arguments.Values;
     std::map<std::string, const Node *> Producers;
     if (Tail)
       for (auto &S : Tail->Children)
         if (S.K == Node::Init && !Producers.emplace(S.Text, &S).second)
           fail(S.At, "duplicate initialization producer");
     if (Actual.size() == 1 && Actual[0].Type == T) {
+      admitArguments(Arguments, nullptr, At);
       materialize(Actual[0], At, Ptr);
     } else {
       auto It = U.Overloads.find(T + "::$ctor");
@@ -999,8 +1086,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       if (Authored) {
         Node C(Node::Name, At);
         auto *D = select("$ctor", C, Actual, Obj);
+        admitArguments(Arguments, D, At);
         if (Producers.empty())
-          invoke(*D, Actual, At, Obj);
+          invoke(*D, Actual, At, Obj, true);
         else {
           Frame Root(U, D, IR);
           Root.B.SetInsertPoint(B.GetInsertBlock());
@@ -1015,7 +1103,10 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             if (!ends(Ty, "&")) {
               V = convert(V, Ty, At);
               auto *Addr = allocate(Ty, At);
-              materialize(V, At, Addr);
+              if (I < Actual.size())
+                Root.B.CreateStore(V.IR, Addr);
+              else
+                Root.materialize(V, At, Addr);
               V = {Ty, nullptr, Addr, P.Const};
               Root.Scopes[0].Drops.push_back(V);
             } else
@@ -1030,6 +1121,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Producers.clear();
         }
       } else {
+        admitArguments(Arguments, nullptr, At);
         if (Actual.size() + R.Bases.size() > R.Fields.size())
           fail(At, "too many aggregate initializers");
         if (R.Bases.empty())
