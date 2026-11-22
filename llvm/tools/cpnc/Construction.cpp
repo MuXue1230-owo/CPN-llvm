@@ -21,21 +21,18 @@ const Node *site(const Node &N, bool Conditional = false) {
     }
   return Found;
 }
-std::string slot(Frame &F, const Node &N) {
-  return llvm::StringRef(N.Text).starts_with("base/")
-             ? "$base:" + F.resolve(N.Text.substr(5), N.At)
-             : N.Text;
-}
 } // namespace
 Construction::Construction(Frame &Em, Function &Root, Value Obj,
                            const Node *Tail, Frame *Caller)
     : Object(Obj), TailFrame(Caller) {
+  if (Em.BaseLayer)
+    Frontier = Em.U.Records.at(Obj.Type).VirtualCount;
   for (auto &F : Em.U.Records.at(Obj.Type).Fields)
     Order.push_back(F.Decl.Text);
   auto add = [&](const Node &Body, Function *Owner) {
     for (auto &N : Body.Children)
       if (N.K == Node::Init) {
-        auto K = slot(Em, N);
+        auto K = Em.initSlot(N);
         if (std::find(Order.begin(), Order.end(), K) == Order.end())
           fail(N.At, "unknown initialization target '" + K + "'");
         if (!Explicit.emplace(K, Producer{Owner, &N}).second)
@@ -117,7 +114,7 @@ void Construction::advance(Frame &Current) {
       Args = &P.Source->Children;
     }
     Source->B.SetInsertPoint(Current.B.GetInsertBlock());
-    auto *Address = Source->B.CreateStructGEP(R.IR, Object.Address, Frontier);
+    auto *Address = Source->fieldAddress(Object, Frontier);
     auto Previous = Source->Self;
     auto *PreviousTxn = Source->Transaction;
     Source->Transaction = this;
@@ -129,8 +126,7 @@ void Construction::advance(Frame &Current) {
       Earlier.Names[Member.Decl.Text] =
           I >= Frontier
               ? Value{}
-              : Value{Member.Type, nullptr,
-                      Source->B.CreateStructGEP(R.IR, Object.Address, I)};
+              : Value{Member.Type, nullptr, Source->fieldAddress(Object, I)};
     }
     // Constructor parameters shadow members. Body-local declarations never
     // participate in the declarative initializer environment.
@@ -141,7 +137,8 @@ void Construction::advance(Frame &Current) {
     } else {
       Source->Scopes = {std::move(Earlier), Old.front()};
     }
-    Source->construct(F.Type, *Args, F.Decl.At, Address);
+    Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
+                      Frontier < R.Bases.size());
     Source->endExpression();
     Source->Scopes = std::move(Old);
     Source->Self = Previous;
@@ -180,6 +177,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
   auto &Args = Actual.Values;
   Frame Next(Em.U, D, Em.IR);
   Next.B.SetInsertPoint(Em.B.GetInsertBlock());
+  Next.BaseLayer = Em.BaseLayer;
   Next.Self = Object;
   Next.Scopes[0].Names["this"] = {Object.Type + "*", Object.Address};
   for (size_t J = 0; J < D->Params.size(); ++J) {

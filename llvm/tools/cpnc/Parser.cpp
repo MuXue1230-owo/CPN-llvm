@@ -849,8 +849,8 @@ class Parser {
           I.Type = "Complete";
           if (!is(";")) {
             I.Text = take().Text;
-            if (I.Text == "base" && eat("<")) {
-              I.Text = "$base:" + type();
+            if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
+              I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type();
               closeAngle();
             }
           } else

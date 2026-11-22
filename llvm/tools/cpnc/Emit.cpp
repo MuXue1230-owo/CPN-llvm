@@ -79,7 +79,11 @@ Value Frame::member(Value Obj, const Token &T) {
   auto It = U.Records.find(Obj.Type);
   if (It == U.Records.end() || !It->second.Complete)
     fail(T, "member access requires a complete record");
-  auto &R = It->second;
+  auto Path = U.lookupPath(Obj.Type, T, false);
+  if (!Path)
+    fail(T, "unknown member '" + T.Text + "'");
+  Obj = baseView(Obj, *Path);
+  auto &R = U.Records.at(Obj.Type);
   for (size_t I = 0; I < R.Fields.size(); ++I)
     if (R.Fields[I].Decl.Text == T.Text) {
       auto &Field = R.Fields[I];
@@ -89,28 +93,9 @@ Value Frame::member(Value Obj, const Token &T) {
         Transaction->checkAccess(*this, T);
       checkAccess(Field.Decl, Obj.Type, T);
       if (Obj.Address)
-        return {Field.Type, nullptr, B.CreateStructGEP(R.IR, Obj.Address, I),
-                Obj.Readonly};
+        return {Field.Type, nullptr, fieldAddress(Obj, I), Obj.Readonly};
       return {Field.Type, B.CreateExtractValue(Obj.IR, I)};
     }
-  Value Found;
-  for (size_t I = 0; I < R.Bases.size(); ++I) {
-    Value V;
-    try {
-      V = member({R.Bases[I], nullptr, B.CreateStructGEP(R.IR, Obj.Address, I),
-                  Obj.Readonly},
-                 T);
-    } catch (const Diagnostic &D) {
-      if (!StringRef(D.Message).starts_with("unknown member"))
-        throw;
-      continue;
-    }
-    if (!Found.Type.empty())
-      fail(T, "ambiguous inherited member");
-    Found = V;
-  }
-  if (!Found.Type.empty())
-    return Found;
   fail(T, "unknown member '" + T.Text + "'");
 }
 void Frame::bindParams() {
@@ -858,10 +843,17 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto *Vptr = B.CreateStructGEP(R.IR, Receiver.Address, R.Fields.size());
     auto *Table = B.CreateLoad(B.getPtrTy(), Vptr);
     auto *Slot = B.CreateGEP(B.getPtrTy(), Table, B.getInt32(D.Slot));
+    auto *Deltas =
+        B.CreateStructGEP(R.IR, Receiver.Address, R.Fields.size() + 1);
+    auto *Delta =
+        B.CreateLoad(B.getInt64Ty(),
+                     B.CreateGEP(B.getInt64Ty(), Deltas, B.getInt64(D.Slot)));
+    Values[0] = B.CreateGEP(B.getInt8Ty(), Receiver.Address, Delta);
     Call = B.CreateCall(D.IR->getFunctionType(),
                         B.CreateLoad(B.getPtrTy(), Slot), Values);
   } else
-    Call = B.CreateCall(D.IR, Values);
+    Call =
+        B.CreateCall(Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR, Values);
   Call->setAttributes(D.IR->getAttributes());
   return callResult(D.Result, Call, T);
 }
@@ -1000,8 +992,16 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   admitArguments(A, D, C.At);
   return invoke(*D, std::move(A.Values), C.At, Receiver, IR != nullptr);
 }
+std::string Frame::initSlot(const Node &N) {
+  if (StringRef(N.Text).starts_with("base/"))
+    return "$base:" + resolve(N.Text.substr(5), N.At);
+  if (StringRef(N.Text).starts_with("virtual_base/"))
+    return "$virtual:" + resolve(N.Text.substr(13), N.At);
+  return N.Text;
+}
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
-                       const Token &At, llvm::Value *Dest, const Node *Tail) {
+                       const Token &At, llvm::Value *Dest, const Node *Tail,
+                       bool AsBase) {
   if (T == "void")
     fail(At, "object cannot have void type");
   if (floating(T)) {
@@ -1065,16 +1065,25 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     auto *Ptr = Dest ? Dest : allocate(T, At);
     Value Obj{T, nullptr, Ptr};
     auto &R = U.Records.at(T);
+    Obj.BaseView = AsBase;
+    if (!AsBase)
+      bindVirtualLayout(Obj);
     auto Arguments = evaluateArguments(Args);
     auto &Actual = Arguments.Values;
     std::map<std::string, const Node *> Producers;
     if (Tail)
       for (auto &S : Tail->Children)
-        if (S.K == Node::Init && !Producers.emplace(S.Text, &S).second)
+        if (S.K == Node::Init && !Producers.emplace(initSlot(S), &S).second)
           fail(S.At, "duplicate initialization producer");
     if (Actual.size() == 1 && Actual[0].Type == T) {
       admitArguments(Arguments, nullptr, At);
-      materialize(Actual[0], At, Ptr);
+      if (AsBase && R.VirtualCount)
+        transfer(Actual[0], Ptr,
+                 Actual[0].Expiring ? SpecialOperation::MoveConstruct
+                                    : SpecialOperation::CopyConstruct,
+                 At, true);
+      else
+        materialize(Actual[0], At, Ptr);
     } else {
       auto It = U.Overloads.find(T + "::$ctor");
       bool Authored =
@@ -1092,6 +1101,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         else {
           Frame Root(U, D, IR);
           Root.B.SetInsertPoint(B.GetInsertBlock());
+          Root.BaseLayer = AsBase;
           Root.Self = Obj;
           Root.Scopes[0].Names["this"] = {T + "*", Ptr};
           for (size_t I = 0; I < D->Params.size(); ++I) {
@@ -1124,7 +1134,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         admitArguments(Arguments, nullptr, At);
         if (Actual.size() + R.Bases.size() > R.Fields.size())
           fail(At, "too many aggregate initializers");
-        if (R.Bases.empty())
+        if (R.Bases.size() == (AsBase ? R.VirtualCount : 0))
           installTables(Obj);
         auto *SavedObject = PendingObject;
         auto SavedSlots = std::move(PendingSlots);
@@ -1136,9 +1146,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         Scopes.back().Names["this"] = {T + "*", Ptr};
         for (auto &Field : R.Fields)
           Scopes.back().Names[Field.Decl.Text] = {};
-        for (size_t I = 0; I < R.Fields.size(); ++I) {
+        for (size_t I = AsBase ? R.VirtualCount : 0; I < R.Fields.size(); ++I) {
           auto &Field = R.Fields[I];
-          auto *P = B.CreateStructGEP(R.IR, Ptr, I);
+          auto *P = fieldAddress(Obj, I);
           auto Found = Producers.find(Field.Decl.Text);
           if (I >= R.Bases.size() && I - R.Bases.size() < Actual.size()) {
             if (Found != Producers.end())
@@ -1149,7 +1159,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             construct(Field.Type,
                       Found == Producers.end() ? Field.Decl.Children
                                                : Found->second->Children,
-                      At, P);
+                      At, P, nullptr, I < R.Bases.size());
             if (Found != Producers.end())
               Producers.erase(Found);
           }
@@ -1179,7 +1189,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     }
     if (!Dest)
       Temps.push_back(Obj);
-    Obj.IR = B.CreateLoad(Ty, Ptr);
+    if (!AsBase)
+      Obj.IR = B.CreateLoad(Ty, Ptr);
     Obj.Expiring = Obj.Prvalue = !Dest;
     return Obj;
   }
@@ -1205,7 +1216,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   }
   return V;
 }
-void Frame::drop(Value V) {
+void Frame::drop(Value V, bool AsBase) {
   if (!IR || !V.Address)
     return;
   if (!V.Storage.empty() && Extents.count(V.Storage) &&
@@ -1230,13 +1241,15 @@ void Frame::drop(Value V) {
   if (!U.Records.count(V.Type))
     return;
   if (auto It = U.Overloads.find(V.Type + "::$drop"); It != U.Overloads.end()) {
-    B.CreateCall(It->second.front()->IR, {V.Address});
+    auto *D = It->second.front();
+    B.CreateCall(AsBase && D->BaseIR ? D->BaseIR : D->IR, {V.Address});
     return;
   }
   auto &R = U.Records.at(V.Type);
-  for (size_t I = R.Fields.size(); I; --I) {
+  installTables(V);
+  for (size_t I = R.Fields.size(); I > (AsBase ? R.VirtualCount : 0); --I) {
     auto &F = R.Fields[I - 1];
-    drop({F.Type, nullptr, B.CreateStructGEP(R.IR, V.Address, I - 1)});
+    drop({F.Type, nullptr, fieldAddress(V, I - 1)}, I - 1 < R.Bases.size());
   }
 }
 void Frame::cleanup(size_t From) {
@@ -1378,10 +1391,9 @@ void Frame::object(const Node &N, bool Global) {
     if (Args.size() != 1)
       fail(N.At, "reference requires one initializer");
     auto V = place(Args[0]);
-    auto E = baseRef(Ty);
-    if (unconst(E) != V.Type)
-      fail(N.At, "incompatible reference binding");
-    V.Readonly |= N.Const || E != unconst(E);
+    if (N.Const && baseRef(Ty) == unconst(baseRef(Ty)))
+      Ty = "const<" + baseRef(Ty) + ">" + (ends(Ty, "&&") ? "&&" : "&");
+    V = bindReference(V, Ty, N.At);
     names()[Name] = V;
     return;
   }
@@ -1741,35 +1753,20 @@ bool Frame::adjust(Value &V, const std::string &T, const Token &At, bool Emit) {
     return true;
   if (!U.Records.count(V.Type))
     return false;
-  std::vector<std::vector<unsigned>> Paths;
-  std::function<void(const std::string &, std::vector<unsigned>)> Walk =
-      [&](const std::string &Cur, std::vector<unsigned> P) {
-        if (Cur == T) {
-          Paths.push_back(std::move(P));
-          return;
-        }
-        auto &Bases = U.Records.at(Cur).Bases;
-        for (size_t I = 0; I < Bases.size(); ++I) {
-          auto Next = P;
-          Next.push_back(I);
-          Walk(Bases[I], std::move(Next));
-        }
-      };
-  Walk(V.Type, {});
-  if (Paths.empty())
-    return false;
-  if (Paths.size() != 1) {
-    if (!Emit)
+  std::optional<BasePath> Path;
+  for (const auto &[Candidate, Type] : U.Records.at(V.Type).Views) {
+    if (Type != T)
+      continue;
+    if (Path) {
+      if (Emit)
+        fail(At, "ambiguous inherited base conversion");
       return false;
-    fail(At, "ambiguous inherited base conversion");
+    }
+    Path = Candidate;
   }
-  if (Emit) {
-    std::vector<llvm::Value *> Indices{B.getInt32(0)};
-    for (auto I : Paths[0])
-      Indices.push_back(B.getInt32(I));
-    V.Address = B.CreateGEP(U.ir(V.Type), V.Address, Indices);
-    V.IR = nullptr;
-    V.Type = T;
-  }
+  if (!Path)
+    return false;
+  if (Emit)
+    V = baseView(V, *Path);
   return true;
 }

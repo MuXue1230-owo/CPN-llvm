@@ -27,7 +27,9 @@ void Frame::endField(const std::string &Slot, const Token &At,
   Token Name = At;
   Name.Text = Slot;
   if (RunDestructor)
-    drop(member(Self, Name));
+    drop(member(Self, Name),
+         llvm::StringRef(Slot).starts_with("$base:") ||
+             llvm::StringRef(Slot).starts_with("$virtual:"));
   branch(Done);
   B.SetInsertPoint(Done);
 }
@@ -35,12 +37,12 @@ void Frame::retirement() {
   auto &R = U.Records.at(Self.Type);
   installTables(Self);
   std::set<std::string> Manual;
-  for (auto &Field : R.Fields) {
+  for (unsigned I = 0; I < R.Fields.size(); ++I) {
+    auto &Field = R.Fields[I];
     auto *Flag = allocate("bool", Field.Decl.At);
-    B.CreateStore(B.getTrue(), Flag);
+    B.CreateStore(B.getInt1(!BaseLayer || I >= R.VirtualCount), Flag);
     FieldFlags[Field.Decl.Text] = Flag;
-    if (R.Decl.Settings.count("manual") &&
-        !llvm::StringRef(Field.Decl.Text).starts_with("$base:"))
+    if (R.Decl.Settings.count("manual") && I >= R.Bases.size())
       Manual.insert(Field.Decl.Text);
   }
   for (auto &D : R.Decl.Children)
@@ -61,6 +63,8 @@ void Frame::retirement() {
   auto *Cleanup = block("dtor.cleanup");
   for (auto I = R.Fields.rbegin(); I != R.Fields.rend(); ++I) {
     auto &Slot = I->Decl.Text;
+    if (llvm::StringRef(Slot).starts_with("$virtual:"))
+      break;
     if (Manual.count(Slot)) {
       auto *Next = block("dtor.pass");
       B.CreateCondBr(B.CreateLoad(B.getInt1Ty(), FieldFlags.at(Slot)), Cleanup,

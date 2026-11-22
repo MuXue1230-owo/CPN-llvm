@@ -902,6 +902,104 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn(diagnostic, r.stderr)
 
+    def test_shared_virtual_base_identity_and_lifetime(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace; i32 producers; i32 last;
+            i32 note(){++producers;return 7;}
+            struct Root {
+                i32 n;
+                Root(i32 x){init n(x);trace=trace*10+1;}
+                virtual i32 read() const {return n;}
+                virtual ~Root(){trace=trace*10+7;}
+            };
+            i32 call(const<Root>* p){return p->read();}
+            struct Left : virtual Root {
+                Left(){init virtual_base<Root>(note());trace=trace*10+2;}
+                i32 read() const override {return n+1;}
+                ~Left() {last=call(this);trace=trace*10+6;}
+            };
+            struct Right : virtual Root {
+                Right(){init virtual_base<Root>(note());trace=trace*10+3;}
+                ~Right(){trace=trace*10+5;}
+            };
+            struct Both : Left, Right {
+                Both(){init virtual_base<Root>(37);trace=trace*10+4;}
+                i32 read() const override {return n+5;}
+            };
+            Root* fromLeft(Left* p){return p;}
+            Root* fromRight(Right* p){return p;}
+            i32 main(){
+                { Both b;
+                  Root* a(fromLeft(&b)); Root* c(fromRight(&b));
+                  if(a!=c || b.n!=37 || call(c)!=42 || trace!=1234 || producers!=0){return 1;}
+                }
+                if(trace!=1234567 || last!=38){return 2;}
+                trace=0;
+                { Left alone; if(producers!=1 || call(&alone)!=8){return 3;} }
+                return 42;
+            }"""),
+            42,
+        )
+
+    def test_virtual_base_copy_and_nested_boundaries(self):
+        self.assertEqual(
+            self.program("""
+            i32 copies; i32 drops;
+            struct V {
+                i32 n;
+                V(const<V>& src){init n(src.n);++copies;}
+                ~V(){++drops;}
+            };
+            struct A:virtual V {A(const<A>& src)=default;};
+            struct B:virtual V {B(const<B>& src)=default;};
+            struct D:A,B {D(const<D>& src)=default;};
+            struct Top:virtual D {Top(const<Top>& src)=default;};
+            struct Nested {Top[2] items;};
+            i32 take(A a){return a.n;}
+            i32 main(){
+                {Nested s; s.items[0].n=20; s.items[1].n=22;
+                 Top t(s.items[0]);
+                 if(copies!=1 || t.n!=20 || &t.n==&s.items[0].n){return 1;}
+                 A& a(s.items[1]);
+                 if(take(a)+t.n!=42 || copies!=2){return 2;}
+                }
+                if(drops==4){return 42;} return 3;
+            }
+        """),
+            42,
+        )
+
+    def test_virtual_base_tail_aggregate_and_diagnostics(self):
+        self.assertEqual(
+            self.program("""
+            struct V{i32 n;}; struct A:virtual V{}; struct B:virtual V{};
+            struct D:A,B{i32 inc(2);};
+            i32 main(){D x -> {init virtual_base<V>(40);};
+                       return x.n+x.inc;}
+            """),
+            42,
+        )
+        for src, msg in (
+            (
+                "struct V{};struct A:V{A(){init virtual_base<V>();}};",
+                "unknown initialization target",
+            ),
+            (
+                "struct V{};struct A:virtual V{A(){init base<V>();}};",
+                "unknown initialization target",
+            ),
+            (
+                "struct V{virtual i32 f(){return 0;}};struct A:virtual V{i32 f() override{return 1;}};"
+                "struct B:virtual V{i32 f() override{return 2;}};struct D:A,B{};",
+                "ambiguous final overrider",
+            ),
+        ):
+            with self.subTest(src=src):
+                result = self.compile(src, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(msg, result.stderr)
+
     def test_virtual_slots_and_active_layers(self):
         self.assertEqual(
             self.program("""

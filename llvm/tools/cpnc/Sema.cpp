@@ -117,7 +117,9 @@ cpn::Value Frame::load(cpn::Value V) {
   if (!V.IR && V.Address) {
     if (!IR)
       fail({}, "constant expression required");
-    V.IR = B.CreateLoad(U.ir(V.Type), V.Address);
+    V.IR = U.Records.count(V.Type) && U.Records.at(V.Type).VirtualCount
+               ? snapshot(V)
+               : B.CreateLoad(U.ir(V.Type), V.Address);
   }
   return V;
 }
@@ -420,22 +422,44 @@ void Context::record(const Node &N, const std::string &Name,
   Frame Check(*this, nullptr, nullptr, P);
   Check.Env = R.Env;
   std::vector<llvm::Type *> Layout;
-  for (auto &Base : N.TemplateArgs) {
+  std::vector<std::pair<std::string, bool>> Direct;
+  std::set<std::string> Seen;
+  for (const auto &Base : N.TemplateArgs) {
     auto T = Check.resolve(Base.Type, Base.At);
-    if (!Records.count(T) || !Records.at(T).Complete)
+    if (!Records.count(T) || !Records.at(T).Complete ||
+        Records.at(T).Decl.K != Node::Record)
       fail(Base.At, "base requires a complete record");
-    if (Base.Definition)
-      fail(Base.At, "virtual base layout is unavailable");
-    if (std::find(R.Bases.begin(), R.Bases.end(), T) != R.Bases.end())
+    if (!Seen.insert(T).second)
       fail(Base.At, "duplicate direct base");
-    if (Records.at(T).Decl.Settings.count("final"))
+    auto &BR = Records.at(T);
+    if (BR.Decl.Settings.count("final"))
       fail(Base.At, "base must be a complete non-final record");
-    auto D = Base;
-    D.Text = "$base:" + T;
-    D.At.Text = D.Text;
-    R.Fields.push_back({D, T});
-    R.Bases.push_back(T);
-    Layout.push_back(ir(T, Base.At));
+    for (unsigned I = 0; I < BR.VirtualCount; ++I)
+      if (!llvm::is_contained(R.Bases, BR.Bases[I]))
+        R.Bases.push_back(BR.Bases[I]);
+    if (Base.Definition && !llvm::is_contained(R.Bases, T))
+      R.Bases.push_back(T);
+    Direct.emplace_back(T, Base.Definition);
+  }
+  R.VirtualCount = R.Bases.size();
+  for (auto &[T, Virtual] : Direct) {
+    if (Virtual)
+      R.Direct.push_back(llvm::find(R.Bases, T) - R.Bases.begin());
+    else {
+      R.Direct.push_back(R.Bases.size());
+      R.Bases.push_back(T);
+    }
+  }
+  for (unsigned I = 0; I < R.Bases.size(); ++I) {
+    const auto &T = R.Bases[I];
+    Node Slot(Node::TypeArg, N.At);
+    Slot.Text = Slot.At.Text =
+        (I < R.VirtualCount ? "$virtual:" : "$base:") + T;
+    R.Fields.push_back({Slot, T});
+    Layout.push_back(I < R.VirtualCount
+                         ? static_cast<llvm::Type *>(llvm::ArrayType::get(
+                               llvm::Type::getInt8Ty(C), 0))
+                         : Records.at(T).Layer);
   }
   for (auto &D : N.Children)
     if (D.K == Node::Field) {
@@ -454,12 +478,27 @@ void Context::record(const Node &N, const std::string &Name,
                    [&](auto &Base) { return Records.at(Base).Polymorphic; }) ||
       llvm::any_of(N.Children,
                    [](auto &C) { return C.Settings.count("virtual"); });
-  if (R.Polymorphic)
+  if (R.Polymorphic) {
     Layout.push_back(llvm::PointerType::getUnqual(C));
+    size_t Slots = N.Children.size();
+    for (auto I : R.Direct)
+      Slots += Records.at(R.Bases[I]).Virtuals.size();
+    Layout.push_back(llvm::ArrayType::get(llvm::Type::getInt64Ty(C), Slots));
+  }
+  Layout.insert(Layout.end(), R.VirtualCount, llvm::Type::getInt64Ty(C));
   if (Layout.empty())
     Layout.push_back(llvm::Type::getInt8Ty(C));
+  R.Layer = R.IR;
+  if (R.VirtualCount) {
+    R.Layer = llvm::StructType::create(C, Layout, "cpn.layer." + Name);
+    // Align the tail after the full size of the embedded nonvirtual prefix.
+    Layout.push_back(llvm::ArrayType::get(R.Layer, 0));
+    for (unsigned I = 0; I < R.VirtualCount; ++I)
+      Layout.push_back(Records.at(R.Bases[I]).Layer);
+  }
   R.IR->setBody(Layout);
   R.Complete = true;
+  buildViews(Name);
   std::vector<Function *> Members;
   for (auto &D : N.Children)
     if (D.K == Node::Constructor || D.K == Node::Destructor ||
@@ -501,6 +540,13 @@ void Context::record(const Node &N, const std::string &Name,
       if (Op && !R.Special.emplace(*Op, SpecialMember{D, Body}).second)
         fail(D.At, "duplicate special operation");
     }
+  if (R.VirtualCount)
+    for (auto *F : Members)
+      if ((F->Decl.K == Node::Constructor || F->Decl.K == Node::Destructor) &&
+          !F->Decl.Prototype && !F->Decl.Settings.count("control"))
+        F->BaseIR = llvm::Function::Create(F->IR->getFunctionType(),
+                                           llvm::GlobalValue::InternalLinkage,
+                                           F->IR->getName() + ".base", M);
   buildTables(Name, Members);
   for (auto *F : Members)
     emit(*F);
@@ -598,7 +644,15 @@ void Context::emit(Function &D) {
       D.Decl.Settings.count("control"))
     return;
   D.Emitting = true;
-  Frame F(*this, &D, D.IR);
+  emitBody(D, D.IR, false);
+  if (D.BaseIR)
+    emitBody(D, D.BaseIR, true);
+  D.Emitting = false;
+  D.Emitted = true;
+}
+void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
+  Frame F(*this, &D, Entry);
+  F.BaseLayer = AsBase;
   F.B.SetInsertPoint(F.block("entry"));
   F.bindParams();
   if (D.Decl.Settings.count("closure"))
@@ -621,8 +675,6 @@ void Context::emit(Function &D) {
   for (auto &L : F.Labels)
     if (!F.DefinedLabels.count(L.first))
       fail(D.Decl.At, "unknown statement label");
-  D.Emitting = false;
-  D.Emitted = true;
 }
 void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));

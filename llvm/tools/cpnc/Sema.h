@@ -37,7 +37,7 @@ struct Function {
   DefinitionSite Definition, Defaults;
   size_t DeclaredAt = 0;
   const Family *Origin = nullptr;
-  llvm::Function *IR = nullptr;
+  llvm::Function *IR = nullptr, *BaseIR = nullptr;
   bool Emitting = false, Emitted = false;
   int Slot = -1;
 };
@@ -55,16 +55,33 @@ struct SpecialMember {
   Node Decl;
   Function *Body = nullptr;
 };
+using BasePath = std::vector<unsigned>;
+struct DispatchTable {
+  BasePath View;
+  llvm::GlobalVariable *Entries;
+  std::vector<BasePath> Receivers;
+};
 struct Record {
   Node Decl;
-  llvm::StructType *IR = nullptr;
+  llvm::StructType *IR = nullptr, *Layer = nullptr;
   std::vector<Field> Fields;
   std::map<SpecialOperation, SpecialMember> Special;
+  // Canonical slots: distinct virtual bases, direct nonvirtual bases, members.
   std::vector<std::string> Bases;
+  unsigned VirtualCount = 0;
+  std::vector<unsigned> Direct;
+  std::map<BasePath, std::string> Views;
+  std::map<BasePath, std::vector<BasePath>> Edges;
+  unsigned tailSlot(unsigned I) const {
+    return Layer->getNumElements() + 1 + I;
+  }
+  unsigned offsetSlot(unsigned I) const {
+    return Fields.size() + (Polymorphic ? 2 : 0) + I;
+  }
   Substitution Env;
   bool Complete = false, Polymorphic = false, VirtualDestructor = false;
   std::vector<Function *> Virtuals;
-  std::vector<std::pair<uint64_t, llvm::GlobalVariable *>> Tables;
+  std::vector<DispatchTable> Tables;
 };
 struct Case {
   std::string Owner;
@@ -116,12 +133,16 @@ struct Context {
   llvm::Type *ir(const std::string &T, const Token &At = {});
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
+  void buildViews(const std::string &);
+  std::optional<BasePath> lookupPath(const std::string &, const Token &,
+                                     bool Method) const;
   void buildTables(const std::string &, const std::vector<Function *> &);
   void tagged(const Node &, const std::string &, const std::string &);
   void record(const Node &, const std::string &, const std::string &,
               const Substitution &);
   void unit(const std::vector<Node> &, std::string Prefix = "");
   void emit(Function &);
+  void emitBody(Function &, llvm::Function *, bool);
   void validate(const Node &, const std::string &,
                 const std::string &Owner = "");
 };
@@ -189,13 +210,14 @@ public:
   std::string directField(const Node &) const;
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
-  bool Live = true, RequireNoexcept = false;
+  bool Live = true, RequireNoexcept = false, BaseLayer = false;
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
   Value load(Value);
   Value materialize(Value, const Token &, llvm::Value *Dest = nullptr);
-  void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &);
+  void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &,
+                bool AsBase = false);
   Value bindReference(Value, const std::string &, const Token &);
   Value callResult(const std::string &, llvm::Value *, const Token &);
   Value constant(llvm::APInt, std::string Type = "integer");
@@ -228,14 +250,16 @@ public:
                              const std::vector<Value> &);
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
+  std::string initSlot(const Node &);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
-                  llvm::Value *Dest = nullptr, const Node *Tail = nullptr);
+                  llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
+                  bool AsBase = false);
   void checkAccess(const Node &, const std::string &Owner, const Token &);
   Function *checkSelected(Function *, const Token &);
   Value member(Value, const Token &);
   void stmt(const Node &);
   void object(const Node &, bool Global = false);
-  void drop(Value);
+  void drop(Value, bool AsBase = false);
   void track(Value &);
   void ensureLive(const Value &, const Token &);
   void replaceGeneration(const Value &, const std::string &, const Token &);
@@ -258,6 +282,10 @@ public:
   bool constructible(const std::string &, SpecialOperation, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &);
   void match(const Node &);
+  llvm::Value *fieldAddress(Value, unsigned);
+  Value baseView(Value, const BasePath &);
+  void bindVirtualLayout(Value);
+  llvm::Value *snapshot(Value);
   void installTables(Value);
   std::string methodOwner(const std::string &, const Token &);
   void bindParams();

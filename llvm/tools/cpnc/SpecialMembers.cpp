@@ -54,7 +54,7 @@ bool Frame::constructible(const std::string &T, SpecialOperation Op,
       R.Fields, [&](auto &Field) { return constructible(Field.Type, Op, At); });
 }
 void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
-                     const Token &At) {
+                     const Token &At, bool AsBase) {
   auto *Ty = U.ir(Source.Type, At);
   if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
     // Evaluate aggregate designators once. Each element's own declared
@@ -86,6 +86,9 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   }
   auto &R = It->second;
   Value Result{Source.Type, nullptr, Dest};
+  Result.BaseView = AsBase;
+  if (!assignment(Op) && !AsBase)
+    bindVirtualLayout(Result);
   if (moving(Op) && Source.Readonly)
     fail(At, "moving requires a mutable source");
   if (R.Decl.K != Node::Lambda) {
@@ -104,13 +107,14 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
       return;
     }
   }
-  if (!assignment(Op))
+  if (!assignment(Op) && R.Fields.empty())
     B.CreateStore(llvm::Constant::getNullValue(Ty), Dest);
-  for (size_t I = 0; I < R.Fields.size(); ++I) {
+  for (size_t I = AsBase ? R.VirtualCount : 0; I < R.Fields.size(); ++I) {
     auto &Field = R.Fields[I];
-    auto *From = B.CreateStructGEP(R.IR, Source.Address, I);
-    auto *To = B.CreateStructGEP(R.IR, Dest, I);
-    transfer({Field.Type, nullptr, From, Source.Readonly}, To, Op, At);
+    auto *From = fieldAddress(Source, I);
+    auto *To = fieldAddress(Result, I);
+    transfer({Field.Type, nullptr, From, Source.Readonly}, To, Op, At,
+             I < R.Bases.size());
   }
   if (!assignment(Op))
     installTables(Result);
