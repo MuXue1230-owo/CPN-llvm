@@ -21,6 +21,7 @@ struct Value {
   // for arrays of pointers. BoundsCell follows reassignment of a local pointer.
   llvm::Value *Lower = nullptr, *Upper = nullptr, *BoundsCell = nullptr;
   llvm::Value *ElementLower = nullptr, *ElementUpper = nullptr;
+  llvm::Value *ArraySlot = nullptr, *ArrayGeneration = nullptr;
   std::set<unsigned> Origins;
   bool Subobject = false, OptionalTemp = false;
   void borrow(const Value &V) {
@@ -33,6 +34,8 @@ struct Value {
     Lower = V.Lower;
     Upper = V.Upper;
     Origins = V.Origins;
+    ArraySlot = V.ArraySlot;
+    ArrayGeneration = V.ArrayGeneration;
   }
   bool BaseView = false, Prvalue = false;
   Value() = default;
@@ -294,7 +297,10 @@ public:
   Value literal(int64_t, const std::string &Ty = "integer");
   Value convert(Value, const std::string &, const Token &);
   Value pointerBinary(const Node &, Value, Value);
+  llvm::StructType *pointerMetadataType();
   void saveBounds(llvm::Value *, Value);
+  void offsetRegistration(Value &, llvm::Value *, const std::string &,
+                          const Token &);
   Value binary(const Node &, Value, Value);
   Value boolean(const Node &);
   Value eval(const Node &, std::string Expected = "",

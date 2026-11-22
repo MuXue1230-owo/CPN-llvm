@@ -105,6 +105,24 @@ class CompilerTests(unittest.TestCase):
             self.compile("i32 main(){i32[0] a;return a[0];}", "--check").returncode, 0
         )
 
+    def test_pointer_offsets_track_selected_element_generation(self):
+        self.assertEqual(
+            self.program("""
+          i32 main(){i32[3] a(40,7,42);i32* p(&a[0]);auto tail(p+3);
+            destroy(a[0]);i32* q(tail-1); if(*q!=42){return 1;}
+            auto slot(storage_of(a[0]));p=construct_at<i32>(slot,42);return *p;}
+        """),
+            42,
+        )
+        for body in (
+            "auto q(p+1);destroy(a[1]);return *q;",
+            "p++;destroy(a[1]);return *p;",
+            "auto q(p+1);auto cap(storage_of(a[1]));destroy(a[1]);construct_at<i32>(cap,5);return *q;",
+        ):
+            self.assertLess(
+                self.program("i32 main(){i32[2] a(7,8);i32* p(&a[0]);" + body + "}"), 0
+            )
+
     def test_goto_drops_only_exited_objects_in_reverse(self):
         self.assertEqual(
             self.program("""

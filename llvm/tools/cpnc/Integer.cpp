@@ -297,6 +297,13 @@ cpn::Value Frame::pointerBinary(const Node &N, cpn::Value P, cpn::Value Other) {
       guard(B.CreateAnd(B.CreateAnd(B.CreateIsNotNull(P.Lower),
                                     B.CreateIsNotNull(Other.Lower)),
                         B.CreateICmpNE(P.Lower, Other.Lower)));
+    if (P.ArraySlot && Other.ArraySlot && P.ArrayGeneration &&
+        Other.ArrayGeneration)
+      guard(B.CreateAnd(B.CreateAnd(B.CreateIsNotNull(P.ArraySlot),
+                                    B.CreateIsNotNull(Other.ArraySlot)),
+                        B.CreateOr(B.CreateICmpNE(P.ArraySlot, Other.ArraySlot),
+                                   B.CreateICmpNE(P.ArrayGeneration,
+                                                  Other.ArrayGeneration))));
     auto right = address(Other.IR);
     if (N.Text != "-") {
       auto Pred = N.Text == "<"    ? CmpInst::ICMP_ULT
@@ -326,7 +333,9 @@ cpn::Value Frame::pointerBinary(const Node &N, cpn::Value P, cpn::Value Other) {
     guard(B.CreateAnd(B.CreateIsNotNull(P.Lower),
                       B.CreateOr(B.CreateICmpULT(Target, address(P.Lower)),
                                  B.CreateICmpUGT(Target, address(P.Upper)))));
-  P.IR = B.CreateIntToPtr(Raw, B.getPtrTy());
+  auto *Result = B.CreateIntToPtr(Raw, B.getPtrTy());
+  offsetRegistration(P, Result, T, N.At);
+  P.IR = Result;
   P.Address = nullptr;
   P.BoundsCell = nullptr;
   P.Prvalue = P.Expiring = true;

@@ -228,14 +228,55 @@ done:
   ret void
 }
 
+; A borrowed registration can outlive its owner's stack frame or sparse entry.
+; Compare its identity against linked records before inspecting its contents.
+define internal i1 @cpn.slot.linked(ptr %wanted) {
+  %head = load ptr, ptr @cpn.slots
+  br label %scan
+scan:
+  %s = phi ptr [%head,%0], [%next,%advance]
+  %empty = icmp eq ptr %s, null
+  br i1 %empty, label %absent, label %test
+test:
+  %same = icmp eq ptr %s, %wanted
+  br i1 %same, label %found, label %advance
+advance:
+  %next = load ptr, ptr %s
+  br label %scan
+found:
+  ret i1 true
+absent:
+  ret i1 false
+}
+
+define internal i1 @cpn.borrow.valid(ptr %slot, i64 %expected) {
+  %raw = icmp eq ptr %slot, null
+  br i1 %raw, label %valid, label %member
+member:
+  %linked = call i1 @cpn.slot.linked(ptr %slot)
+  br i1 %linked, label %test, label %expired
+test:
+  %stamp = call i64 @cpn.generation(ptr %slot, i1 false)
+  %original = call i64 @cpn.generation(ptr %slot, i1 true)
+  %implicit = icmp eq i64 %expected, 0
+  %want = select i1 %implicit, i64 %original, i64 %expected
+  %same = icmp eq i64 %want, %stamp
+  %alive = trunc i64 %stamp to i1
+  %ok = and i1 %same, %alive
+  ret i1 %ok
+valid:
+  ret i1 true
+expired:
+  ret i1 false
+}
+
 ; A child extent belongs to one generation of its containing object.
-define internal i1 @cpn.extent.valid(ptr %slot, i64 %expectedparent) {
-  %absent = icmp eq ptr %slot, null
-  br i1 %absent, label %invalid, label %first
+define internal i1 @cpn.extent.valid(ptr %slot, i64 %extentid) {
+  %linked = call i1 @cpn.slot.linked(ptr %slot)
+  br i1 %linked, label %first, label %invalid
 first:
-  %gp = getelementptr %cpn.slot, ptr %slot, i32 0, i32 11
-  %bound = load i64, ptr %gp
-  %same = icmp eq i64 %bound, %expectedparent
+  %birthid = call i64 @cpn.generation(ptr %slot, i1 true)
+  %same = icmp eq i64 %birthid, %extentid
   br i1 %same, label %scan, label %invalid
 scan:
   %s = phi ptr [%slot, %first], [%p, %test]

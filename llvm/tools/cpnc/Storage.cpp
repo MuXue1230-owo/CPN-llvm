@@ -63,7 +63,7 @@ enum SlotField {
   Destructor = 8,
   Capacity = 9,
   Alignment = 10,
-  ParentGeneration = 11
+  Birth = 6
 };
 llvm::Constant *destructor(Frame &F, const std::string &T) {
   if (auto *D = F.U.cleanupEntry(T))
@@ -158,15 +158,9 @@ void Frame::ensureLive(const Value &V, const Token &At) {
     fail(At, "ended object generation");
   if (!IR || !V.Slot)
     return;
-  auto *Expected = V.Generation
-                       ? V.Generation
-                       : B.CreateCall(U.M.getFunction("cpn.generation"),
-                                      {V.Slot, B.getTrue()});
-  auto *Stamp =
-      B.CreateCall(U.M.getFunction("cpn.generation"), {V.Slot, B.getFalse()});
-  auto *Invalid = B.CreateOr(B.CreateICmpNE(Expected, Stamp),
-                             B.CreateNot(B.CreateTrunc(Stamp, B.getInt1Ty())));
-  guard(B.CreateAnd(B.CreateIsNotNull(V.Slot), Invalid));
+  auto *Expected = V.Generation ? V.Generation : B.getInt64(0);
+  guard(B.CreateNot(
+      B.CreateCall(U.M.getFunction("cpn.borrow.valid"), {V.Slot, Expected})));
 }
 void Frame::retireStorage(const Value &V, bool Destroy) {
   B.CreateCall(U.M.getFunction("cpn.slot.retire"),
@@ -232,13 +226,14 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     V.Slot = slotFor(V);
   guard(B.CreateIsNull(V.Slot));
   if (Storage) {
+    guard(B.CreateNot(
+        B.CreateCall(U.M.getFunction("cpn.slot.linked"), {V.Slot})));
     Value S{"storage",
             B.CreateLoad(B.getPtrTy(),
                          B.CreateStructGEP(U.SlotType, V.Slot, Address))};
     S.borrow(V);
-    S.Generation =
-        B.CreateLoad(B.getInt64Ty(),
-                     B.CreateStructGEP(U.SlotType, V.Slot, ParentGeneration));
+    S.Generation = B.CreateLoad(B.getInt64Ty(),
+                                B.CreateStructGEP(U.SlotType, V.Slot, Birth));
     return S;
   }
   if (V.BaseView && V.ExtentType != V.Type &&
@@ -261,4 +256,40 @@ void Frame::forgetStorage() {
   for (auto &[ID, State] : Active)
     if (Registrations.count(ID))
       State = -1;
+}
+
+// Array positions share the parent extent. Changing position selects the
+// destination element's generation, while the one-past address has no slot.
+void Frame::offsetRegistration(Value &P, llvm::Value *Target,
+                               const std::string &Element, const Token &At) {
+  if (!TracksStorage || !P.ArraySlot || !P.Upper)
+    return;
+  Value Owner{Element, nullptr, P.Lower};
+  Owner.Slot = P.ArraySlot;
+  Owner.Generation = P.ArrayGeneration;
+  ensureLive(Owner, At);
+  auto *From = B.GetInsertBlock(), *ElementPath = block("pointer.element"),
+       *Done = block("pointer.position");
+  auto *Past = B.CreateICmpEQ(Target, P.Upper);
+  auto *Changed = B.CreateICmpNE(Target, P.IR);
+  auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
+  auto *Slot = B.CreateSelect(Past, Null, P.Slot ? P.Slot : Null);
+  auto *Stamp = B.CreateSelect(Past, B.getInt64(0),
+                               P.Generation ? P.Generation : B.getInt64(0));
+  auto *HasElement =
+      B.CreateAnd(B.CreateIsNotNull(P.ArraySlot), B.CreateNot(Past));
+  B.CreateCondBr(B.CreateAnd(HasElement, Changed), ElementPath, Done);
+  B.SetInsertPoint(ElementPath);
+  auto V = subobject(Owner, {Element, nullptr, Target});
+  auto *Exit = B.GetInsertBlock();
+  branch(Done);
+  B.SetInsertPoint(Done);
+  auto *NewSlot = B.CreatePHI(B.getPtrTy(), 2);
+  NewSlot->addIncoming(Slot, From);
+  NewSlot->addIncoming(V.Slot, Exit);
+  auto *NewStamp = B.CreatePHI(B.getInt64Ty(), 2);
+  NewStamp->addIncoming(Stamp, From);
+  NewStamp->addIncoming(V.Generation, Exit);
+  P.Slot = NewSlot;
+  P.Generation = NewStamp;
 }

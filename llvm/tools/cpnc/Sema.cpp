@@ -123,17 +123,43 @@ cpn::Value Frame::load(cpn::Value V) {
                : B.CreateLoad(U.ir(V.Type), V.Address);
   }
   if (V.BoundsCell && IR) {
-    V.Lower = B.CreateLoad(B.getPtrTy(), V.BoundsCell);
-    V.Upper = B.CreateLoad(
-        B.getPtrTy(), B.CreateGEP(B.getPtrTy(), V.BoundsCell, B.getInt32(1)));
+    auto *Meta = pointerMetadataType();
+    auto read = [&](unsigned I) {
+      return B.CreateLoad(Meta->getElementType(I),
+                          B.CreateStructGEP(Meta, V.BoundsCell, I));
+    };
+    V.Lower = read(0);
+    V.Upper = read(1);
+    if (TracksStorage) {
+      V.ArraySlot = read(2);
+      V.ArrayGeneration = read(3);
+      V.Slot = read(4);
+      V.Generation = read(5);
+    }
   }
   return V;
 }
+llvm::StructType *Frame::pointerMetadataType() {
+  auto *P = B.getPtrTy();
+  auto *I = B.getInt64Ty();
+  return TracksStorage ? llvm::StructType::get(U.C, {P, P, P, I, P, I})
+                       : llvm::StructType::get(U.C, {P, P});
+}
 void Frame::saveBounds(llvm::Value *Cell, Value V) {
-  auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
-  B.CreateStore(V.Lower ? V.Lower : Null, Cell);
-  B.CreateStore(V.Upper ? V.Upper : Null,
-                B.CreateGEP(B.getPtrTy(), Cell, B.getInt32(1)));
+  auto *Meta = pointerMetadataType();
+  auto write = [&](unsigned I, llvm::Value *Val) {
+    B.CreateStore(Val ? Val
+                      : llvm::Constant::getNullValue(Meta->getElementType(I)),
+                  B.CreateStructGEP(Meta, Cell, I));
+  };
+  write(0, V.Lower);
+  write(1, V.Upper);
+  if (TracksStorage) {
+    write(2, V.ArraySlot);
+    write(3, V.ArrayGeneration);
+    write(4, V.Slot);
+    write(5, V.Generation);
+  }
 }
 std::string
 cpn::scopeKey(StringRef Prefix, StringRef Name,

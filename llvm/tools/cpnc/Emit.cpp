@@ -258,7 +258,7 @@ Value Frame::place(const Node &N, bool NeedLive) {
     V = eval(N);
   if (!V.Address)
     fail(N.At, "object lvalue required");
-  if (NeedLive)
+  if (NeedLive && !V.BoundsCell)
     ensureLive(V, N.At);
   return V;
 }
@@ -282,6 +282,13 @@ Value Frame::subscript(const Node &N) {
       Base, {unconst(E), nullptr,
              B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
              Base.Readonly || E != unconst(E)});
+  if (TracksStorage) {
+    V.ArraySlot = slotFor(Base);
+    V.ArrayGeneration = Base.Generation
+                            ? Base.Generation
+                            : B.CreateCall(U.M.getFunction("cpn.generation"),
+                                           {V.ArraySlot, B.getFalse()});
+  }
   V.ElementLower = Base.Address;
   V.ElementUpper =
       B.CreateGEP(Array->getElementType(), Base.Address, B.getInt64(Count));
@@ -505,6 +512,15 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
       P.borrow(V);
+      if (!V.ElementLower) {
+        P.ArraySlot = nullptr;
+        P.ArrayGeneration = nullptr;
+        if (V.BoundsCell) {
+          P.Slot = nullptr;
+          P.Generation = nullptr;
+          P.Storage.clear();
+        }
+      }
       P.Lower = V.ElementLower ? V.ElementLower : V.Address;
       P.Upper = V.ElementUpper
                     ? V.ElementUpper
@@ -530,8 +546,18 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       }
       auto Next = binary(Bop, V, literal(1));
       B.CreateStore(Next.IR, D.Address);
-      return N.Definition ? Value(V.Type, V.IR)
-                          : Value(Next.Type, Next.IR, D.Address);
+      if (D.BoundsCell)
+        saveBounds(D.BoundsCell, Next);
+      if (N.Definition) {
+        V.Address = nullptr;
+        V.BoundsCell = nullptr;
+        V.Expiring = V.Prvalue = true;
+        return V;
+      }
+      Next.Address = D.Address;
+      Next.BoundsCell = D.BoundsCell;
+      Next.Prvalue = Next.Expiring = false;
+      return Next;
     }
     auto V = eval(A[0], Op == "-" && A[0].K == Node::Real ? "" : Expected);
     if (U.Records.count(V.Type))
@@ -690,8 +716,18 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
                  N.At);
         return load(D);
       }
-      if (D.BoundsCell)
+      if (D.BoundsCell) {
         saveBounds(D.BoundsCell, R);
+        // Branches may rebind a local pointer to a different extent. Keep its
+        // dynamic stamp and union of potential parameter origins.
+        for (auto &Scope : Scopes)
+          for (auto &[Name, Local] : Scope.Names)
+            if (Local.BoundsCell == D.BoundsCell) {
+              if (Local.Storage != R.Storage)
+                Local.Storage.clear();
+              Local.Origins.insert(R.Origins.begin(), R.Origins.end());
+            }
+      }
       if (ends(D.Type, "*") &&
           llvm::isa<llvm::GlobalVariable>(
               llvm::getUnderlyingObject(D.Address)) &&
@@ -1907,7 +1943,7 @@ void Frame::object(const Node &N, bool Global) {
     Cell.borrow(V);
   if (ends(Ty, "*")) {
     llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
-    Cell.BoundsCell = Entry.CreateAlloca(B.getPtrTy(), B.getInt32(2));
+    Cell.BoundsCell = Entry.CreateAlloca(pointerMetadataType());
     saveBounds(Cell.BoundsCell, V);
   }
   if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {
