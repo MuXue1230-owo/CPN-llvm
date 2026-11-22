@@ -11,7 +11,9 @@ using SourcePosition = std::pair<unsigned, unsigned>;
 using JumpCleanups = std::map<SourcePosition, std::set<SourcePosition>>;
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
+struct ConstantPlace;
 struct Value {
+  std::shared_ptr<ConstantPlace> Location;
   SourcePosition DeclaredAt;
   std::string Type;
   llvm::Value *IR = nullptr, *Address = nullptr;
@@ -45,6 +47,11 @@ struct Value {
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
         bool RO = false)
       : Type(std::move(T)), IR(V), Address(A), Readonly(RO) {}
+};
+struct ConstantTransfer {
+  Node::Kind Kind;
+  Value Result;
+  std::string Label;
 };
 struct Substitution {
   std::map<std::string, std::string> Types;
@@ -134,6 +141,19 @@ struct Case {
   Node Decl;
   std::vector<std::string> Types;
 };
+// Paths into evaluation-local values survive immutable LLVM aggregate updates.
+struct ConstantPlace {
+  struct Step {
+    unsigned Index;
+    const Case *Alternative = nullptr;
+  };
+  Value *Root;
+  std::vector<Step> Steps;
+  std::string Type;
+  bool Readonly;
+  Value read(Frame &, const Token &) const;
+  void write(Frame &, Value, const Token &) const;
+};
 struct DeductionFailure : Diagnostic {};
 struct Family {
   Node Decl;
@@ -172,8 +192,15 @@ struct Context {
   std::map<std::string, std::vector<std::string>> Variants;
   std::map<std::string, std::string> DefaultCase;
   std::map<llvm::Value *, llvm::GlobalVariable *> Ready;
+  std::map<llvm::Function *, llvm::GlobalVariable *> Initializing;
+  llvm::Function *StaticRead = nullptr;
+  llvm::GlobalVariable *CurrentInitializer = nullptr;
+  void checkStaticRead(llvm::IRBuilder<> &, llvm::Value *);
+  void finishStaticReads();
   std::set<llvm::GlobalVariable *> ConstantObjects;
   std::vector<std::pair<std::string, Node>> Statics;
+  std::map<llvm::Constant *, llvm::Constant *> ConstantPayloads;
+  void chargeConstant(const Token &, uint64_t Steps = 1);
   unsigned ConstantSteps = 0, ConstantDepth = 0, SpecializationDepth = 0;
   uint64_t Instantiations = 0, SolverSteps = 0;
   void chargeInstance(const Token &);
@@ -202,6 +229,7 @@ struct Context {
   void defineQualified(const Node &, const std::string &,
                        const Substitution * = nullptr);
   struct MemberBody {
+    SourcePosition GenericOwner;
     Node Definition;
     DefinitionSite Site;
   };
@@ -269,6 +297,7 @@ struct Local {
   std::map<std::string, std::string> Aliases;
   std::map<std::string, Value> Names;
   std::vector<Value> Drops;
+  std::vector<std::string> ConstantDrops;
 };
 struct Loop {
   llvm::BasicBlock *Break, *Continue;
@@ -291,6 +320,12 @@ void forwardPointerCall(llvm::IRBuilder<> &, llvm::Function *,
 struct CallArguments {
   std::vector<Value> Values;
   std::vector<llvm::BasicBlock *> Entries, Exits;
+};
+class ConstantActivation {
+  llvm::SaveAndRestore<unsigned> Depth;
+
+public:
+  ConstantActivation(Context &, const Token &);
 };
 class Construction;
 class Frame {
@@ -317,6 +352,8 @@ public:
   std::map<std::string, llvm::BasicBlock *> Labels;
   std::set<std::string> DefinedLabels;
   Value Self;
+  Value *ConstantReceiver = nullptr;
+  std::map<std::string, bool> ConstantMembersAlive;
   Construction *Transaction = nullptr;
   llvm::BasicBlock *InlineReturn = nullptr;
   bool HasDelegated = false;
@@ -464,12 +501,20 @@ public:
   void beginUnionConstructor();
   llvm::Value *payloadAddress(const Case &, llvm::Value *, unsigned);
   void match(const Node &);
+  void constantMatch(const Node &);
+  llvm::Constant *packVariant(const Case &, llvm::Constant *, const Token &);
+  llvm::Constant *unpackVariant(const Case &, llvm::Constant *, const Token &);
+  std::optional<ConstantPlace> constantPlace(const Node &);
   llvm::Value *fieldAddress(Value, unsigned);
   Value baseView(Value, const BasePath &);
   llvm::Value *ownerRecord(Value, unsigned);
   void enterOwnerLayer(Value);
   bool containsPointerField(const std::string &) const;
   Value constantAssignment(const Node &);
+  Value constantSelf(const Token &);
+  Value constantCopy(Value, const Token &);
+  Value constantConstructor(Function &, const std::vector<Value> &,
+                            const Token &, const Node *);
   Value constantAggregate(const std::string &, const std::vector<Node> &,
                           const Token &, const Node *);
   void finishVirtualBase(Value, unsigned);
@@ -478,6 +523,10 @@ public:
   void installTables(Value);
   std::string methodOwner(const std::string &, const Token &);
   void bindParams();
+  void endConstantScope();
+  void constantDrop(Value, const Token &);
+  void endConstantField(const std::string &, bool, const Token &);
+  void constructorBody(const Node &);
   void bindInlineParams(const std::vector<Value> &);
 };
 class Construction {
@@ -510,6 +559,7 @@ class Construction {
 public:
   Construction(Frame &, Function &, Value, const Node *, Frame *);
   void run(Frame &);
+  Value constantResult() const { return Object; }
   Construction(Frame &, Function &Method);
   llvm::Value *admitCall(Frame &, const Function &, const Token &);
   void checkReturn(const Token &) const;

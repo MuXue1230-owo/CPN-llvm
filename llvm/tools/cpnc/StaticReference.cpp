@@ -63,6 +63,7 @@ void Frame::staticReference(const Node &N, const std::string &Name,
   Init.B.CreateRetVoid();
   U.Startup.push_back(Fn);
   U.Ready[Cell] = Ready;
+  U.Initializing[Fn] = Cell;
   Bound.Type = V.Type;
   Bound.Readonly = V.Readonly;
   Bound.ReferenceCell = Cell;
@@ -126,4 +127,65 @@ Value Frame::constantPointerOffset(const Node &N, Value P, Value Other,
   P.BoundsCell = nullptr;
   P.Prvalue = P.Expiring = true;
   return P;
+}
+
+// Register source-level reads while building bodies. A pointer parameter can
+// designate an object declared later, so resolve the checked extents only
+// after all root declarations and deferred function bodies have been bound.
+void Context::checkStaticRead(llvm::IRBuilder<> &B, llvm::Value *Address) {
+  if (llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(Address)))
+    return;
+  if (!StaticRead)
+    StaticRead = llvm::Function::Create(
+        llvm::FunctionType::get(B.getVoidTy(), {B.getPtrTy()}, false),
+        llvm::GlobalValue::InternalLinkage, "cpn.static.read", M);
+  B.CreateCall(StaticRead, {Address});
+}
+
+void Context::finishStaticReads() {
+  if (!StaticRead)
+    return;
+  for (auto *User : llvm::make_early_inc_range(StaticRead->users())) {
+    auto *Call = llvm::cast<llvm::CallInst>(User);
+    auto *Base = llvm::getUnderlyingObject(Call->getArgOperand(0));
+    if (Initializing.empty() || llvm::isa<llvm::AllocaInst>(Base) ||
+        (llvm::isa<llvm::GlobalVariable>(Base) && !Ready.count(Base)))
+      Call->eraseFromParent();
+  }
+  if (StaticRead->use_empty()) {
+    StaticRead->eraseFromParent();
+    StaticRead = nullptr;
+    return;
+  }
+  llvm::IRBuilder<> B(llvm::BasicBlock::Create(C, "entry", StaticRead));
+  CurrentInitializer = new llvm::GlobalVariable(
+      M, B.getPtrTy(), false, llvm::GlobalValue::InternalLinkage,
+      llvm::ConstantPointerNull::get(B.getPtrTy()), "cpn.static.current");
+  auto *Current = B.CreateLoad(B.getPtrTy(), CurrentInitializer);
+  auto *Done = llvm::BasicBlock::Create(C, "return", StaticRead);
+  auto *Check = llvm::BasicBlock::Create(C, "check", StaticRead);
+  auto *Failure = llvm::BasicBlock::Create(C, "unpublished", StaticRead);
+  B.CreateCondBr(B.CreateIsNull(Current), Done, Check);
+  B.SetInsertPoint(Check);
+  auto *P = B.CreatePtrToInt(StaticRead->getArg(0), B.getInt64Ty());
+  for (const auto &[Fn, Object] : Initializing) {
+    // The current constructor may expose an already constructed subobject.
+    // Its own plan checks that frontier. Other tasks require commitment.
+    auto *Base = B.CreatePtrToInt(Object, B.getInt64Ty());
+    uint64_t Bytes = M.getDataLayout().getTypeAllocSize(Object->getValueType());
+    auto *Inside = B.CreateICmpULT(B.CreateSub(P, Base), B.getInt64(Bytes));
+    auto *ReadyBit = B.CreateLoad(B.getInt1Ty(), Ready.at(Object));
+    auto *Pending =
+        B.CreateAnd(B.CreateICmpNE(Current, Object), B.CreateNot(ReadyBit));
+    auto *Next = llvm::BasicBlock::Create(C, "next", StaticRead);
+    B.CreateCondBr(B.CreateAnd(Inside, Pending), Failure, Next);
+    B.SetInsertPoint(Next);
+  }
+  B.CreateBr(Done);
+  B.SetInsertPoint(Failure);
+  B.CreateCall(
+      llvm::Intrinsic::getOrInsertDeclaration(&M, llvm::Intrinsic::trap));
+  B.CreateUnreachable();
+  B.SetInsertPoint(Done);
+  B.CreateRetVoid();
 }

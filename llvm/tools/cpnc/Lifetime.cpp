@@ -5,10 +5,13 @@ std::string Frame::directField(const Node &N) const {
     for (auto &Scope : Scopes)
       if (Scope.Names.count(N.Text))
         return "";
-    return FieldFlags.count(N.Text) ? N.Text : "";
+    return FieldFlags.count(N.Text) || ConstantMembersAlive.count(N.Text)
+               ? N.Text
+               : "";
   }
   if (N.K == Node::Member && N.Definition && N.Children[0].K == Node::Name &&
-      N.Children[0].Text == "this" && FieldFlags.count(N.Text))
+      N.Children[0].Text == "this" &&
+      (FieldFlags.count(N.Text) || ConstantMembersAlive.count(N.Text)))
     return N.Text;
   return "";
 }
@@ -55,6 +58,95 @@ void Frame::checkAbandon(const std::string &Type, const Token &At) {
     return;
   Opt.diagnose(At, Severity::Anomaly, "LIFE004",
                "abandon bypasses nontrivial cleanup of " + Type);
+}
+void Frame::endConstantScope() {
+  auto Names = std::move(Scopes.back().ConstantDrops);
+  Scopes.back().ConstantDrops.clear();
+  for (const auto &Name : llvm::reverse(Names)) {
+    auto V = Scopes.back().Names.at(Name);
+    constantDrop(V, F ? F->Decl.At : Token{});
+  }
+}
+
+void Frame::endConstantField(const std::string &Slot, bool Run,
+                             const Token &At) {
+  auto &Alive = ConstantMembersAlive.at(Slot);
+  if (!Alive)
+    fail(At, "subobject destruction obligation already consumed");
+  Token Field = At;
+  Field.Text = Slot;
+  auto V = member(*ConstantReceiver, Field);
+  Alive = false;
+  if (Run)
+    constantDrop(V, At);
+  else
+    checkAbandon(V.Type, At);
+}
+
+void Frame::constantDrop(Value Object, const Token &At) {
+  auto Type = unconst(Object.Type);
+  if (!U.aggregate(Type))
+    return;
+  ConstantActivation Activation(U, At);
+  auto *C = llvm::dyn_cast_or_null<llvm::Constant>(Object.IR);
+  if (!C)
+    fail(At, "constant object required for destruction");
+  if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType())) {
+    auto E = element(Type);
+    if (U.aggregate(unconst(E)) && !llvm::StringRef(Type).ends_with("[0]"))
+      for (size_t I = Array->getNumElements(); I; --I)
+        constantDrop({E, C->getAggregateElement(unsigned(I - 1))}, At);
+    return;
+  }
+  auto &R = U.Records.at(Type);
+  auto D = U.Overloads.find(Type + "::$drop");
+  Function *Destructor = D == U.Overloads.end() ? nullptr : D->second.front();
+  Frame Body(U, Destructor, nullptr, Type + "::");
+  Object.Readonly = false;
+  Body.ConstantReceiver = &Object;
+  std::set<std::string> Manual;
+  for (size_t I = 0; I < R.Fields.size(); ++I) {
+    auto &Name = R.Fields[I].Decl.Text;
+    Body.ConstantMembersAlive[Name] = true;
+    if (R.Decl.Settings.count("manual") && I >= R.Bases.size())
+      Manual.insert(Name);
+  }
+  for (const auto &Decl : R.Decl.Children)
+    if (Decl.K == Node::Init && Decl.Type == "Complete") {
+      if (Decl.Text == "*")
+        for (const auto &Field : R.Fields)
+          Manual.insert(Field.Decl.Text);
+      else
+        Manual.insert(Decl.Text);
+    }
+  if (Destructor) {
+    if (Destructor->Decl.Prototype || Destructor->Decl.Children.empty())
+      fail(At, "constant destruction requires a destructor definition");
+    Body.constructorBody(Destructor->Decl.Children.front());
+  }
+  if (U.Variants.count(Type)) {
+    auto *Image = llvm::cast<llvm::Constant>(Object.IR);
+    auto Tag = llvm::cast<llvm::ConstantInt>(Image->getAggregateElement(0u))
+                   ->getZExtValue();
+    auto &Active = U.Cases.at(U.Variants.at(Type).at(Tag));
+    auto *Payload = unpackVariant(Active, Image, At);
+    for (unsigned I = Active.Types.size(); I; --I)
+      constantDrop({Active.Types[I - 1], Payload->getAggregateElement(I - 1)},
+                   At);
+  }
+  for (auto &Field : llvm::reverse(R.Fields)) {
+    const auto &Name = Field.Decl.Text;
+    if (!Body.ConstantMembersAlive.at(Name))
+      continue;
+    if (Manual.count(Name) && Destructor)
+      break;
+    Body.endConstantField(Name, true, At);
+  }
+  if (Destructor && Destructor->Decl.Children.size() > 1)
+    Body.constructorBody(Destructor->Decl.Children[1]);
+  for (auto &Field : llvm::reverse(R.Fields))
+    if (Body.ConstantMembersAlive.at(Field.Decl.Text))
+      Body.endConstantField(Field.Decl.Text, true, At);
 }
 void Frame::retirement() {
   auto &R = U.Records.at(Self.Type);

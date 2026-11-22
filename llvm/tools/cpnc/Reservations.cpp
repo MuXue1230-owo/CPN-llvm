@@ -430,6 +430,12 @@ std::optional<Value> Construction::firstWrite(Frame &Em, const Node &N) {
     fail(N.At, "first assignment is beyond the initialization frontier");
   auto &R = Em.U.Records.at(Object.Type);
   auto &Type = R.Fields[Index].Type;
+  if (!Em.IR) {
+    auto V = Em.construct(Type, {N.Children[1]}, N.At);
+    Object.IR = Em.B.CreateInsertValue(Object.IR, V.IR, Index);
+    finishSlot(Em);
+    return V;
+  }
   auto *Addr = Em.B.CreateStructGEP(R.IR, Object.Address, Index);
   atEachPosition(Em, [&] {
     if (Frontier < Index) {

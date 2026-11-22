@@ -132,6 +132,8 @@ llvm::AllocaInst *Frame::allocate(const std::string &T, const Token &At) {
   return Ptr;
 }
 cpn::Value Frame::load(cpn::Value V) {
+  if (!IR && V.Location)
+    V = V.Location->read(*this, {});
   if (V.Type != "storage" && !StringRef(V.Type).ends_with("*"))
     ensureLive(V, {});
   if (V.Address && U.Ready.count(V.Address)) {
@@ -139,6 +141,8 @@ cpn::Value Frame::load(cpn::Value V) {
       fail({}, "dynamic static read is unavailable in a constant expression");
     guard(B.CreateNot(B.CreateLoad(B.getInt1Ty(), U.Ready.at(V.Address))));
   }
+  if (IR && V.Address && !U.Ready.count(V.Address))
+    U.checkStaticRead(B, V.Address);
   if (IR && V.Address &&
       (!V.IR || llvm::isa<llvm::GlobalVariable>(V.Address)) && !V.BoundsCell &&
       carriesPointerBounds(V.Type))
@@ -475,11 +479,6 @@ std::string Frame::resolve(std::string S, const Token &At) {
           U.tagged(Fam.Decl, Full, Fam.Prefix, E);
         else
           U.record(Fam.Decl, Full, Fam.Prefix, E);
-        if (auto Bodies =
-                U.OwnerBodies.find({Fam.Decl.At.Line, Fam.Decl.At.Column});
-            Bodies != U.OwnerBodies.end())
-          for (auto &[Site, Definition] : Bodies->second)
-            U.bindFamilyMember(Full, Definition);
       }
       return Full;
     }
@@ -1104,6 +1103,10 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
     Check.object(D, true);
   }
   buildTables(Name, Members);
+  if (auto Bodies = OwnerBodies.find({N.At.Line, N.At.Column});
+      Bodies != OwnerBodies.end())
+    for (const auto &[Site, Definition] : Bodies->second)
+      bindFamilyMember(Name, Definition);
   for (auto *F : Members)
     emit(*F);
 }
@@ -1301,12 +1304,12 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       Specializations[Name].push_back({D, P, site()});
       continue;
     }
+    if (D.Settings.count("qualifier") &&
+        D.Settings.at("qualifier").find('<') != std::string::npos) {
+      defineFamilyMember(D, P);
+      continue;
+    }
     if (!D.Generics.empty()) {
-      if (D.Settings.count("qualifier") &&
-          D.Settings.at("qualifier").find('<') != std::string::npos) {
-        defineFamilyMember(D, P);
-        continue;
-      }
       if (D.K == Node::Function) {
         genericFunction(D, Name, P);
         continue;
@@ -1429,14 +1432,25 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
         !Ids.insert(N.Settings.at("static_id")).second)
       fail(N.At, "STAT001: duplicate static identity");
     if (N.Settings.count("init_after")) {
-      auto Dep = N.Settings.at("init_after");
-      if (!U.Globals.count(Dep))
-        fail(N.At, "unknown static dependency");
-      if (!Previous.count(Dep))
-        fail(N.At, "cyclic static initialization");
+      auto Owner = StringRef(Name).rsplit("::");
+      auto Prefix =
+          Owner.second.empty() ? std::string{} : Owner.first.str() + "::";
+      for (const auto &Spelling : splitArguments(N.Settings.at("init_after"))) {
+        auto Dep = scopeKey(Prefix, Spelling, [&](const auto &Key) {
+          return U.Globals.count(Key);
+        });
+        if (Dep.empty())
+          fail(N.At, "unknown static dependency");
+        // One root source file has a declaration-order edge between successive
+        // definitions. A backward dependency is already ordered and a forward
+        // dependency closes a cycle, including through a constant object.
+        if (!Previous.count(Dep))
+          fail(N.At, "cyclic static initialization");
+      }
     }
     Previous.insert(Name);
   }
+  U.finishStaticReads();
   auto Hook = [&](std::vector<llvm::Function *> &List, bool IsStartup) {
     if (List.empty())
       return;
@@ -1447,8 +1461,21 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
         llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                IsStartup ? "cpn.startup" : "cpn.shutdown", M);
     llvm::IRBuilder<> B(llvm::BasicBlock::Create(U.C, "entry", F));
-    for (auto *Call : List)
+    for (auto *Call : List) {
+      if (IsStartup && U.CurrentInitializer) {
+        auto It = U.Initializing.find(Call);
+        // Metadata setup for precommitted objects has no construction
+        // authority.
+        llvm::Value *Owner = It == U.Initializing.end()
+                                 ? static_cast<llvm::Value *>(F)
+                                 : It->second;
+        B.CreateStore(Owner, U.CurrentInitializer);
+      }
       B.CreateCall(Call);
+    }
+    if (IsStartup && U.CurrentInitializer)
+      B.CreateStore(llvm::ConstantPointerNull::get(B.getPtrTy()),
+                    U.CurrentInitializer);
     B.CreateRetVoid();
     if (IsStartup)
       llvm::appendToGlobalCtors(M, F, 65535);

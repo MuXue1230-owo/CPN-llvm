@@ -1022,14 +1022,29 @@ class Parser {
         auto Key = name();
         expect("(");
         std::string Value;
-        if (Key.Text == "static_id")
-          Value = unquote(take());
-        else if (Key.Text == "init_after")
-          Value = qualified().Text;
-        else if (Key.Text == "noescape" ||
-                 Key.Text == "returns_borrowed_from" ||
-                 Key.Text == "consumes" || Key.Text == "initializes" ||
-                 Key.Text == "requires_initialized") {
+        if (Key.Text == "static_id") {
+          auto ID = take();
+          if (!StringRef(ID.Text).starts_with("\""))
+            fail(ID, "static_id requires a string literal");
+          Value = unquote(ID);
+        } else if (Key.Text == "init_after") {
+          do {
+            if (!Value.empty())
+              Value += ",";
+            Value += qualified().Text;
+          } while (eat(","));
+        } else if (Key.Text == "init_cancel" || Key.Text == "init_effect") {
+          auto Contract = take();
+          if (Contract.Text != "finish" &&
+              !(Key.Text == "init_cancel" && Contract.Text == "cooperative") &&
+              !(Key.Text == "init_effect" &&
+                (Contract.Text == "none" || Contract.Text == "compensate")))
+            fail(Contract, "invalid static initialization contract");
+          Value = Contract.Text;
+        } else if (Key.Text == "noescape" ||
+                   Key.Text == "returns_borrowed_from" ||
+                   Key.Text == "consumes" || Key.Text == "initializes" ||
+                   Key.Text == "requires_initialized") {
           std::set<std::string> Seen;
           do {
             auto Arg = name();
@@ -1316,6 +1331,11 @@ class Parser {
           D = declaration(false, true);
         }
         applyAttributes(D, Leading);
+        if (D.K == Node::Object && !D.Settings.count("storage") &&
+            (D.Settings.count("static_id") || D.Settings.count("init_after") ||
+             D.Settings.count("init_cancel") ||
+             D.Settings.count("init_effect")))
+          fail(D.At, "static initialization metadata requires static storage");
         if (D.K == Node::Object)
           D.K = Node::Field;
         if (Virt)

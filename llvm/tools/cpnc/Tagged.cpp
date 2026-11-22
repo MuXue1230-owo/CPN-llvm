@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/Analysis/ConstantFolding.h"
 using namespace cpn;
 
 void Context::tagged(const Node &D, const std::string &Name,
@@ -66,8 +67,12 @@ void Context::tagged(const Node &D, const std::string &Name,
     Cases.emplace(Key, std::move(V));
     Alternatives.push_back(Key);
   }
+  // Aligned integer slots preserve native payload offsets and can carry a
+  // link-time pointer relocation as one constant initializer.
+  unsigned Unit = DL.getABITypeAlign(AlignType).value();
+  auto *Word = llvm::IntegerType::get(C, Unit * 8);
   R.IR->setBody({llvm::Type::getInt32Ty(C), llvm::ArrayType::get(AlignType, 0),
-                 llvm::ArrayType::get(llvm::Type::getInt8Ty(C), Size)});
+                 llvm::ArrayType::get(Word, llvm::divideCeil(Size, Unit))});
   R.Layer = R.IR;
   R.Complete = true;
   declareMembers(Name, Name + "::");
@@ -106,8 +111,20 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
                      const Token &At, llvm::Value *Dest, bool Default) {
   if (!Default && Args.size() != C.Types.size())
     fail(At, "wrong union payload arity");
-  if (!IR)
-    fail(At, "union construction requires object storage");
+  if (!IR) {
+    std::vector<llvm::Constant *> Fields;
+    for (size_t I = 0; I < C.Types.size(); ++I) {
+      auto V = Default ? construct(C.Types[I], {}, At)
+                       : materialize(convert(eval(Args[I], C.Types[I]),
+                                             C.Types[I], Args[I].At),
+                                     Args[I].At);
+      Fields.push_back(llvm::cast<llvm::Constant>(V.IR));
+    }
+    Value V{C.Owner,
+            packVariant(C, llvm::ConstantStruct::get(C.Payload, Fields), At)};
+    V.Prvalue = V.Expiring = true;
+    return V;
+  }
   auto *Ptr = Dest ? Dest : allocate(C.Owner, At);
   for (size_t I = 0; I < C.Types.size(); ++I) {
     auto *Slot = payloadAddress(C, Ptr, I);
@@ -125,6 +142,130 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     Temps.push_back(V);
   }
   return V;
+}
+
+llvm::Constant *Frame::packVariant(const Case &C, llvm::Constant *Payload,
+                                   const Token &At) {
+  auto *Ty = U.Records.at(C.Owner).IR;
+  auto *Storage = llvm::cast<llvm::ArrayType>(Ty->getElementType(2));
+  auto *Word = Storage->getElementType();
+  const auto &DL = U.M.getDataLayout();
+  uint64_t Size = DL.getTypeAllocSize(C.Payload);
+  uint64_t Stride = DL.getTypeAllocSize(Word);
+  llvm::Constant *Data = llvm::Constant::getNullValue(Storage);
+  if (!Payload->isNullValue()) {
+    U.chargeConstant(At, Storage->getNumElements());
+    std::vector<llvm::Constant *> Words;
+    for (uint64_t I = 0; I < Storage->getNumElements(); ++I) {
+      auto *W = I * Stride < Size
+                    ? llvm::ConstantFoldLoadFromConst(
+                          Payload, Word, llvm::APInt(64, I * Stride), DL)
+                    : llvm::Constant::getNullValue(Word);
+      if (!W || llvm::isa<llvm::UndefValue>(W))
+        fail(At, "union payload cannot be represented as a target constant");
+      Words.push_back(W);
+    }
+    Data = llvm::ConstantArray::get(Storage, Words);
+  }
+  auto *Image = llvm::ConstantStruct::get(
+      Ty, {B.getInt32(C.Tag),
+           llvm::Constant::getNullValue(Ty->getElementType(1)), Data});
+  U.ConstantPayloads[Image] = Payload;
+  return Image;
+}
+
+llvm::Constant *Frame::unpackVariant(const Case &C, llvm::Constant *Image,
+                                     const Token &At) {
+  auto *Tag =
+      llvm::dyn_cast_or_null<llvm::ConstantInt>(Image->getAggregateElement(0u));
+  auto P = U.ConstantPayloads.find(Image);
+  if (!Tag || Tag->getZExtValue() != C.Tag || P == U.ConstantPayloads.end())
+    fail(At, "inactive constant union payload");
+  return P->second;
+}
+
+void Frame::constantMatch(const Node &N) {
+  const auto &SubjectExpr = N.Children.front();
+  auto Place = constantPlace(SubjectExpr);
+  auto Subject = Place ? Place->read(*this, N.At) : eval(SubjectExpr);
+  if (!Place && Subject.Location)
+    Place = *Subject.Location;
+  auto Alternatives = U.Variants.find(Subject.Type);
+  if (Alternatives == U.Variants.end())
+    fail(N.At, "match requires a union value");
+  auto *Image = llvm::cast<llvm::Constant>(Subject.IR);
+  auto Tag = llvm::cast<llvm::ConstantInt>(Image->getAggregateElement(0u))
+                 ->getZExtValue();
+  const Node *Body = nullptr;
+  Local Bindings;
+  std::set<unsigned> Seen;
+  bool Wild = false;
+  for (const auto &Arm : llvm::drop_begin(N.Children)) {
+    if (Wild)
+      fail(Arm.At, "wildcard must be the final match arm");
+    if (Arm.Text == "_") {
+      Wild = true;
+      if (!Body)
+        Body = &Arm.Children.front();
+      continue;
+    }
+    auto *C = findCase(Arm.Text, Arm.At);
+    if (!C || C->Owner != Subject.Type)
+      fail(Arm.At, "unknown union case");
+    if (!Seen.insert(C->Tag).second || C->Types.size() != Arm.Params.size())
+      fail(Arm.At, "duplicate case or incomplete payload pattern");
+    std::set<std::string> Names;
+    for (unsigned I = 0; I < Arm.Params.size(); ++I) {
+      auto &P = Arm.Params[I];
+      if (P.Type == "_")
+        continue;
+      if (!Names.insert(P.Text).second)
+        fail(P.At, "duplicate match binding");
+      if (P.Type == "move" && !Subject.Expiring)
+        fail(P.At, "move binding requires an expiring subject");
+      if (Tag != C->Tag)
+        continue;
+      auto Field = Place.value_or(
+          ConstantPlace{&Subject, {}, Subject.Type, Subject.Readonly});
+      Field.Type = C->Types[I];
+      Field.Readonly |= C->Decl.Params[I].Const;
+      Field.Steps.push_back({I, C});
+      auto V = Field.read(*this, P.At);
+      if (P.Type == "ref")
+        V.Location = std::make_shared<ConstantPlace>(std::move(Field));
+      else {
+        V.Location = std::make_shared<ConstantPlace>(std::move(Field));
+        V.Expiring = P.Type == "move";
+        V = constantCopy(V, P.At);
+        V.Prvalue = V.Expiring = false;
+        V.Readonly = false;
+        if (U.aggregate(V.Type))
+          Bindings.ConstantDrops.push_back(P.Text);
+      }
+      Bindings.Names.emplace(P.Text, V);
+    }
+    if (Tag == C->Tag)
+      Body = &Arm.Children.front();
+  }
+  if (!Wild && Seen.size() != Alternatives->second.size())
+    fail(N.At, "non-exhaustive match");
+  if (!Body)
+    fail(N.At, "invalid constant union discriminant");
+  Scopes.push_back(std::move(Bindings));
+  // A return or loop transfer still leaves the binding and subject scopes.
+  auto finish = [&] {
+    endConstantScope();
+    Scopes.pop_back();
+    if (Subject.Prvalue)
+      constantDrop(Subject, N.At);
+  };
+  try {
+    stmt(*Body);
+  } catch (const ConstantTransfer &) {
+    finish();
+    throw;
+  }
+  finish();
 }
 
 // Only the active alternative has live payload objects.

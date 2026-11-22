@@ -583,6 +583,33 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
 
+    def test_packed_nested_and_specialized_member_definitions(self):
+        self.assertEqual(
+            self.program("""
+          i32 add(){return 0;}i32 add(i32 a,i32 b){return a+b;}
+          generic<const i32... Ns> struct Values{declare i32 sum();};
+          generic<const i32... Vs> i32 Values<Vs...>::sum(){return add(Vs...);}
+          generic<type T> struct Outer{struct Inner{T n;declare T get() const;};};
+          generic<type X> X Outer<X>::Inner::get() const{return n;}
+          generic<type A,type B> struct Pair{declare i32 read();};
+          generic<type X> specialize struct Pair<X,i32>{X n;declare X get();};
+          specialize struct Pair<i32,i16>{declare i32 value();};
+          generic<type Y> Y Pair<Y,i32>::get(){return n;}
+          i32 Pair<i32,i16>::value(){return 7;}
+          i32 main(){Values<4,6> v;Values<> z; Outer<i32>::Inner n(17);
+            Pair<i32,i32> s(8);Pair<i32,i16> explicitPair;
+            return v.sum()+z.sum()+n.get()+s.get()+explicitPair.value();}
+        """),
+            42,
+        )
+        for source in (
+            "generic<type... Ts> struct P{declare i32 f();};generic<type... Us> i32 P<Us>::f(){return 0;}",
+            "generic<type T> struct P{declare i32 f();};i32 P<i32>::f(){return 0;}",
+            "generic<type T> struct P{struct I{declare T f();};};generic<type U> U P<U>::I::other(){return U();}",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
     def test_never_paths_and_nullptr_object_representation(self):
         program = """
           never diverge(){for(;;){}}
@@ -641,6 +668,95 @@ class CompilerTests(unittest.TestCase):
             "constexpr i32[1] bad(1,2);",
             "constexpr i32[1] a(3);constexpr i32 n(a[1]);",
             "struct P{i32 a(b);i32 b(2);};constexpr P p;",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constexpr_constructor_uses_canonical_plan(self):
+        self.assertEqual(
+            self.program("""
+            struct Number {
+                i32 first; i32 second(first + 2); i32 third;
+                Number(i32 v, bool choose) {
+                    init third(v + second);
+                    if(choose) {first = v;} else {first = 1;}
+                    this->third += 2;
+                }
+                Number(i32 v) {delegate(v,true);}
+            };
+            constexpr Number n(8);
+            constexpr Number m(1,false) -> {third += 2;};
+            i32 main(){Number runtime(8);return runtime.third == n.third ?
+                n.first+n.second+n.third+m.first+m.second : 0;}
+            """),
+            42,
+        )
+        for source in (
+            "i32 global; struct S{i32 n;S(i32 v){init n(v);global=v;}};constexpr S bad(2);",
+            "i32 run(i32 v){return v;} struct S{i32 n;S(i32 x){init n(run(x));}};constexpr S bad(2);",
+            "struct S{i32 a;i32 b;S(i32 n){init a(b);init b(n);}};constexpr S bad(3);",
+            "struct S{i32 x;S(i32 n){init x(n);}};constexpr S bad(2)->{init x(3);};",
+            "struct S{i32 n;S(i32 x){for(;;){}}};constexpr S bad(1);",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constexpr_references_special_members_and_switch(self):
+        self.assertEqual(
+            self.program("""
+          struct N {
+            i32 n;
+            N(const<N>& other){init n(other.n+1);}
+            constexpr i32 add(i32 v){n+=v;return n;}
+          };
+          constexpr i32 bump(i32& n){return ++n;}
+          constexpr i32 run(i32 n){
+            N obj(n); N copy(obj);
+            i32& field(copy.n);
+            switch(n){case 8:{bump(field);fallthrough;}
+              case 9:{copy.add(2);break;} default:{return 1;}}
+            return 2*copy.n+2*obj.n+2;
+          }
+          constexpr i32 result(run(8));
+          i32 main(){return run(8)==result?result:0;}
+        """),
+            42,
+        )
+        for source in (
+            "struct X{~X(){i32 n(1);}};i32 global;struct Y{~Y(){global=1;}};"
+            "constexpr i32 f(){Y[2] y;return 3;}constexpr i32 n(f());",
+            'struct Y{~Y(){i32 n(4);}};extern "C" void effect();'
+            "struct Z{Y y;~Z(){return;}cleanup{effect();}};"
+            "constexpr i32 f(bool cond){if(cond){Z z;}return 1;}constexpr i32 n(f(true));",
+            "constexpr void change(const<i32>& x){x=5;}constexpr i32 f(){i32 a(2);change(a);return a;}constexpr i32 n(f());",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constexpr_tagged_union_payloads_and_match(self):
+        self.assertEqual(
+            self.program("""
+            struct Pair{i16 a; i32 b; Pair(const<Pair>& p)=default;};
+            union U{default case Empty;case Small(i8 b);case PairOf(Pair p, i8 t);case Ptr(const<i32>* p);U(const<U>& v)=default;};
+            constexpr i32 base(14);
+            constexpr U pointer(U::Ptr(&base));
+            constexpr U pair(U::PairOf(Pair(6,10),2));
+            constexpr U empty;
+            constexpr i32 sum(U v){
+                match(v){case U::PairOf(ref p,value t){p.b+=t;return p.a+p.b;}
+                    case U::Small(value b){return b;} case U::Empty{return 0;}
+                    case U::Ptr(value p){return *p;}}
+            }
+            constexpr i32 a(sum(pair)+sum(empty)+sum(U::Small(10)));
+            i32 main(){return a+sum(pointer);}
+            """),
+            42,
+        )
+        for source in (
+            "union U{case A(i32 v);};constexpr U bad;",
+            "union U{case A(i32 v);};constexpr U bad(U::A());",
+            "union U{case A(i32 v);};constexpr U u(U::A(2));constexpr i32 f(){match(u){case U::A(ref n){n+=1;return n;}}}constexpr i32 bad(f());",
+            "union U{case A;case B;};constexpr i32 f(){match(U::A()){case U::A{return 1;}}}constexpr i32 bad(f());",
         ):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
@@ -1704,6 +1820,61 @@ class CompilerTests(unittest.TestCase):
             }"""),
             42,
         )
+
+    def test_static_publication_through_pointer_and_subobject(self):
+        source = """
+          struct Cell {i32 a; i32 b(a+2);Cell(i32 n){init a(n);}};
+          declare i32 early();i32 read(i32* p){return *p;}
+          i32 make(){return 40;}
+        """
+        self.assertLess(
+            self.program(
+                source
+                + """
+          i32 first(early());Cell later(make());
+          i32 early(){return read(&later.b);}
+          i32 main(){return first;}
+        """
+            ),
+            0,
+        )
+        self.assertEqual(
+            self.program(
+                source
+                + """
+          Cell earlier(make());i32 after(early());
+          i32 early(){return read(&earlier.b);}
+          i32 main(){return after;}
+        """
+            ),
+            42,
+        )
+
+    def test_root_static_dependency_lists_and_attributes(self):
+        self.assertEqual(
+            self.program("""
+          namespace lib {
+            [[static_id("lib.first")]] i32 first(8);
+            [[init_after(first)]] i32 second(10);
+            [[init_after(::lib::first,second),init_cancel(cooperative),init_effect(none)]]
+            i32 sum(first+second);
+          }
+          [[init_after(lib::sum,lib::second),init_cancel(finish)]] i32 answer(lib::sum+24);
+          i32 main(){return answer;}
+        """),
+            42,
+        )
+        for source in (
+            "[[static_id(42)]] i32 n;",
+            "[[init_after()]] i32 n;",
+            "i32 a;[[init_after(a,b)]] i32 c;i32 b;",
+            "i32 a;[[init_after(a,missing)]] i32 b;",
+            "[[init_cancel(cooperative)]] i32 a;",
+            "[[init_effect(other)]] i32 a;",
+            'struct X{[[static_id("field")]] i32 a;};',
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
 
     def test_root_static_initialization_and_shutdown(self):
         self.assertEqual(

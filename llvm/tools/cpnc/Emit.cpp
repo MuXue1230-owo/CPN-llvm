@@ -20,10 +20,6 @@ bool assignment(StringRef Op) {
          Op == "%=" || Op == "&=" || Op == "|=" || Op == "^=" || Op == "<<=" ||
          Op == ">>=";
 }
-struct Transfer {
-  Node::Kind Kind;
-  Value Result;
-};
 } // namespace
 Value Frame::lookup(const Token &T) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
@@ -38,6 +34,11 @@ Value Frame::lookup(const Token &T) {
   }
   if (Env.Values.count(T.Text))
     return Env.Values.at(T.Text);
+  if (ConstantReceiver && U.lookupPath(ConstantReceiver->Type, T, false)) {
+    if (Transaction)
+      Transaction->checkAccess(*this, T);
+    return member(load(*ConstantReceiver), T);
+  }
   if (!Self.Type.empty()) {
     try {
       return member(Self, T);
@@ -121,7 +122,7 @@ Value Frame::member(Value Obj, const Token &T) {
       auto &Field = R.Fields[I];
       if (Obj.Address == PendingObject && PendingSlots.count(T.Text))
         fail(T, "use before initialization");
-      if (Transaction && Obj.Address == Self.Address)
+      if (Transaction && IR && Obj.Address == Self.Address)
         Transaction->checkAccess(*this, T);
       checkAccess(Field.Decl, Obj.Type, T);
       if (Obj.Address) {
@@ -211,7 +212,13 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
     if (ends(Type, "&"))
       V = bindReference(V, Type, Param.At);
     else {
-      if (!U.aggregate(Type)) {
+      if (!IR) {
+        V = materialize(convert(V, Type, Param.At), Param.At);
+        if (!llvm::isa_and_nonnull<llvm::Constant>(V.IR))
+          fail(Param.At, "constant argument required");
+        V.Location.reset();
+        V.Address = nullptr;
+      } else if (!U.aggregate(Type)) {
         auto *Cell = allocate(Type, Param.At);
         B.CreateStore(load(convert(V, Type, Param.At)).IR, Cell);
         V.Address = Cell;
@@ -229,9 +236,17 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
         Extents[V.Storage] = V;
         Active[V.Storage] = 1;
       }
-      Scopes.front().Drops.push_back(V);
+      if (IR)
+        Scopes.front().Drops.push_back(V);
+      else if (U.aggregate(V.Type)) {
+        auto Name =
+            Param.Text.empty() ? "$arg." + std::to_string(I) : Param.Text;
+        Scopes.front().Names[Name] = V;
+        Scopes.front().ConstantDrops.push_back(Name);
+      }
     }
-    V.IR = nullptr;
+    if (IR)
+      V.IR = nullptr;
     if (!Param.Text.empty())
       Scopes.front().Names[Param.Text] = V;
     if (!Default.Text.empty())
@@ -412,12 +427,26 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
                                    Value{Expected, nullptr, Dest});
   auto &A = N.Children;
   auto Op = N.Text;
-  if (!IR && U.ConstantDepth && ++U.ConstantSteps > 100000)
-    fail(N.At, "constant evaluation step budget exhausted");
+  if (!IR && U.ConstantDepth)
+    U.chargeConstant(N.At);
   if (!IR && ((N.K == Node::Unary && (Op == "++" || Op == "--")) ||
               (N.K == Node::Binary && assignment(Op)))) {
+    if (Transaction && N.K == Node::Binary && Op == "=")
+      if (auto V = Transaction->firstWrite(*this, N))
+        return *V;
     return constantAssignment(N);
   }
+  if (ConstantReceiver && N.K == Node::Unary && Op == "*" &&
+      A[0].K == Node::Name && A[0].Text == "this")
+    return constantSelf(N.At);
+  if (!IR && (N.K == Node::Name || N.K == Node::Member || N.K == Node::Index))
+    if (auto Place = constantPlace(N)) {
+      if (Place->Type.empty())
+        fail(N.At, "use before initialization");
+      auto V = Place->read(*this, N.At);
+      V.Location = std::make_shared<ConstantPlace>(std::move(*Place));
+      return V;
+    }
   switch (N.K) {
   case Node::Lambda:
     return closure(N);
@@ -474,6 +503,12 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     }
     return load(subscript(N));
   case Node::Member:
+    if (ConstantReceiver && N.Definition && A[0].K == Node::Name &&
+        A[0].Text == "this") {
+      if (Transaction)
+        Transaction->checkAccess(*this, N.At);
+      return member(load(*ConstantReceiver), N.At);
+    }
     if (!IR && !N.Definition) {
       auto Base = eval(A[0]);
       if (U.Records.count(Base.Type) &&
@@ -919,7 +954,8 @@ std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
   if (V.Type == "never")
     return 0;
   auto Base = baseRef(Param), T = unconst(Base);
-  bool Ref = Base != Param, RO = T != Base, Lvalue = V.Address && !V.Expiring;
+  bool Ref = Base != Param, RO = T != Base,
+       Lvalue = (V.Address || V.Location) && !V.Expiring;
   if (Ref && ((ends(Param, "&&") && Lvalue) ||
               (!ends(Param, "&&") && !RO && !Lvalue) || (!RO && V.Readonly)))
     return {};
@@ -1228,6 +1264,32 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     F->Calls.insert(&D);
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
+  if (!IR || D.Decl.Settings.count("mode")) {
+    if (!D.Decl.Required || D.Decl.Prototype)
+      fail(T, "constant expression requires a constexpr function");
+    ConstantActivation Activation(U, T);
+    Frame CF(U, &D, nullptr);
+    if (!D.Owner.empty() && !D.isStatic()) {
+      if (!llvm::isa_and_nonnull<llvm::Constant>(Receiver.IR))
+        fail(T, "constant receiver required");
+      Receiver.Readonly |= D.Decl.Const;
+      CF.ConstantReceiver = &Receiver;
+    }
+    CF.bindInlineParams(Actual);
+    try {
+      CF.stmt(D.Decl.Children.front());
+    } catch (const ConstantTransfer &R) {
+      if (R.Kind != Node::Return)
+        throw;
+      CF.endConstantScope();
+      return R.Result;
+    }
+    if (D.Result == "void") {
+      CF.endConstantScope();
+      return {"void"};
+    }
+    fail(T, "constant invocation completed without a result");
+  }
   std::vector<llvm::Value *> Values;
   auto *ResultStorage = resultAddress(D.Result, T);
   if (ResultStorage)
@@ -1238,8 +1300,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   auto OldPrefix = Prefix;
   Scopes = {Local{}};
   Prefix = D.DefaultPrefix;
-  bool Defaults = Actual.size() < D.Params.size(),
-       Constant = !IR || D.Decl.Settings.count("mode");
+  bool Defaults = Actual.size() < D.Params.size();
   std::vector<Value> Cells;
   for (size_t I = 0; I < D.Params.size(); ++I) {
     auto &P = D.DefaultParams[I];
@@ -1256,7 +1317,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if (!Prepared || I >= Actual.size())
       V = ends(Ty, "&") ? bindReference(V, Ty, P.At)
                         : materialize(convert(V, Ty, T), T);
-    if (!ends(Ty, "&") && !U.aggregate(Ty) && Defaults && !Constant) {
+    if (!ends(Ty, "&") && !U.aggregate(Ty) && Defaults) {
       auto *Addr = allocate(Ty, P.At);
       B.CreateStore(V.IR, Addr);
       V.Address = Addr;
@@ -1274,45 +1335,14 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto &P = D.DefaultParams[I];
     auto V =
         Defaults && !P.Text.empty() ? Scopes.back().Names.at(P.Text) : Cells[I];
-    if (Defaults && !Constant && carriesPointerBounds(D.Params[I]))
+    if (Defaults && carriesPointerBounds(D.Params[I]))
       Cells[I] = load(V);
-    Values.push_back((ends(D.Params[I], "&") || U.aggregate(D.Params[I])) &&
-                             !Constant
+    Values.push_back((ends(D.Params[I], "&") || U.aggregate(D.Params[I]))
                          ? V.Address
                          : load(V).IR);
   }
   Scopes = std::move(Original);
   Prefix = std::move(OldPrefix);
-  if (!IR || D.Decl.Settings.count("mode")) {
-    if (!D.Decl.Required || D.Decl.Prototype)
-      fail(T, "constant expression requires a constexpr function");
-    struct Budget {
-      Context &U;
-      ~Budget() { --U.ConstantDepth; }
-    } Balance{U};
-    if (!U.ConstantDepth++)
-      U.ConstantSteps = 0;
-    if (U.ConstantDepth > 256)
-      fail(T, "constant invocation depth exhausted");
-    Frame CF(U, &D, nullptr);
-    for (size_t I = 0; I < D.Params.size(); ++I) {
-      auto *C = llvm::dyn_cast<llvm::Constant>(Values[I]);
-      if (!C)
-        fail(T, "constant argument required");
-      auto Base = baseRef(D.Params[I]);
-      CF.Scopes[0].Names[D.Decl.Params[I].Text] = {unconst(Base), C, nullptr,
-                                                   D.Decl.Params[I].Const ||
-                                                       Base != unconst(Base)};
-    }
-    try {
-      CF.stmt(D.Decl.Children[0]);
-    } catch (const Transfer &R) {
-      if (R.Kind == Node::Return)
-        return CF.convert(R.Result, D.Result, T);
-      throw;
-    }
-    fail(T, "constant invocation completed without a result");
-  }
   if (!D.Owner.empty() && D.Decl.K == Node::Function && !D.isStatic()) {
     if (Transaction && Receiver.Address == Self.Address) {
       if (auto *Hooks = Transaction->admitCall(*this, D, T))
@@ -1394,10 +1424,16 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     }
   }
   if (C.K == Node::Member) {
-    Receiver = C.Definition ? eval(C.Children[0]) : place(C.Children[0]);
-    if (C.Definition) {
-      auto T = element(Receiver.Type);
-      Receiver = {unconst(T), nullptr, Receiver.IR, T != unconst(T)};
+    if (ConstantReceiver && C.Definition && C.Children[0].K == Node::Name &&
+        C.Children[0].Text == "this")
+      Receiver = constantSelf(C.At);
+    else {
+      Receiver =
+          C.Definition || !IR ? eval(C.Children[0]) : place(C.Children[0]);
+      if (C.Definition) {
+        auto T = element(Receiver.Type);
+        Receiver = {unconst(T), nullptr, Receiver.IR, T != unconst(T)};
+      }
     }
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
@@ -1428,18 +1464,24 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   if ((Name == "destroy_base" || Name == "abandon_base") && Args.size() == 1 &&
       C.TemplateArgs.size() == 1)
     return baseRequest(C, Args.front());
-  if (!FieldFlags.empty() && Args.size() == 1 &&
-      (Name == "destroy" || Name == "abandon")) {
+  if ((!FieldFlags.empty() || !ConstantMembersAlive.empty()) &&
+      Args.size() == 1 && (Name == "destroy" || Name == "abandon")) {
     auto Slot = directField(Args[0]);
     if (!Slot.empty()) {
-      endField(Slot, C.At, Name == "destroy", true);
+      if (IR)
+        endField(Slot, C.At, Name == "destroy", true);
+      else
+        endConstantField(Slot, Name == "destroy", C.At);
       return {"void"};
     }
   }
   if (((Name == "destroy" || Name == "abandon" || Name == "storage_of") &&
        Args.size() == 1) ||
-      (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1))
+      (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1)) {
+    if (!IR)
+      fail(C.At, "storage operation requires runtime storage");
     return storageCall(C, Args);
+  }
   if (C.K == Node::Name && typeCallee(Name, C.At)) {
     auto T = resolve(Name, C.At);
     return construct(
@@ -1453,6 +1495,9 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     if (auto Owner = memberQualifier(Name, C.At, Tail))
       Name = *Owner + "::" + Tail;
   }
+  if (Receiver.Type.empty() && ConstantReceiver &&
+      !methodOwner(ConstantReceiver->Type, C.At).empty())
+    Receiver = constantSelf(C.At);
   if (Receiver.Type.empty() && !Self.Type.empty() &&
       !methodOwner(Self.Type, C.At).empty())
     Receiver = Self;
@@ -1954,6 +1999,15 @@ void Frame::endExpression(size_t From) {
   }
 }
 void Frame::object(const Node &N, bool Global) {
+  if (!Global && !N.Settings.count("storage") &&
+      (N.Settings.count("static_id") || N.Settings.count("init_after") ||
+       N.Settings.count("init_cancel") || N.Settings.count("init_effect")))
+    fail(N.At, "static initialization metadata requires static storage");
+  if (auto Cancel = N.Settings.find("init_cancel");
+      Cancel != N.Settings.end() && Cancel->second == "cooperative" &&
+      (!N.Settings.count("init_effect") ||
+       N.Settings.at("init_effect") == "finish"))
+    fail(N.At, "cooperative cancellation requires none or compensate effects");
   std::string Name = Global ? Prefix + N.Text : N.Text;
   if (Global && N.Settings.count("identity"))
     Name = N.Settings.at("identity");
@@ -2058,11 +2112,11 @@ void Frame::object(const Node &N, bool Global) {
                      (Args[0].K == Node::Name &&
                       (Args[0].Text == "true" || Args[0].Text == "false")))));
     llvm::Value *StaticConstant = nullptr;
-    if (N.Required && Tail)
-      fail(N.At, "constant evaluation of construction tails is unavailable");
+    if (N.Required && Tail && !U.Records.count(Ty))
+      fail(N.At, "constant construction tail requires a record");
     Simple |= N.Required;
     if (Simple) {
-      auto V = construct(Ty, Args, N.At);
+      auto V = construct(Ty, Args, N.At, nullptr, Tail);
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
       G->setConstant(Readonly);
       StaticConstant = N.Required ? V.IR : nullptr;
@@ -2090,6 +2144,7 @@ void Frame::object(const Node &N, bool Global) {
                                              llvm::GlobalValue::InternalLinkage,
                                              B.getFalse(), "cpn.ready");
       U.Ready[G] = Ready;
+      U.Initializing[Fn] = G;
       Init.B.CreateStore(B.getTrue(), Ready);
     }
     Value Cell{Ty, StaticConstant, G, Readonly};
@@ -2097,7 +2152,7 @@ void Frame::object(const Node &N, bool Global) {
       // The initializer supplies symbolic bytes at translation. Capture the
       // designated storage generations at startup without writing those bytes.
       auto *Temp = Init.allocate(Ty, N.At);
-      Init.construct(Ty, Args, N.At, Temp);
+      Init.construct(Ty, Args, N.At, Temp, Tail);
       Init.copyStoredBounds({Ty, nullptr, Temp}, G);
       Init.endExpression();
     }
@@ -2143,21 +2198,31 @@ void Frame::object(const Node &N, bool Global) {
       Check.Scopes = Scopes;
       Check.symbolicAddress(Check.place(Args[0]), N.At);
     }
-    auto V = place(Args[0]);
+    Value V;
+    if (!IR && !N.Required) {
+      V = eval(Args.front());
+      if (!V.Location && !V.Address)
+        fail(N.At, "reference initializer requires a designated object");
+    } else
+      V = place(Args[0]);
     V = bindReference(V, Ty, N.At);
     names()[Name] = V;
     return;
   }
   if (!IR) {
-    auto V =
-        Ty == "auto" ? constantEval(Args.at(0)) : construct(Ty, Args, N.At);
+    auto V = Ty == "auto" ? constantEval(Args.at(0))
+                          : construct(Ty, Args, N.At, nullptr, Tail);
     if (V.Type == "real")
       V = floatingConvert(V, Opt.DefaultReal, N.At);
     if (V.Type == "integer")
       V = convert(V, Opt.DefaultInt, N.At);
     V.Readonly = Readonly;
+    V.Location.reset();
+    V.Prvalue = V.Expiring = false;
     V.Address = nullptr;
     names()[Name] = V;
+    if (U.aggregate(V.Type))
+      Scopes.back().ConstantDrops.push_back(Name);
     return;
   }
   Value V;
@@ -2169,7 +2234,7 @@ void Frame::object(const Node &N, bool Global) {
     CF.LookupLimit = LookupLimit;
     CF.Scopes = Scopes;
     V = Ty == "auto" ? CF.constantEval(Args.at(0))
-                     : CF.construct(Ty, Args, N.At);
+                     : CF.construct(Ty, Args, N.At, nullptr, Tail);
     if (Ty == "auto")
       Ty = V.Type == "integer" ? Opt.DefaultInt
            : V.Type == "real"  ? Opt.DefaultReal
@@ -2181,7 +2246,7 @@ void Frame::object(const Node &N, bool Global) {
     }
     Ptr = allocate(Ty, N.At);
     if (containsPointerField(Ty))
-      construct(Ty, Args, N.At, Ptr);
+      construct(Ty, Args, N.At, Ptr, Tail);
     B.CreateStore(V.IR, Ptr);
   } else if (Ty == "auto") {
     V = eval(Args.at(0));
@@ -2220,6 +2285,16 @@ void Frame::object(const Node &N, bool Global) {
   Scopes.back().Drops.push_back(Cell);
   endExpression();
 }
+void Frame::constructorBody(const Node &Body) {
+  try {
+    stmt(Body);
+  } catch (const ConstantTransfer &T) {
+    if (T.Kind != Node::Return)
+      throw;
+  }
+  if (!IR)
+    endConstantScope();
+}
 void Frame::stmt(const Node &N) {
   auto &A = N.Children;
   auto Label = std::move(StatementLabel);
@@ -2229,11 +2304,15 @@ void Frame::stmt(const Node &N) {
     try {
       for (auto &S : A)
         stmt(S);
-    } catch (const Transfer &) {
+    } catch (const ConstantTransfer &) {
+      if (!IR)
+        endConstantScope();
       Scopes.pop_back();
       throw;
     }
-    if (IR && Live)
+    if (!IR)
+      endConstantScope();
+    else if (Live)
       cleanup(Scopes.size() - 1);
     Scopes.pop_back();
     return;
@@ -2270,8 +2349,8 @@ void Frame::stmt(const Node &N) {
     Opt = Old;
     return;
   }
-  if (!IR && U.ConstantDepth && ++U.ConstantSteps > 100000)
-    fail(N.At, "constant evaluation step budget exhausted");
+  if (!IR && U.ConstantDepth)
+    U.chargeConstant(N.At);
   if (N.K == Node::Delegate) {
     if (!Transaction)
       fail(N.At, "delegate requires a constructor");
@@ -2320,15 +2399,19 @@ void Frame::stmt(const Node &N) {
       V.IR = V.Address;
     } else if (F->Result != "void") {
       V = convert(V, F->Result, N.At);
-      if (IR)
-        V = materialize(V, N.At, Result);
+      V = materialize(V, N.At, Result);
+      if (!IR) {
+        V.Location.reset();
+        V.Address = nullptr;
+        V.Prvalue = V.Expiring = true;
+      }
     }
     if (IR)
       publishPointerResult(V);
     if (Transaction && Live)
       Transaction->checkReturn(N.At);
     if (!IR)
-      throw Transfer{Node::Return, V};
+      throw ConstantTransfer{Node::Return, V};
     endExpression();
     cleanup(0);
     if (V.Type == "void" || Result)
@@ -2403,33 +2486,132 @@ void Frame::stmt(const Node &N) {
     B.SetInsertPoint(End);
     return;
   }
+  if (N.K == Node::Switch) {
+    auto S = eval(A[0]);
+    if (S.Type == "integer")
+      S = convert(S, Opt.DefaultInt, N.At);
+    if (!integer(S.Type) && !U.Enums.count(S.Type))
+      fail(N.At, "switch requires an integer");
+    auto *End = IR ? block("switch.end") : nullptr;
+    std::vector<llvm::BasicBlock *> Arms;
+    for (size_t I = 1; IR && I < A.size(); ++I)
+      Arms.push_back(block("case"));
+    auto *SW = IR ? B.CreateSwitch(S.IR, End) : nullptr;
+    size_t Selected = 0, Fallback = 0;
+    Loops.push_back({End, nullptr, Scopes.size(), Label});
+    std::set<uint64_t> Cases;
+    bool Default = false, CanExit = false;
+    for (size_t I = 1; I < A.size(); ++I) {
+      auto &Arm = A[I];
+      if (IR)
+        B.SetInsertPoint(Arms[I - 1]);
+      Live = true;
+      if (Arm.Children.size() == 1) {
+        if (Default)
+          fail(Arm.At, "duplicate default arm");
+        Default = true;
+        Fallback = I;
+        if (SW)
+          SW->setDefaultDest(Arms[I - 1]);
+      } else {
+        auto *K = llvm::cast<llvm::ConstantInt>(
+            convert(constantEval(Arm.Children[0]), S.Type, Arm.At).IR);
+        if (!Cases.insert(K->getZExtValue()).second)
+          fail(Arm.At, "duplicate case");
+        if (SW)
+          SW->addCase(K, Arms[I - 1]);
+        else if (K == S.IR)
+          Selected = I;
+      }
+      auto Body = Arm.Children.back();
+      bool Fall =
+          !Body.Children.empty() && Body.Children.back().K == Node::Fallthrough;
+      if (Fall) {
+        if (I + 1 == A.size())
+          fail(Arm.At, "invalid final fallthrough");
+        Body.Children.pop_back();
+      }
+      if (!IR)
+        continue;
+      if (Transaction)
+        Transaction->restoreFlow(Body);
+      stmt(Body);
+      CanExit |= Live && !Fall;
+      branch(Fall ? Arms[I] : End);
+    }
+    if (!IR) {
+      Loops.pop_back();
+      for (size_t I = Selected ? Selected : Fallback; I && I < A.size(); ++I) {
+        auto Body = A[I].Children.back();
+        bool Fall = !Body.Children.empty() &&
+                    Body.Children.back().K == Node::Fallthrough;
+        if (Fall)
+          Body.Children.pop_back();
+        try {
+          stmt(Body);
+        } catch (const ConstantTransfer &T) {
+          if (T.Kind != Node::Break || (!T.Label.empty() && T.Label != Label))
+            throw;
+          break;
+        }
+        if (!Fall)
+          break;
+      }
+      return;
+    }
+    if (Transaction)
+      Transaction->restoreFlow(N, true);
+    Live = !Default || CanExit || Loops.back().BreakUsed;
+    Loops.pop_back();
+    B.SetInsertPoint(End);
+    return;
+  }
   if (!IR) {
+    if (N.K == Node::Label) {
+      StatementLabel = N.Text;
+      stmt(A[0]);
+      return;
+    }
+    if (N.K == Node::Match) {
+      constantMatch(N);
+      return;
+    }
     if (N.K == Node::For || N.K == Node::Do || N.K == Node::While) {
       bool For = N.K == Node::For, Do = N.K == Node::Do;
       Scopes.emplace_back();
       if (For)
         stmt(A[0]);
-      for (bool First = true;; First = false) {
-        auto &Test = A[For || Do ? 1 : 0];
-        if (!(Do && First) && Test.K != Node::Empty &&
-            llvm::cast<llvm::ConstantInt>(boolean(Test).IR)->isZero())
-          break;
-        try {
-          stmt(A[For ? 3 : Do ? 0 : 1]);
-        } catch (const Transfer &C) {
-          if (C.Kind == Node::Break)
+      try {
+        for (bool First = true;; First = false) {
+          U.chargeConstant(N.At);
+          auto &Test = A[For || Do ? 1 : 0];
+          if (!(Do && First) && Test.K != Node::Empty &&
+              llvm::cast<llvm::ConstantInt>(boolean(Test).IR)->isZero())
             break;
-          if (C.Kind != Node::Continue)
-            throw;
+          try {
+            stmt(A[For ? 3 : Do ? 0 : 1]);
+          } catch (const ConstantTransfer &C) {
+            if (!C.Label.empty() && C.Label != Label)
+              throw;
+            if (C.Kind == Node::Break)
+              break;
+            if (C.Kind != Node::Continue)
+              throw;
+          }
+          if (For && A[2].K != Node::Empty)
+            eval(A[2]);
         }
-        if (For && A[2].K != Node::Empty)
-          eval(A[2]);
+      } catch (const ConstantTransfer &) {
+        endConstantScope();
+        Scopes.pop_back();
+        throw;
       }
+      endConstantScope();
       Scopes.pop_back();
       return;
     }
     if (N.K == Node::Break || N.K == Node::Continue)
-      throw Transfer{N.K, {}};
+      throw ConstantTransfer{N.K, {}, N.Text};
     fail(N.At, "statement unavailable in constant evaluation");
   }
   if (N.K == Node::For || N.K == Node::While || N.K == Node::Do) {
@@ -2486,57 +2668,6 @@ void Frame::stmt(const Node &N) {
   }
   if (N.K == Node::Match) {
     match(N);
-    return;
-  }
-  if (N.K == Node::Switch) {
-    auto S = eval(A[0]);
-    if (S.Type == "integer")
-      S = convert(S, Opt.DefaultInt, N.At);
-    if (!integer(S.Type) && !U.Enums.count(S.Type))
-      fail(N.At, "switch requires an integer");
-    auto *End = block("switch.end");
-    std::vector<llvm::BasicBlock *> Arms;
-    for (size_t I = 1; I < A.size(); ++I)
-      Arms.push_back(block("case"));
-    auto *SW = B.CreateSwitch(S.IR, End);
-    Loops.push_back({End, nullptr, Scopes.size(), Label});
-    std::set<uint64_t> Cases;
-    bool Default = false, CanExit = false;
-    for (size_t I = 1; I < A.size(); ++I) {
-      auto &Arm = A[I];
-      B.SetInsertPoint(Arms[I - 1]);
-      Live = true;
-      if (Arm.Children.size() == 1) {
-        if (Default)
-          fail(Arm.At, "duplicate default arm");
-        Default = true;
-        SW->setDefaultDest(Arms[I - 1]);
-      } else {
-        auto *K = llvm::cast<llvm::ConstantInt>(
-            convert(constantEval(Arm.Children[0]), S.Type, Arm.At).IR);
-        if (!Cases.insert(K->getZExtValue()).second)
-          fail(Arm.At, "duplicate case");
-        SW->addCase(K, Arms[I - 1]);
-      }
-      auto Body = Arm.Children.back();
-      bool Fall =
-          !Body.Children.empty() && Body.Children.back().K == Node::Fallthrough;
-      if (Fall) {
-        if (I + 1 == A.size())
-          fail(Arm.At, "invalid final fallthrough");
-        Body.Children.pop_back();
-      }
-      if (Transaction)
-        Transaction->restoreFlow(Body);
-      stmt(Body);
-      CanExit |= Live && !Fall;
-      branch(Fall ? Arms[I] : End);
-    }
-    if (Transaction)
-      Transaction->restoreFlow(N, true);
-    Live = !Default || CanExit || Loops.back().BreakUsed;
-    Loops.pop_back();
-    B.SetInsertPoint(End);
     return;
   }
   if (N.K == Node::Label || N.K == Node::Goto) {

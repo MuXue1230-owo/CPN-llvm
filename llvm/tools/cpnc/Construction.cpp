@@ -86,7 +86,7 @@ Construction::Construction(Frame &Em, Function &Root, Value Obj,
     Tmp->eraseFromParent();
   }
   findReservations(Em);
-  if (!Reserved.empty()) {
+  if (Em.IR && !Reserved.empty()) {
     Cursor = Em.allocate("i32", Root.Decl.At);
     publish(Em);
   }
@@ -99,7 +99,7 @@ bool Construction::needsDelegate(const Frame &F) const {
 }
 void Construction::advance(Frame &Current) {
   auto &R = Current.U.Records.at(Object.Type);
-  if (Frontier == R.Bases.size())
+  if (Current.IR && Frontier == R.Bases.size())
     Current.installTables(Object);
   while (Frontier < Order.size()) {
     auto &F = R.Fields[Frontier];
@@ -115,8 +115,12 @@ void Construction::advance(Frame &Current) {
       Source = P.Owner ? Activations.at(P.Owner) : TailFrame;
       Args = &P.Source->Children;
     }
-    Source->B.SetInsertPoint(Current.B.GetInsertBlock());
-    auto *Address = Source->fieldAddress(Object, Frontier);
+    if (Current.IR)
+      Source->B.SetInsertPoint(Current.B.GetInsertBlock());
+    auto *Address =
+        Current.IR ? Source->fieldAddress(Object, Frontier) : nullptr;
+    llvm::SaveAndRestore Receiver(Source->ConstantReceiver,
+                                  Current.IR ? nullptr : &Object);
     auto Previous = Source->Self;
     auto *PreviousTxn = Source->Transaction;
     Source->Transaction = this;
@@ -126,9 +130,10 @@ void Construction::advance(Frame &Current) {
     for (size_t I = 0; I < R.Fields.size(); ++I) {
       auto &Member = R.Fields[I];
       Earlier.Names[Member.Decl.Text] =
-          I >= Frontier
-              ? Value{}
-              : Value{Member.Type, nullptr, Source->fieldAddress(Object, I)};
+          I >= Frontier ? Value{}
+          : Current.IR
+              ? Value{Member.Type, nullptr, Source->fieldAddress(Object, I)}
+              : Value{Member.Type, Source->B.CreateExtractValue(Object.IR, I)};
     }
     // Constructor parameters shadow members. Body-local declarations never
     // participate in the declarative initializer environment.
@@ -148,17 +153,21 @@ void Construction::advance(Frame &Current) {
       Source->LookupLimit = F.DefaultSite->Through;
     }
     size_t Mark = Source->Temps.size();
-    Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
-                      Frontier < R.Bases.size());
+    auto Built = Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
+                                   Frontier < R.Bases.size());
+    if (!Current.IR)
+      Object.IR = Source->B.CreateInsertValue(Object.IR, Built.IR, Frontier);
     Source->endExpression(Mark);
     Source->Scopes = std::move(Old);
     Source->Self = Previous;
     Source->Transaction = PreviousTxn;
-    Current.B.SetInsertPoint(Source->B.GetInsertBlock());
-    Current.finishVirtualBase(Object, Frontier);
+    if (Current.IR) {
+      Current.B.SetInsertPoint(Source->B.GetInsertBlock());
+      Current.finishVirtualBase(Object, Frontier);
+    }
     ++Frontier;
     publish(Current);
-    if (Frontier == R.Bases.size())
+    if (Current.IR && Frontier == R.Bases.size())
       Current.installTables(Object);
   }
 }
@@ -168,7 +177,8 @@ void Construction::enter(Frame &Em, size_t Depth) {
   auto *Old = Em.Transaction;
   Em.Transaction = this;
   atEachPosition(Em, [&] { advance(Em); });
-  Em.stmt(D->Decl.Children.front());
+  llvm::SaveAndRestore Receiver(Em.ConstantReceiver, Em.IR ? nullptr : &Object);
+  Em.constructorBody(D->Decl.Children.front());
   Em.Transaction = Old;
   Activations.erase(D);
 }
@@ -188,6 +198,12 @@ void Construction::delegate(Frame &Em, const Node &N) {
   Em.admitArguments(Actual, D, N.At);
   auto &Args = Actual.Values;
   Frame Next(Em.U, D, Em.IR);
+  if (!Em.IR) {
+    Next.bindInlineParams(Args);
+    enter(Next, I + 1);
+    Em.HasDelegated = true;
+    return;
+  }
   Next.B.SetInsertPoint(Em.B.GetInsertBlock());
   Next.BaseLayer = Em.BaseLayer;
   Next.Self = Object;

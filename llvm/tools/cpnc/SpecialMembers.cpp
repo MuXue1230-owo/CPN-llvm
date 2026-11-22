@@ -155,6 +155,14 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
 }
 
 Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
+  if (!IR) {
+    Source = load(Source);
+    if (!Source.Prvalue && U.aggregate(Source.Type))
+      return constantCopy(Source, At);
+    Source.Location.reset();
+    Source.Address = nullptr;
+    return Source;
+  }
   bool Aggregate = U.aggregate(Source.Type);
   if (Dest && Dest == Source.Address)
     return Source;
