@@ -347,24 +347,28 @@ class Parser {
       S += ")";
       if (eat("noexcept"))
         S += " noexcept";
-      std::set<unsigned> NoEscape, Borrowed;
+      std::set<unsigned> NoEscape, Borrowed, Consumes;
       for (const auto &[Key, Value] : attributes()) {
         if (Key == "lifecycle_effect") {
           S += " whole";
           continue;
         }
-        if (Key != "noescape" && Key != "returns_borrowed_from")
+        if (Key != "noescape" && Key != "returns_borrowed_from" &&
+            Key != "consumes")
           fail(T, "invalid callable type attribute");
         llvm::SmallVector<StringRef> List;
         StringRef(Value).split(List, ',');
+        auto &Positions = Key == "consumes"   ? Consumes
+                          : Key == "noescape" ? NoEscape
+                                              : Borrowed;
         for (auto Name : List) {
           auto It = Named.find(Name.str());
           if (It == Named.end())
             fail(T, "unknown borrow-contract parameter");
-          (Key == "noescape" ? NoEscape : Borrowed).insert(It->second);
+          Positions.insert(It->second);
         }
       }
-      S += borrowEffects(NoEscape, Borrowed);
+      S += parameterEffects(NoEscape, Borrowed, Consumes);
       closeAngle();
       S += ">";
     } else {
@@ -944,26 +948,41 @@ class Parser {
   }
   // A special member has no return type. Its qualified name is followed
   // immediately by the parameter list, unlike a function's result type.
-  bool separateSpecial() const {
-    size_t I = is("::") ? 1 : 0;
-    if (!identifier(peek(I).Text))
+  bool separateSpecial() {
+    auto Start = Pos;
+    if (!is("::") && (!identifier(peek().Text) ||
+                      (peek(1).Text != "::" && peek(1).Text != "<")))
       return false;
-    while (peek(I + 1).Text == "::") {
-      I += 2;
-      if (peek(I).Text == "~")
-        return true;
-      if (peek(I + 1).Text == "(")
-        return true;
+    llvm::SaveAndRestore Position(Pos, Start);
+    try {
+      std::string Q;
+      bool Drop = false;
+      declarationName(Q, Drop);
+      return !Q.empty() && is("(");
+    } catch (const Diagnostic &) {
+      return false;
     }
-    return false;
   }
   Token declarationName(std::string &Qualifier, bool &Dtor) {
     bool Root = eat("::");
     auto Id = is("operator") ? operatorName() : name();
-    while (eat("::")) {
-      Qualifier += Id.Text + "::";
+    std::string Schema = Id.Text;
+    for (;;) {
+      auto Component = Id.Text;
+      if (is("<") && Families.count(Schema)) {
+        std::string Args;
+        templateArgs(Schema, &Args);
+        Component += Args;
+        if (!is("::"))
+          fail(peek(),
+               "an applied declaration qualifier must name an owning scope");
+      }
+      if (!eat("::"))
+        break;
+      Qualifier += Component + "::";
       Dtor = eat("~");
       Id = !Dtor && is("operator") ? operatorName() : name();
+      Schema += "::" + Id.Text;
       if (Dtor)
         break;
     }
@@ -1009,7 +1028,7 @@ class Parser {
           Value = qualified().Text;
         else if (Key.Text == "noescape" ||
                  Key.Text == "returns_borrowed_from" ||
-                 Key.Text == "initializes" ||
+                 Key.Text == "consumes" || Key.Text == "initializes" ||
                  Key.Text == "requires_initialized") {
           std::set<std::string> Seen;
           do {
@@ -1035,7 +1054,8 @@ class Parser {
   }
   void applyAttributes(Node &D, const Attributes &Attrs) {
     for (const auto &[Key, Value] : Attrs) {
-      if (Key == "noescape" || Key == "returns_borrowed_from") {
+      if (Key == "noescape" || Key == "returns_borrowed_from" ||
+          Key == "consumes") {
         if (D.K != Node::Function)
           fail(D.At, "borrow contract requires a function");
       } else if (Key == "initializes" || Key == "requires_initialized") {
@@ -1336,7 +1356,11 @@ class Parser {
       auto Id = declarationName(Q, Dtor);
       Node D(Dtor ? Node::Destructor : Node::Constructor, Id);
       D.Settings["qualifier"] = Q;
+      D.Generics = G;
+      if (Requires.K != Node::Empty)
+        D.TemplateArgs.push_back(std::move(Requires));
       specialBody(D, false, true);
+      Types = std::move(Saved);
       return D;
     }
     if (Foreign && is("declare"))
@@ -1389,7 +1413,7 @@ class Parser {
     F.Required = CE || Eval;
     if (Eval)
       F.Settings["mode"] = "consteval";
-    if (!G.empty())
+    if (!G.empty() && Q.empty())
       Families[Id.Text] = G;
     if (Requires.K != Node::Empty)
       F.TemplateArgs.push_back(std::move(Requires));

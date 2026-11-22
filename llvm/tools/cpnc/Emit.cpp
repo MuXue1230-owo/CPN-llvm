@@ -33,7 +33,7 @@ Value Frame::lookup(const Token &T) {
     if (V != I->Names.end()) {
       if (V->second.Type.empty())
         fail(T, "use before initialization");
-      return V->second;
+      return openStaticReference(V->second);
     }
   }
   if (Env.Values.count(T.Text))
@@ -56,7 +56,7 @@ Value Frame::lookup(const Token &T) {
       checkAccess(U.StaticMembers.at(Key).second, Owner, T);
       if (!U.Globals.count(Key))
         fail(T, "static member used before initialization");
-      return U.Globals.at(Key);
+      return openStaticReference(U.Globals.at(Key));
     }
   }
   std::string Tail, Name = T.Text;
@@ -74,7 +74,7 @@ Value Frame::lookup(const Token &T) {
     }
     if (auto I = U.StaticMembers.find(Key); I != U.StaticMembers.end())
       checkAccess(I->second.second, I->second.first, T);
-    return U.Globals.at(Key);
+    return openStaticReference(U.Globals.at(Key));
   }
   fail(T, "unknown name '" + T.Text + "'");
 }
@@ -112,7 +112,7 @@ Value Frame::member(Value Obj, const Token &T) {
     checkAccess(I->second.second, Owner, T);
     if (!U.Globals.count(I->first))
       fail(T, "static member used before initialization");
-    return U.Globals.at(I->first);
+    return openStaticReference(U.Globals.at(I->first));
   }
   Obj = baseView(Obj, *Path);
   auto &R = U.Records.at(Obj.Type);
@@ -170,9 +170,14 @@ void Frame::bindParams() {
       }
       Scopes[0].Drops.push_back(V);
     }
-    if (carriesPointerBounds(T))
+    if (carriesPointerBounds(T)) {
       V.BoundsCell = incomingPointerCell(J + 1);
-    else if (ends(T, "&"))
+      if (!ends(T, "&")) {
+        readBounds(V, V.BoundsCell);
+        V.BoundsCell = storedPointerCell(V.Address);
+        saveBounds(V.BoundsCell, V);
+      }
+    } else if (ends(T, "&"))
       readReferent(V, incomingPointerCell(J + 1));
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
@@ -193,6 +198,7 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
       llvm::SaveAndRestore Policy(Opt, F->Defaults.Configuration);
       llvm::SaveAndRestore Limit(LookupLimit, F->Defaults.Through);
       llvm::SaveAndRestore Namespace(Prefix, F->DefaultPrefix);
+      llvm::SaveAndRestore Bindings(Env, F->DefaultEnv);
       Scopes.push_back(Defaults);
       if (ends(Type, "&") && Default.Children.size() == 1)
         V = bindReference(eval(Default.Children.front()), Type, Default.At);
@@ -211,7 +217,7 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
         V.Address = Cell;
         V.IR = nullptr;
         if (carriesPointerBounds(Type)) {
-          V.BoundsCell = B.CreateAlloca(pointerMetadataType());
+          V.BoundsCell = storedPointerCell(Cell);
           saveBounds(V.BoundsCell, V);
         }
       }
@@ -253,6 +259,14 @@ Value Frame::place(const Node &N, bool NeedLive) {
     V.borrow(P);
     V.ElementLower = P.Lower;
     V.ElementUpper = P.Upper;
+    if (!IR && P.Upper) {
+      int64_t Position, End;
+      const auto &DL = U.M.getDataLayout();
+      if (llvm::GetPointerBaseWithConstantOffset(P.IR, Position, DL) ==
+              llvm::GetPointerBaseWithConstantOffset(P.Upper, End, DL) &&
+          Position == End)
+        fail(N.At, "cannot dereference a one-past pointer");
+    }
     if (P.Upper && IR)
       guard(B.CreateAnd(B.CreateIsNotNull(P.Upper),
                         B.CreateICmpEQ(P.IR, P.Upper)));
@@ -278,6 +292,8 @@ Value Frame::place(const Node &N, bool NeedLive) {
     fail(N.At, "object lvalue required");
   if (NeedLive && !V.BoundsCell)
     ensureLive(V, N.At);
+  if (IR && carriesPointerBounds(V.Type) && !V.BoundsCell)
+    V.BoundsCell = storedPointerCell(V.Address);
   return V;
 }
 Value Frame::subscript(const Node &N) {
@@ -292,6 +308,24 @@ Value Frame::subscript(const Node &N) {
   if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(Index.IR)) {
     if (K->getValue().uge(Count))
       fail(N.At, "array index outside extent");
+  }
+  if (!IR) {
+    auto *Address = symbolicAddress(Base, N.At);
+    auto *IndexValue = llvm::dyn_cast<llvm::ConstantInt>(Index.IR);
+    if (!IndexValue)
+      fail(N.At, "constant array index required");
+    auto E = element(Base.Type);
+    llvm::Constant *Indices[] = {B.getInt32(0),
+                                 B.getInt64(IndexValue->getZExtValue())};
+    Value V{unconst(E), nullptr,
+            llvm::ConstantExpr::getGetElementPtr(U.M.getDataLayout(), Array,
+                                                 Address, Indices),
+            Base.Readonly || E != unconst(E)};
+    V.ElementLower = Address;
+    V.ElementUpper = llvm::ConstantExpr::getGetElementPtr(
+        U.M.getDataLayout(), Array->getElementType(), Address,
+        B.getInt64(Count));
+    return V;
   }
   auto *I = B.CreateIntCast(Index.IR, B.getInt64Ty(), signedType(Index.Type));
   guard(B.CreateICmpUGE(I, B.getInt64(Count)));
@@ -433,6 +467,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     auto *G = new llvm::GlobalVariable(U.M, C->getType(), true,
                                        llvm::GlobalValue::PrivateLinkage, C,
                                        "cpn.string");
+    U.ConstantObjects.insert(G);
     return {"u8[" + std::to_string(S.size() + 1) + "]", C, G, true};
   }
   case Node::Name:
@@ -521,6 +556,15 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           P.Generation = nullptr;
           P.Storage.clear();
         }
+      }
+      if (!IR) {
+        auto *Address = symbolicAddress(V, N.At);
+        P.Lower = V.ElementLower ? V.ElementLower : Address;
+        P.Upper = V.ElementUpper ? V.ElementUpper
+                                 : llvm::ConstantExpr::getGetElementPtr(
+                                       U.M.getDataLayout(), U.ir(V.Type),
+                                       Address, B.getInt64(1));
+        return P;
       }
       auto *End = B.CreateGEP(U.ir(V.Type), V.Address, B.getInt64(1));
       P.Lower = V.ElementLower
@@ -790,7 +834,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           if (F->NoEscape.count(Origin))
             fail(N.At, "noescape parameter retained in static storage");
       B.CreateStore(R.IR, D.Address);
-      return {D.Type, R.IR, D.Address};
+      D.IR = R.IR;
+      return load(D);
     }
     // Only all-literal floating subexpressions inherit the destination's
     // format. A typed operand is a rounding boundary of its own.
@@ -1165,7 +1210,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     else {
       llvm::SaveAndRestore Policy(Opt, D.Defaults.Configuration);
       llvm::SaveAndRestore Lookup(LookupLimit, D.Defaults.Through);
-      llvm::SaveAndRestore Bindings(Env, D.Env);
+      llvm::SaveAndRestore Bindings(Env, D.DefaultEnv);
       V = construct(unconst(baseRef(Ty)), P.Children, P.At);
     }
     if (!Prepared || I >= Actual.size())
@@ -1619,6 +1664,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     Obj.BaseView = AsBase;
     if (!AsBase)
       bindVirtualLayout(Obj);
+    enterOwnerLayer(Obj);
     auto It = U.Overloads.find(T + "::$ctor");
     std::vector<Initializer> Inputs;
     std::vector<Value> Actual;
@@ -1728,6 +1774,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             if (Found != Producers.end())
               Producers.erase(Found);
           }
+          finishVirtualBase(Obj, I);
           PendingSlots.erase(Field.Decl.Text);
           Scopes.back().Names[Field.Decl.Text] = {Field.Type, nullptr, P};
           if (I + 1 == R.Bases.size())
@@ -1767,8 +1814,11 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     else
       V = convert(Source, T, At);
   }
-  if (Dest)
+  if (Dest) {
+    if (carriesPointerBounds(T))
+      saveBounds(storedPointerCell(Dest), V);
     B.CreateStore(V.IR, Dest);
+  }
   runConstructionTail({T, nullptr, Dest}, Tail);
   return V;
 }
@@ -1913,6 +1963,15 @@ void Frame::object(const Node &N, bool Global) {
   }
   if (!Existing)
     names()[Name] = {};
+  if (Global && ends(Ty, "&")) {
+    if (N.Foreign)
+      fail(N.At, "no C ABI transport for a reference object");
+    if (N.Settings.count("storage") &&
+        N.Settings.at("storage") == "thread_local")
+      fail(N.At, "thread-local storage is unavailable on this configuration");
+    staticReference(N, Name, Ty);
+    return;
+  }
   if (Global) {
     if (N.Settings.count("storage") &&
         N.Settings.at("storage") == "thread_local")
@@ -1967,8 +2026,14 @@ void Frame::object(const Node &N, bool Global) {
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
       G->setConstant(Readonly);
       StaticConstant = N.Required ? V.IR : nullptr;
-      names()[Name] = {Ty, StaticConstant, G, Readonly};
-      if (!U.SlotType || Readonly)
+      if (N.Required)
+        U.ConstantObjects.insert(G);
+      Value Bound{Ty, StaticConstant, G, Readonly};
+      if (carriesPointerBounds(Ty))
+        Bound.borrow(V);
+      names()[Name] = Bound;
+      if ((!U.SlotType || Readonly) &&
+          !(N.Required && carriesPointerBounds(Ty)))
         return;
     }
     auto FT = llvm::FunctionType::get(B.getVoidTy(), false);
@@ -1988,7 +2053,14 @@ void Frame::object(const Node &N, bool Global) {
       Init.B.CreateStore(B.getTrue(), Ready);
     }
     Value Cell{Ty, StaticConstant, G, Readonly};
-    if (U.SlotType) {
+    if (N.Required && Simple && carriesPointerBounds(Ty)) {
+      auto Bound = names().at(Name);
+      Cell.borrow(Bound);
+      auto V = Init.construct(Ty, Args, N.At);
+      Init.saveBounds(Init.storedPointerCell(G), V);
+      Init.endExpression();
+    }
+    if (U.SlotType && !Readonly) {
       auto *GlobalSlot = new llvm::GlobalVariable(
           U.M, U.SlotType, false, llvm::GlobalValue::InternalLinkage,
           llvm::Constant::getNullValue(U.SlotType), "cpn.static.slot");
@@ -2015,6 +2087,14 @@ void Frame::object(const Node &N, bool Global) {
   if (ends(Ty, "&")) {
     if (Args.size() != 1)
       fail(N.At, "reference requires one initializer");
+    if (N.Required) {
+      Frame Check(U, F, nullptr, Prefix);
+      Check.Env = Env;
+      Check.Opt = Opt;
+      Check.LookupLimit = LookupLimit;
+      Check.Scopes = Scopes;
+      Check.symbolicAddress(Check.place(Args[0]), N.At);
+    }
     auto V = place(Args[0]);
     V = bindReference(V, Ty, N.At);
     names()[Name] = V;
@@ -2046,6 +2126,10 @@ void Frame::object(const Node &N, bool Global) {
            : V.Type == "real"  ? Opt.DefaultReal
                                : V.Type;
     V = CF.convert(V, Ty, N.At);
+    if (carriesPointerBounds(Ty) && !Args.empty()) {
+      auto Runtime = convert(eval(Args.front(), Ty), Ty, N.At);
+      V.borrow(Runtime);
+    }
     Ptr = allocate(Ty, N.At);
     B.CreateStore(V.IR, Ptr);
   } else if (Ty == "auto") {
@@ -2071,8 +2155,7 @@ void Frame::object(const Node &N, bool Global) {
   if (Ty == "storage" || ends(Ty, "*"))
     Cell.borrow(V);
   if (carriesPointerBounds(Ty)) {
-    llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
-    Cell.BoundsCell = Entry.CreateAlloca(pointerMetadataType());
+    Cell.BoundsCell = storedPointerCell(Ptr);
     saveBounds(Cell.BoundsCell, V);
   }
   if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {

@@ -167,29 +167,23 @@ llvm::Function *Context::coordinator(const std::string &Type) {
     llvm::Value *Binding = B.getInt32(Indices.at(Owner));
     llvm::Value *Eligible = B.getInt1(!Path.empty());
     if (Path.size() == 1 && Path.front() < Root.VirtualCount) {
-      if (auto I = Root.Owners.find(T); I != Root.Owners.end())
-        Owner = I->second;
-      auto Manual = [&](const std::string &Type) {
-        const auto &Layer = Records.at(Type);
-        return llvm::any_of(Layer.Decl.Children, [&](const Node &D) {
-          return D.K == Node::Init && D.Type == "Complete" &&
-                 D.Text == "$virtual:" + T;
-        });
-      };
-      Binding = B.getInt32(Indices.at(Owner));
-      Eligible = B.getInt1(Manual(Root.Views.at(Owner)));
-      auto *Override = B.CreateCall(
-          M.getFunction("cpn.owner.find"),
-          {F.slotFor(Object), F.baseView(Object, Path).Address, typeID(T)});
+      auto *State = ownerRecordType();
+      auto *Row = F.ownerRecord(Object, Path.front());
+      B.CreateStore(B.getTrue(), B.CreateStructGEP(State, Row, 3));
+      Binding = B.CreateLoad(B.getInt32Ty(), B.CreateStructGEP(State, Row, 0));
+      Eligible = B.getFalse();
       for (const auto &[Candidate, Layer] : Root.Views) {
         if (Candidate == Path || !Root.contains(Candidate, Path))
           continue;
-        auto *Match = B.CreateCall(
-            M.getFunction("cpn.owner.matches"),
-            {Override, F.baseView(Object, Candidate).Address, typeID(Layer)});
-        Binding =
-            B.CreateSelect(Match, B.getInt32(Indices.at(Candidate)), Binding);
-        Eligible = B.CreateSelect(Match, B.getInt1(Manual(Layer)), Eligible);
+        bool Manual =
+            llvm::any_of(Records.at(Layer).Decl.Children, [&](const Node &D) {
+              return D.K == Node::Init && D.Type == "Complete" &&
+                     D.Text == "$virtual:" + T;
+            });
+        if (Manual)
+          Eligible = B.CreateOr(
+              Eligible,
+              B.CreateICmpEQ(Binding, B.getInt32(Indices.at(Candidate))));
       }
     }
     store(4, Binding);
@@ -261,20 +255,18 @@ Value Frame::transferOwner(const Node &C, const Node &Operand) {
   if (V == Virtuals.end())
     fail(C.At, "target must contain the selected virtual base");
   ensureLive(Target, C.At);
-  auto Base = baseView(Target, {unsigned(V - Virtuals.begin())});
-  auto *Registered = slotFor(Target);
-  auto *Containing = B.CreateCall(U.M.getFunction("cpn.slot.enclosing"),
-                                  {Target.Address, Base.Address});
-  auto *Slot =
-      B.CreateSelect(B.CreateIsNotNull(Registered), Registered, Containing);
-  guard(B.CreateIsNull(Slot));
-  // Entry into destruction freezes the binding for the complete object.
-  guard(B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(U.SlotType, Slot, 12)));
-  guard(B.CreateIsNotNull(B.CreateCall(U.M.getFunction("cpn.view.find"),
-                                       {Base.Address, U.typeID(T)})));
-  B.CreateCall(
-      U.M.getFunction("cpn.owner.assign"),
-      {Slot, Base.Address, U.typeID(T), Target.Address, U.typeID(Target.Type)});
+  auto *Row = ownerRecord(Target, V - Virtuals.begin());
+  auto *State = U.ownerRecordType();
+  auto *Entered =
+      B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(Layer.IR, Target.Address,
+                                                    Layer.layerEnteredSlot()));
+  auto *Alive = B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(State, Row, 2));
+  auto *Frozen = B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(State, Row, 3));
+  guard(B.CreateOr(Frozen, B.CreateNot(B.CreateAnd(Entered, Alive))));
+  auto *ID =
+      B.CreateLoad(B.getInt32Ty(), B.CreateStructGEP(Layer.IR, Target.Address,
+                                                     Layer.layerIndexSlot()));
+  B.CreateStore(ID, B.CreateStructGEP(State, Row, 0));
   return {"void"};
 }
 Value Frame::baseRequest(const Node &C, const Node &Operand) {

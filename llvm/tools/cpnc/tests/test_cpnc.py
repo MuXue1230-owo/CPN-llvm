@@ -551,6 +551,164 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertNotEqual(self.compile(source, "--check").returncode, 0)
 
+    def test_out_of_line_members_of_applied_owners(self):
+        self.assertEqual(
+            self.program("""
+          namespace lib {
+            generic<type T,const usize N> struct Box {
+              T[N] a;declare T get(usize index) const;
+              declare Box(T first);
+            };
+            declare i32 early();
+          }
+          i32 lib::early(){lib::Box<i32,2> box(20);return box.get(0);}
+          generic<type X,const usize K> X lib::Box<X,K>::get(usize pos) const {
+            return a[pos];}
+          generic<type X,const usize K> lib::Box<X,K>::Box(X n){a[0]=n;}
+          i32 main(){lib::Box<i16,1> second(22);
+            return lib::early()+i32(second.get(0));}
+        """),
+            42,
+        )
+        for source in (
+            "generic<type T> struct B{declare T get();};"
+            "generic<type X> X B<X>::other(){return X();}",
+            "generic<type T> struct B{declare T get(T p);};"
+            "generic<type X> X B<X>::get(X v){return v+v;}",
+            "generic<type T> struct B{declare T get(T p);};"
+            "generic<type X> X B<X>::get(X v(X())){return v;}",
+            "generic<type T> struct B{declare T get() const;};"
+            "generic<type X> X B<X>::get(){return X();}",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_static_reference_binding_and_symbolic_pointer_constants(self):
+        self.assertEqual(
+            self.program("""
+          struct Pair{i32 unused; i32[3] a;};
+          Pair box;constexpr i32 n(16);
+          constexpr const<i32>* c(&n);constexpr i32 value(*c);
+          constexpr i32* begin(&box.a[0]);constexpr i32* mid(begin+1);
+          constexpr isize distance(mid-begin);
+          constexpr i32& ref(box.a[1]);
+          i32 picks; i32& pick(){++picks;return box.a[2];} i32& selected(pick());
+          i32 main(){*mid=20;selected=5;
+            constexpr i32* last(&box.a[2]);
+            return value+ref+*last+i32(distance)*picks;}
+        """),
+            42,
+        )
+        self.assertLess(
+            self.program("""
+          i32 item(42);i32& old(item);i32 main(){auto s(storage_of(item));
+            destroy(item);construct_at<i32>(s,12);return old;}
+        """),
+            0,
+        )
+        self.assertLess(
+            self.program("""
+          i32[2] a;constexpr i32* p(&a[0]);
+          i32 main(){auto s(storage_of(a[0]));destroy(a[0]);
+            construct_at<i32>(s,12);return *p;}
+        """),
+            0,
+        )
+        for src in [
+            "i32 main(){i32 n(7);constexpr i32* p(&n);return 0;}",
+            "i32 main(){i32 n(7);constexpr i32& ref(n);return 0;}",
+            "i32[2] a;constexpr i32* invalid(&a[0]+3);",
+            "constexpr i32 i(7);constexpr const<i32>* end(&i+1);constexpr i32 n(*end);",
+            "i32 x(3);constexpr i32* p(&x);constexpr i32 bad(*p);",
+        ]:
+            with self.subTest(src=src):
+                result = self.compile(src, "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_capture_preserves_element_lifetime_and_extent(self):
+        self.assertLess(
+            self.program("""
+          struct D{i32[2] a;i32 next;};
+          i32 main(){D d;auto p(&d.a[0]);
+            auto call([p] i32(){return *(p+2);});return call();}
+        """),
+            0,
+        )
+        self.assertLess(
+            self.program("""
+          i32 main(){i32 n(3);i32& r(n);auto read([&r] i32(){return r;});
+            auto cap(storage_of(n));destroy(n);construct_at<i32>(cap,17);
+            return read();}
+        """),
+            0,
+        )
+
+    def test_pointer_fields_preserve_array_bounds_and_generations(self):
+        types = """
+          struct Data{i32[2] a; i32 next;};
+          struct Handle{i32* p;Handle(const<Handle>& h)=default;
+             Handle& operator=(const<Handle>& h)=default;
+             Handle& operator=(Handle&& h)=default;};
+          struct Pair{i64 padding;Handle[2] h;Pair(const<Pair>& b)=default;};
+          Handle saved;
+          Handle copy(Handle h){return h;}
+          i32 read(const<Handle>& h,isize i){return *(h.p+i);}
+        """
+        setup = """
+          i32 main(){Data d;d.a[0]=10;d.a[1]=32;d.next=19;
+            Handle first(&d.a[0]);Pair box;
+            box.h[0]=copy(first);box.h[1].p=&d.a[1];
+            saved=box.h[0];Pair other(box);"""
+        self.assertEqual(
+            self.program(types + setup + "return read(saved,1)+read(other.h[1],-1);}"),
+            42,
+        )
+        for tail in (
+            "return read(saved,2);",
+            "return read(other.h[1],1);",
+            "auto s(storage_of(d.a[0]));destroy(d.a[0]);"
+            "construct_at<i32>(s,7);return *other.h[0].p;",
+        ):
+            with self.subTest(tail=tail):
+                self.assertLess(self.program(types + setup + tail + "}"), 0)
+
+    def test_consuming_parameter_position_and_indirect_lifetime(self):
+        source = """
+          alias Release=function<void(i32& arg) [[consumes(arg)]]>*;
+          [[consumes(x)]] declare void end(i32& x);
+          [[consumes(value)]] void end(i32& value){destroy(value);}
+        """
+        self.assertEqual(
+            self.program(
+                source
+                + """
+              i32 main(){i32 x(3);auto s(storage_of(x));Release release(&end);
+                release(x);return *construct_at<i32>(s,42);}
+            """
+            ),
+            42,
+        )
+        self.assertLess(
+            self.program(
+                source
+                + """
+              i32 main(){i32 x(3);Release release(&end);release(x);return x;}
+            """
+            ),
+            0,
+        )
+        for extra in (
+            "void test(){function<void(i32&)>* p(&end);}",
+            "void keep(i32& value){} void test(){Release p(&keep);}",
+            "[[consumes(unknown)]] void broken(i32& x){}",
+            "[[consumes(x)]] declare void f(i32& x);void f(i32& x){}",
+            "alias Bad=function<void(i32& x) [[consumes(y)]]>*;",
+        ):
+            with self.subTest(extra=extra):
+                self.assertNotEqual(
+                    self.compile(source + extra, "--check").returncode, 0
+                )
+
     def test_aliases_in_borrow_contract_signatures(self):
         self.assertEqual(
             self.program("""
@@ -2278,6 +2436,40 @@ class CompilerTests(unittest.TestCase):
                 result = self.compile(source, "--check")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
+
+    def test_virtual_owner_during_construction_and_replacement(self):
+        types = """
+          i32 trace;
+          struct V{~V(){trace=trace*10+2;}};
+          struct L:virtual V{Complete virtual_base<V>;
+            ~L(){destroy_base<V>(this);trace=trace*10+9;}
+            cleanup{trace=trace*10+3;}};
+          struct R:virtual V{};
+          void set(L& target){transfer_destruction<V>(target);}
+          struct D:L,R{destruction_owner<V> = R; D(){set(*this);}};
+          struct Outer{i32 pad;D d;};
+        """
+        self.assertEqual(
+            self.program(
+                types
+                + """
+              i32 main(){{Outer wrapper;auto s(storage_of(wrapper.d));destroy(wrapper.d);
+                if(trace!=23){return 1;}construct_at<D>(s);}
+                return trace==2323?42:0;}
+            """
+            ),
+            42,
+        )
+        self.assertLess(
+            self.program("""
+            struct V{V(i32 n){}};
+            struct L:virtual V{L(){init virtual_base<V>(0);}};
+            i32 early(L& target){transfer_destruction<V>(target);return 0;}
+            struct D:L{D(){init virtual_base<V>(early(*this));}};
+            i32 main(){D d;return 0;}
+        """),
+            0,
+        )
 
     def test_owner_transfer_commits_per_object_and_freezes_at_destruction(self):
         source = """

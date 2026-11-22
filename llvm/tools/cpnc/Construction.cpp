@@ -155,6 +155,7 @@ void Construction::advance(Frame &Current) {
     Source->Self = Previous;
     Source->Transaction = PreviousTxn;
     Current.B.SetInsertPoint(Source->B.GetInsertBlock());
+    Current.finishVirtualBase(Object, Frontier);
     ++Frontier;
     publish(Current);
     if (Frontier == R.Bases.size())

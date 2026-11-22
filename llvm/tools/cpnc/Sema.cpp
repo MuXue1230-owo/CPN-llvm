@@ -1,5 +1,7 @@
 #include "Sema.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
 
 using namespace cpn;
@@ -123,7 +125,9 @@ llvm::AllocaInst *Frame::allocate(const std::string &T, const Token &At) {
   if (!Ty->isSized())
     fail(At, "object requires a complete object type");
   llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
-  return Entry.CreateAlloca(Ty);
+  auto *Ptr = Entry.CreateAlloca(Ty);
+  Ptr->setMetadata("cpn.object", llvm::MDNode::get(U.C, {}));
+  return Ptr;
 }
 cpn::Value Frame::load(cpn::Value V) {
   if (V.Type != "storage" && !StringRef(V.Type).ends_with("*"))
@@ -133,9 +137,22 @@ cpn::Value Frame::load(cpn::Value V) {
       fail({}, "dynamic static read is unavailable in a constant expression");
     guard(B.CreateNot(B.CreateLoad(B.getInt1Ty(), U.Ready.at(V.Address))));
   }
+  if (IR && V.Address &&
+      (!V.IR || llvm::isa<llvm::GlobalVariable>(V.Address)) && !V.BoundsCell &&
+      carriesPointerBounds(V.Type))
+    V.BoundsCell = storedPointerCell(V.Address);
   if (!V.IR && V.Address && !StringRef(V.Type).ends_with("]")) {
-    if (!IR)
-      fail({}, "constant expression required");
+    if (!IR) {
+      auto *Address = symbolicAddress(V, {});
+      auto *Object = llvm::dyn_cast<llvm::GlobalVariable>(
+          llvm::getUnderlyingObject(Address));
+      if (Object && U.ConstantObjects.count(Object))
+        V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
+                                                  U.M.getDataLayout());
+      if (!V.IR || llvm::isa<llvm::UndefValue>(V.IR))
+        fail({}, "constant expression required");
+      return V;
+    }
     V.IR = U.Records.count(V.Type) && U.Records.at(V.Type).VirtualCount
                ? snapshot(V)
                : B.CreateLoad(U.ir(V.Type), V.Address);
@@ -205,8 +222,9 @@ static void requireBorrowable(const std::string &T, const Token &At,
          Result ? "borrowed return requires a pointer or reference result"
                 : "borrow contract must name a pointer or reference parameter");
 }
-std::string cpn::borrowEffects(const std::set<unsigned> &NoEscape,
-                               const std::set<unsigned> &Borrowed) {
+std::string cpn::parameterEffects(const std::set<unsigned> &NoEscape,
+                                  const std::set<unsigned> &Borrowed,
+                                  const std::set<unsigned> &Consumes) {
   std::string Effects;
   auto append = [&](StringRef Key, const std::set<unsigned> &Positions) {
     for (auto I : Positions)
@@ -214,6 +232,7 @@ std::string cpn::borrowEffects(const std::set<unsigned> &NoEscape,
   };
   append("noescape", NoEscape);
   append("borrow", Borrowed);
+  append("consumes", Consumes);
   return Effects;
 }
 std::string Context::callableType(const Function &D) {
@@ -228,7 +247,7 @@ std::string Context::callableType(const Function &D) {
     T += " noexcept";
   if (D.MayWhole)
     T += " whole";
-  T += borrowEffects(D.NoEscape, D.BorrowedResult) + ">";
+  T += parameterEffects(D.NoEscape, D.BorrowedResult, D.Consumes) + ">";
   if (!Signatures.count(T)) {
     std::vector<std::string> Sig{D.Result};
     Sig.insert(Sig.end(), D.Params.begin(), D.Params.end());
@@ -251,7 +270,12 @@ bool Context::compatibleCallable(const std::string &From,
     return false;
   auto Source = callableFlags(From), Target = callableFlags(To);
   for (auto Flag : Target)
-    if (Flag.starts_with("noescape#") && !Source.count(Flag))
+    if ((Flag.starts_with("noescape#") || Flag.starts_with("consumes#")) &&
+        !Source.count(Flag))
+      return false;
+  // A caller and its target must agree on which ownership obligations transfer.
+  for (auto Flag : Source)
+    if (Flag.starts_with("consumes#") && !Target.count(Flag))
       return false;
   if (llvm::any_of(Target,
                    [](StringRef F) { return F.starts_with("borrow#"); })) {
@@ -332,14 +356,16 @@ std::string Frame::resolve(std::string S, const Token &At) {
     Canonical += S.substr(Close);
     for (auto Flag : callableFlags(Canonical)) {
       bool Result = Flag.consume_front("borrow#");
-      if (!Result && !Flag.consume_front("noescape#"))
+      bool Consuming = Flag.consume_front("consumes#");
+      if (!Result && !Consuming && !Flag.consume_front("noescape#"))
         continue;
       unsigned Position;
       if (Flag.getAsInteger(10, Position) || Position >= Sig.size() - 1)
         fail(At, "unknown borrow-contract parameter");
       if (Result)
         requireBorrowable(Sig.front(), At, true);
-      requireBorrowable(Sig[Position + 1], At, false);
+      if (!Consuming)
+        requireBorrowable(Sig[Position + 1], At, false);
     }
     U.Signatures.try_emplace(Canonical, std::move(Sig));
     return Canonical;
@@ -446,6 +472,11 @@ std::string Frame::resolve(std::string S, const Token &At) {
           U.tagged(Fam.Decl, Full, Fam.Prefix, E);
         else
           U.record(Fam.Decl, Full, Fam.Prefix, E);
+        if (auto Bodies =
+                U.OwnerBodies.find({Fam.Decl.At.Line, Fam.Decl.At.Column});
+            Bodies != U.OwnerBodies.end())
+          for (auto &[Site, Definition] : Bodies->second)
+            U.bindFamilyMember(Full, Definition);
       }
       return Full;
     }
@@ -582,7 +613,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
   D.Name = Name;
   D.Owner = Owner;
   D.Prefix = D.DefaultPrefix = P;
-  D.Env = E;
+  D.Env = D.DefaultEnv = E;
   D.Definition = D.Defaults = site();
   D.DeclaredAt = Sequence;
   D.Result = N.K == Node::Constructor || N.K == Node::Destructor
@@ -641,21 +672,25 @@ Function *Context::declare(const Node &N, const std::string &Name,
     Types.push_back(llvm::PointerType::getUnqual(C));
   if (operatorSpelling(N.Text))
     checkOperator(D, *this);
-  for (auto Attr : {"noescape", "returns_borrowed_from"}) {
+  for (auto Attr : {"noescape", "returns_borrowed_from", "consumes"}) {
     auto It = N.Settings.find(Attr);
     if (It == N.Settings.end())
       continue;
     bool Result = llvm::StringRef(Attr) == "returns_borrowed_from";
     if (Result)
       requireBorrowable(D.Result, N.At, true);
-    auto &Positions = Result ? D.BorrowedResult : D.NoEscape;
+    bool Consuming = StringRef(Attr) == "consumes";
+    auto &Positions = Consuming ? D.Consumes
+                      : Result  ? D.BorrowedResult
+                                : D.NoEscape;
     for (const auto &Param : splitArguments(It->second)) {
       auto I = llvm::find_if(N.Params,
                              [&](const Node &P) { return P.Text == Param; });
       if (I == N.Params.end())
         fail(N.At, "unknown borrow-contract parameter");
       unsigned Position = I - N.Params.begin();
-      requireBorrowable(D.Params[Position], I->At, false);
+      if (!Consuming)
+        requireBorrowable(D.Params[Position], I->At, false);
       Positions.insert(Position);
     }
   }
@@ -695,7 +730,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
            Prev->RequiresAlive != D.RequiresAlive) ||
           Prev->NoEscape != D.NoEscape ||
           Prev->BorrowedResult != D.BorrowedResult ||
-          Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
+          Prev->Consumes != D.Consumes || Prev->Result != D.Result ||
+          Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
           Prev->Decl.Settings.count("lifecycle_effect") !=
               N.Settings.count("lifecycle_effect") ||
@@ -720,6 +756,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
         if (Canonical.count(Key))
           Prev->Decl.Settings[Key] = Canonical[Key];
       Prev->Prefix = P;
+      Prev->Env = E;
       Prev->Definition = site();
       for (size_t I = 0; I < Defaults.size(); ++I)
         if (!Defaults[I].Children.empty())
@@ -960,11 +997,15 @@ void Context::record(const Node &N, const std::string &Name,
     Layout.push_back(llvm::Type::getInt8Ty(C));
   R.Layer = R.IR;
   if (R.VirtualCount) {
+    Layout.insert(Layout.end(), R.VirtualCount, llvm::Type::getInt64Ty(C));
+    Layout.push_back(llvm::Type::getInt32Ty(C));
+    Layout.push_back(llvm::Type::getInt1Ty(C));
     R.Layer = llvm::StructType::create(C, Layout, "cpn.layer." + Name);
     // Align the tail after the full size of the embedded nonvirtual prefix.
     Layout.push_back(llvm::ArrayType::get(R.Layer, 0));
     for (unsigned I = 0; I < R.VirtualCount; ++I)
       Layout.push_back(Records.at(R.Bases[I]).Layer);
+    Layout.push_back(llvm::ArrayType::get(ownerRecordType(), R.VirtualCount));
   }
   R.IR->setBody(Layout);
   R.Complete = true;
@@ -1059,7 +1100,8 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   for (auto *F : Members)
     emit(*F);
 }
-void Context::defineQualified(const Node &D, const std::string &P) {
+void Context::defineQualified(const Node &D, const std::string &P,
+                              const Substitution *Bindings) {
   const bool Ctor = D.K == Node::Constructor, Dtor = D.K == Node::Destructor;
   auto Method = Ctor ? "$ctor" : Dtor ? "$drop" : D.Text;
   auto Key = scopeKey(P, D.Settings.at("qualifier") + Method,
@@ -1073,7 +1115,8 @@ void Context::defineQualified(const Node &D, const std::string &P) {
     fail(D.At, "special member must name its owning record");
   if (Owner.empty() && (D.Const || D.Settings.count("category")))
     fail(D.At, "a namespace function has no receiver");
-  auto *F = declare(D, Key, Previous->Prefix, Previous->Env, Owner);
+  auto *F = declare(D, Key, Previous->Prefix,
+                    Bindings ? *Bindings : Previous->Env, Owner);
   if (!Owner.empty())
     for (auto &[Op, Special] : Records.at(Owner).Special)
       if (Special.Body == F)
@@ -1252,6 +1295,11 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       continue;
     }
     if (!D.Generics.empty()) {
+      if (D.Settings.count("qualifier") &&
+          D.Settings.at("qualifier").find('<') != std::string::npos) {
+        defineFamilyMember(D, P);
+        continue;
+      }
       if (D.K == Node::Function) {
         genericFunction(D, Name, P);
         continue;
@@ -1402,4 +1450,5 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   };
   Hook(U.Startup, true);
   Hook(U.Shutdown, false);
+  U.finishPointerStorage();
 }

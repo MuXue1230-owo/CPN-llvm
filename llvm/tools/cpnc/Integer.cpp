@@ -305,6 +305,8 @@ cpn::Value Frame::pointerBinary(const Node &N, cpn::Value P, cpn::Value Other) {
     T = T.substr(6, T.size() - 7);
   if (T == "void" || U.Signatures.count(T) || !U.ir(T)->isSized())
     fail(N.At, "pointer arithmetic requires a complete object element");
+  if (!IR)
+    return constantPointerOffset(N, P, Other, T);
   auto *Long = B.getIntNTy(128);
   auto address = [&](llvm::Value *V) {
     return B.CreateZExt(B.CreatePtrToInt(V, B.getInt64Ty()), Long);

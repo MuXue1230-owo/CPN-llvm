@@ -127,8 +127,9 @@ struct Node {
   Node() = default;
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
-std::string borrowEffects(const std::set<unsigned> &NoEscape,
-                          const std::set<unsigned> &Borrowed);
+std::string parameterEffects(const std::set<unsigned> &NoEscape,
+                             const std::set<unsigned> &Borrowed,
+                             const std::set<unsigned> &Consumes);
 std::vector<Node> parse(llvm::StringRef, const Options &);
 Node parseExpression(llvm::StringRef, const Options &);
 void configure(Options &, const Node &, ConfigScope);

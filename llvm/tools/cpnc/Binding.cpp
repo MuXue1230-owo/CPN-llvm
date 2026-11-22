@@ -121,8 +121,12 @@ struct Check {
 };
 } // namespace
 JumpCleanups Context::validate(const Node &N, const std::string &P,
-                               const std::string &Owner) {
+                               const std::string &Owner,
+                               const Node *FamilyOwner) {
   Check Ch{*this, P, Owner, {}, {}, {}, {}};
+  if (FamilyOwner)
+    for (const auto &D : FamilyOwner->Children)
+      Ch.Names.insert(D.Text);
   Path Scope;
   Ch.Names.insert(N.Text);
   if (!N.Generics.empty() && N.Generics.back().Pack) {

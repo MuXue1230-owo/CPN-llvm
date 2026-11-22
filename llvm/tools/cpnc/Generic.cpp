@@ -66,7 +66,8 @@ bool acceptsPattern(const Node &General, const Node &Specific) {
       return false;
   return true;
 }
-std::string normalized(llvm::StringRef Text, const Node &Decl) {
+std::string substituteBinders(llvm::StringRef Text, const Node &Decl,
+                              const Node *New) {
   std::string Key;
   while (!Text.empty()) {
     auto Word = Text.take_while([](char C) {
@@ -80,12 +81,18 @@ std::string normalized(llvm::StringRef Text, const Node &Decl) {
     }
     auto I =
         llvm::find_if(Decl.Generics, [&](auto &G) { return G.Text == Word; });
-    Key += I == Decl.Generics.end()
-               ? Word.str()
-               : "$" + std::to_string(I - Decl.Generics.begin());
+    if (I == Decl.Generics.end())
+      Key += Word.str();
+    else {
+      size_t Pos = I - Decl.Generics.begin();
+      Key += New ? New->Generics[Pos].Text : "$" + std::to_string(Pos);
+    }
     Text = Text.drop_front(Word.size());
   }
   return Key;
+}
+std::string normalized(llvm::StringRef Text, const Node &Decl) {
+  return substituteBinders(Text, Decl, nullptr);
 }
 std::string atom(const Node &N, const Node &Decl) {
   std::string Key = std::to_string(N.K) + "(" + normalized(N.Text, Decl) + "|" +
@@ -110,6 +117,10 @@ std::set<std::string> requirements(const Node &Decl) {
   return Set;
 }
 } // namespace
+std::string cpn::rebindTypeNames(llvm::StringRef Text, const Node &Old,
+                                 const Node &New) {
+  return substituteBinders(Text, Old, &New);
+}
 bool cpn::betterPattern(const Node &A, const Node &B) {
   if (A.Generics.empty() || B.Generics.empty())
     return A.Generics.empty() && !B.Generics.empty() && B.TemplateArgs.empty();

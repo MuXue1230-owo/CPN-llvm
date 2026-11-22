@@ -78,7 +78,7 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     // Evaluate aggregate designators once. Each element's own declared
     // operation executes before continuing to the next element.
     auto Elem = element(Source.Type);
-    if (U.Records.count(unconst(Elem)) ||
+    if (carriesPointerBounds(Elem) || U.Records.count(unconst(Elem)) ||
         llvm::isa<llvm::ArrayType>(Array->getElementType())) {
       auto *Preheader = B.GetInsertBlock(), *Loop = block("array.transfer"),
            *Done = block("array.done");
@@ -104,7 +104,10 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   }
   auto It = U.Records.find(Source.Type);
   if (It == U.Records.end()) {
-    B.CreateStore(load(Source).IR, Dest);
+    Source = load(Source);
+    if (carriesPointerBounds(Source.Type))
+      saveBounds(storedPointerCell(Dest), Source);
+    B.CreateStore(Source.IR, Dest);
     return;
   }
   auto &R = It->second;
@@ -112,6 +115,8 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   Result.BaseView = AsBase;
   if (!assignment(Op) && !AsBase)
     bindVirtualLayout(Result);
+  if (!assignment(Op))
+    enterOwnerLayer(Result);
   if (moving(Op) && Source.Readonly)
     fail(At, "moving requires a mutable source");
   if (R.Decl.K != Node::Lambda) {
@@ -142,6 +147,8 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     auto *To = fieldAddress(Result, I);
     transfer({Field.Type, nullptr, From, Source.Readonly}, To, Op, At,
              I < R.Bases.size());
+    if (!assignment(Op))
+      finishVirtualBase(Result, I);
   }
   if (!assignment(Op))
     installTables(Result);
@@ -155,6 +162,11 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
     if (Source.Prvalue)
       consume(Source);
     if (Dest) {
+      if (carriesPointerBounds(Source.Type)) {
+        Source = load(Source);
+        saveBounds(storedPointerCell(Dest), Source);
+      } else if (Aggregate && Source.Address)
+        copyStoredBounds(Source, Dest);
       if (llvm::StringRef(Source.Type).ends_with("]") && Source.Address) {
         const auto &Layout = U.M.getDataLayout();
         auto *Ty = U.ir(Source.Type);
@@ -162,7 +174,11 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
                         Layout.getABITypeAlign(Ty),
                         Layout.getTypeAllocSize(Ty).getFixedValue());
         Source.Address = Dest;
-      } else
+      } else if (Source.Prvalue && Source.Address &&
+                 U.Records.count(Source.Type) &&
+                 U.Records.at(Source.Type).VirtualCount)
+        B.CreateStore(B.CreateLoad(U.ir(Source.Type), Source.Address), Dest);
+      else
         B.CreateStore(load(Source).IR, Dest);
     }
     return Source;

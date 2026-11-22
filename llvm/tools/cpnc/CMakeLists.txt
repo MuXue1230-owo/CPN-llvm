@@ -1,5 +1,5 @@
 if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
-  set(LLVM_LINK_COMPONENTS AsmParser Core Support Target MC CodeGen X86)
+  set(LLVM_LINK_COMPONENTS Analysis AsmParser Core Support Target MC CodeGen X86)
   set(LLVM_REQUIRES_EH ON)
   set(LLVM_REQUIRES_RTTI ON)
   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc
@@ -21,6 +21,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Domain.cpp
     Driver.cpp
     Emit.cpp
+    FamilyMembers.cpp
     Floating.cpp
     Generic.cpp
     Integer.cpp
@@ -29,9 +30,11 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Whole.cpp
     Parser.cpp
     PointerCalls.cpp
+    PointerStorage.cpp
     Reservations.cpp
     Sema.cpp
     SpecialMembers.cpp
+    StaticReference.cpp
     Storage.cpp
     Tagged.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc

@@ -13,26 +13,27 @@ Value Frame::closure(const Node &N) {
     // address to its final field as soon as all capture types are known.
     auto *Slot = B.CreateAlloca(B.getInt8Ty());
     Slots.push_back(Slot);
-    Value V = C.Type == "initializer" ? eval(C.Children[0], "", Slot)
-                                      : load(lookup(C.At));
+    Value V;
     if (C.Type == "borrow") {
-      if (!V.Address)
-        fail(C.At, "borrow capture requires an object lvalue");
-      V.Type = (V.Readonly ? qualifyConst(V.Type) : V.Type) + "*";
-      V.IR = V.Address;
-      V.Address = nullptr;
+      Node Address(Node::Unary, C.At);
+      Address.Text = "&";
+      Node Name(Node::Name, C.At);
+      Name.Text = C.Text;
+      Address.Children.push_back(std::move(Name));
+      V = eval(Address);
     } else if (C.Type == "this") {
       if (!F || F->Owner.empty())
         fail(C.At, "this capture requires an enclosing receiver");
+      V = load(lookup(C.At));
     } else {
+      V = C.Type == "initializer" ? eval(C.Children[0], "", Slot)
+                                  : load(lookup(C.At));
       if (V.Type == "integer")
         V = convert(V, Opt.DefaultInt, C.At);
       if (V.Type == "real")
         V = floatingConvert(V, Opt.DefaultReal, C.At);
-      materialize(V, C.At, Slot);
     }
-    if (C.Type == "borrow" || C.Type == "this")
-      B.CreateStore(V.IR, Slot);
+    materialize(V, C.At, Slot);
     Values.push_back(V);
   }
   if (!U.Records.count(Type)) {
@@ -93,8 +94,12 @@ void Frame::bindCaptures() {
     if (Field.Decl.Type == "borrow") {
       auto E = element(Type);
       bool Const = llvm::StringRef(E).starts_with("const<") && E.back() == '>';
-      Captures.Names[Name] = {Const ? E.substr(6, E.size() - 7) : E, nullptr,
-                              B.CreateLoad(B.getPtrTy(), Cell), Const};
+      auto P = load({Type, nullptr, Cell});
+      Value Referent{unconst(E), nullptr, P.IR, Const};
+      Referent.borrow(P);
+      Referent.ElementLower = P.Lower;
+      Referent.ElementUpper = P.Upper;
+      Captures.Names[Name] = Referent;
     } else
       Captures.Names[Name] = {Type, nullptr, Cell, F->Decl.Const};
   }

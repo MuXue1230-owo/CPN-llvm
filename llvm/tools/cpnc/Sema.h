@@ -23,6 +23,7 @@ struct Value {
   // for arrays of pointers. BoundsCell follows reassignment of a local pointer.
   llvm::Value *Lower = nullptr, *Upper = nullptr, *BoundsCell = nullptr;
   llvm::Value *ElementLower = nullptr, *ElementUpper = nullptr;
+  llvm::GlobalVariable *ReferenceCell = nullptr;
   llvm::Value *ArraySlot = nullptr, *ArrayGeneration = nullptr;
   std::set<unsigned> Origins;
   bool Subobject = false, OptionalTemp = false;
@@ -60,7 +61,7 @@ struct Function {
   std::string Name, Result, Owner, Prefix, DefaultPrefix;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
-  Substitution Env;
+  Substitution Env, DefaultEnv;
   DefinitionSite Definition, Defaults;
   size_t DeclaredAt = 0;
   const Family *Origin = nullptr;
@@ -69,7 +70,7 @@ struct Function {
   int Slot = -1;
   JumpCleanups ExitedLifetimes;
   bool MayWhole = false;
-  std::set<unsigned> NoEscape, BorrowedResult;
+  std::set<unsigned> NoEscape, BorrowedResult, Consumes;
   std::set<unsigned> RequiresAlive, Initializes;
   std::set<Function *> Calls;
   bool isStatic() const { return Decl.Settings.count("static"); }
@@ -114,6 +115,12 @@ struct Record {
   unsigned offsetSlot(unsigned I) const {
     return Fields.size() + (Polymorphic ? 2 : 0) + I;
   }
+  unsigned ownerOffsetSlot(unsigned I) const {
+    return offsetSlot(VirtualCount + I);
+  }
+  unsigned layerIndexSlot() const { return ownerOffsetSlot(VirtualCount); }
+  unsigned layerEnteredSlot() const { return layerIndexSlot() + 1; }
+  unsigned obligationsSlot() const { return tailSlot(VirtualCount); }
   Substitution Env;
   bool Complete = false, Polymorphic = false, VirtualDestructor = false;
   std::vector<Function *> Virtuals;
@@ -155,14 +162,17 @@ struct Context {
     return Records.count(unconst(T)) || llvm::StringRef(T).ends_with("]");
   }
   llvm::StructType *SlotType = nullptr;
+  llvm::StructType *ownerRecordType();
   std::map<std::string, llvm::Constant *> TypeIDs;
   void enableStorage();
+  void finishPointerStorage();
   llvm::Constant *typeID(const std::string &);
   llvm::Function *cleanupEntry(const std::string &);
   std::map<std::string, Case> Cases;
   std::map<std::string, std::vector<std::string>> Variants;
   std::map<std::string, std::string> DefaultCase;
   std::map<llvm::Value *, llvm::GlobalVariable *> Ready;
+  std::set<llvm::GlobalVariable *> ConstantObjects;
   std::vector<std::pair<std::string, Node>> Statics;
   unsigned ConstantSteps = 0, ConstantDepth = 0, SpecializationDepth = 0;
   uint64_t Instantiations = 0, SolverSteps = 0;
@@ -189,7 +199,15 @@ struct Context {
   llvm::Type *ir(const std::string &T, const Token &At = {});
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
-  void defineQualified(const Node &, const std::string &);
+  void defineQualified(const Node &, const std::string &,
+                       const Substitution * = nullptr);
+  struct MemberBody {
+    Node Definition;
+    DefinitionSite Site;
+  };
+  std::map<SourcePosition, std::map<SourcePosition, MemberBody>> OwnerBodies;
+  void defineFamilyMember(const Node &, const std::string &);
+  void bindFamilyMember(const std::string &, const MemberBody &);
   void declareMembers(const std::string &, const std::string &);
   bool Whole = false;
   std::vector<std::pair<Function *, Token>> RestrictedPointers;
@@ -217,7 +235,8 @@ struct Context {
   void emit(Function &);
   void emitBody(Function &, llvm::Function *, bool);
   JumpCleanups validate(const Node &, const std::string &,
-                        const std::string &Owner = "");
+                        const std::string &Owner = "",
+                        const Node *FamilyOwner = nullptr);
 };
 struct EnterDefinition {
   llvm::SaveAndRestore<Options> OptionsScope;
@@ -230,6 +249,7 @@ struct EnterDefinition {
 inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
   return T.take_back(T.size() - (T.rfind(')') + 1)).contains(Flag);
 }
+std::string rebindTypeNames(llvm::StringRef, const Node &, const Node &);
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
@@ -338,6 +358,12 @@ public:
                               llvm::ArrayRef<Value>);
   void closePointerCall(const PointerCall &);
   Value pointerCallResult(Value, const PointerCall &, const std::string &);
+  Value constantPointerOffset(const Node &, Value, Value, const std::string &);
+  llvm::Constant *symbolicAddress(Value, const Token &);
+  Value openStaticReference(Value);
+  void staticReference(const Node &, const std::string &, const std::string &);
+  llvm::Value *storedPointerCell(llvm::Value *);
+  void copyStoredBounds(Value, llvm::Value *);
   void saveBounds(llvm::Value *, Value);
   void offsetRegistration(Value &, llvm::Value *, const std::string &,
                           const Token &);
@@ -439,6 +465,9 @@ public:
   void match(const Node &);
   llvm::Value *fieldAddress(Value, unsigned);
   Value baseView(Value, const BasePath &);
+  llvm::Value *ownerRecord(Value, unsigned);
+  void enterOwnerLayer(Value);
+  void finishVirtualBase(Value, unsigned);
   void bindVirtualLayout(Value);
   llvm::Value *snapshot(Value);
   void installTables(Value);

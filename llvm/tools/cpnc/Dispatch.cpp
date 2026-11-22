@@ -178,6 +178,14 @@ void Context::buildTables(const std::string &Name,
 }
 llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
   auto &R = U.Records.at(Obj.Type);
+  if (!IR) {
+    auto *Address = symbolicAddress(Obj, {});
+    if (I < R.VirtualCount)
+      fail({}, "virtual base offset requires runtime storage");
+    llvm::Constant *Indices[] = {B.getInt32(0), B.getInt32(I)};
+    return llvm::ConstantExpr::getGetElementPtr(U.M.getDataLayout(), R.IR,
+                                                Address, Indices);
+  }
   if (I >= R.VirtualCount)
     return B.CreateStructGEP(R.IR, Obj.Address, I);
   auto *Offset = B.CreateLoad(
@@ -193,12 +201,69 @@ Value Frame::baseView(Value Obj, const BasePath &Path) {
   }
   return Obj;
 }
+// All eligible layers reach the same obligation through a relative offset.
+// The binding is part of the complete object's lifetime, including its
+// construction before an automatic or replaced storage slot is published.
+llvm::StructType *Context::ownerRecordType() {
+  auto *I = llvm::Type::getInt32Ty(C);
+  auto *Flag = llvm::Type::getInt1Ty(C);
+  return llvm::StructType::get(C, {I, I, Flag, Flag});
+}
+llvm::Value *Frame::ownerRecord(Value Layer, unsigned I) {
+  auto &R = U.Records.at(Layer.Type);
+  auto *Offset =
+      B.CreateLoad(B.getInt64Ty(), B.CreateStructGEP(R.IR, Layer.Address,
+                                                     R.ownerOffsetSlot(I)));
+  return B.CreateGEP(B.getInt8Ty(), Layer.Address, Offset);
+}
+void Frame::enterOwnerLayer(Value Layer) {
+  auto &R = U.Records.at(Layer.Type);
+  if (!R.VirtualCount)
+    return;
+  B.CreateStore(B.getTrue(),
+                B.CreateStructGEP(R.IR, Layer.Address, R.layerEnteredSlot()));
+  auto *ID =
+      B.CreateLoad(B.getInt32Ty(),
+                   B.CreateStructGEP(R.IR, Layer.Address, R.layerIndexSlot()));
+  auto *State = U.ownerRecordType();
+  for (unsigned I = 0; I < R.VirtualCount; ++I) {
+    auto *Row = ownerRecord(Layer, I);
+    auto *Binding = B.CreateStructGEP(State, Row, 0);
+    auto *Nominee = B.CreateStructGEP(State, Row, 1);
+    auto *Pending = B.CreateLoad(B.getInt32Ty(), Nominee);
+    auto *Ready = B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(State, Row, 2));
+    auto *Establish = B.CreateAnd(Ready, B.CreateICmpEQ(ID, Pending));
+    B.CreateStore(
+        B.CreateSelect(Establish, ID, B.CreateLoad(B.getInt32Ty(), Binding)),
+        Binding);
+    B.CreateStore(B.CreateSelect(Establish, B.getInt32(-1), Pending), Nominee);
+  }
+}
+void Frame::finishVirtualBase(Value Layer, unsigned I) {
+  if (I < U.Records.at(Layer.Type).VirtualCount)
+    B.CreateStore(B.getTrue(), B.CreateStructGEP(U.ownerRecordType(),
+                                                 ownerRecord(Layer, I), 2));
+}
 void Frame::bindVirtualLayout(Value Obj) {
   auto &Root = U.Records.at(Obj.Type);
   if (!Root.VirtualCount)
     return;
   auto &DL = U.M.getDataLayout();
   auto *RootLayout = DL.getStructLayout(Root.IR);
+  auto *State = U.ownerRecordType();
+  auto *Rows = B.CreateStructGEP(Root.IR, Obj.Address, Root.obligationsSlot());
+  std::map<BasePath, unsigned> Indices;
+  for (const auto &[Path, Type] : Root.Views)
+    Indices.emplace(Path, Indices.size());
+  for (unsigned I = 0; I < Root.VirtualCount; ++I) {
+    auto Found = Root.Owners.find(Root.Bases[I]);
+    auto Pending =
+        Found == Root.Owners.end() ? -1 : int(Indices.at(Found->second));
+    B.CreateStore(llvm::ConstantStruct::get(
+                      State, {B.getInt32(Indices.at({})), B.getInt32(Pending),
+                              B.getFalse(), B.getFalse()}),
+                  B.CreateGEP(State, Rows, B.getInt32(I)));
+  }
   for (auto &[Path, T] : Root.Views) {
     auto *Ptr = Obj.Address;
     uint64_t Offset = 0;
@@ -211,11 +276,22 @@ void Frame::bindVirtualLayout(Value Obj) {
       Ptr = B.CreateStructGEP(R->IR, Ptr, Physical);
       R = &U.Records.at(R->Bases[I]);
     }
+    if (R->VirtualCount) {
+      B.CreateStore(B.getInt32(Indices.at(Path)),
+                    B.CreateStructGEP(R->IR, Ptr, R->layerIndexSlot()));
+      B.CreateStore(B.getFalse(),
+                    B.CreateStructGEP(R->IR, Ptr, R->layerEnteredSlot()));
+    }
     for (unsigned I = 0; I < R->VirtualCount; ++I) {
       auto J = llvm::find(Root.Bases, R->Bases[I]) - Root.Bases.begin();
       auto Delta = RootLayout->getElementOffset(Root.tailSlot(J)) - Offset;
       B.CreateStore(B.getInt64(Delta),
                     B.CreateStructGEP(R->IR, Ptr, R->offsetSlot(I)));
+      auto StateOffset =
+          RootLayout->getElementOffset(Root.obligationsSlot()) +
+          uint64_t(J) * DL.getTypeAllocSize(State).getFixedValue() - Offset;
+      B.CreateStore(B.getInt64(StateOffset),
+                    B.CreateStructGEP(R->IR, Ptr, R->ownerOffsetSlot(I)));
     }
   }
 }
@@ -283,9 +359,10 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
       StorageOrigin = V.Storage;
       ++Sources;
     }
-    if (llvm::StringRef(Param).ends_with("&"))
-      Vals.push_back(bindReference(V, Param, At).Address);
-    else {
+    if (llvm::StringRef(Param).ends_with("&")) {
+      V = bindReference(V, Param, At);
+      Vals.push_back(V.Address);
+    } else {
       V = materialize(convert(V, Param, At), At);
       Vals.push_back(U.aggregate(Param) ? V.Address : V.IR);
     }
@@ -299,6 +376,9 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
   closePointerCall(Metadata);
   propagateWhole(Before);
+  for (size_t I = 0; I < Actual.size(); ++I)
+    if (carriesBorrow(Sig[I + 1]) && Active.count(Actual[I].Storage))
+      Active[Actual[I].Storage] = -1;
   auto Result = callResult(Sig[0], Call, At, Storage);
   Result.Origins = std::move(Origins);
   if (Sources == 1)

@@ -143,10 +143,7 @@ done:
   ret i1 true
 }
 
-; Transfers attach to the complete storage generation. The caller has
-; established the nominal virtual-base relation before entering these helpers.
-%cpn.owner = type {ptr, ptr, ptr, ptr, ptr, ptr}
-@cpn.owners = internal thread_local global ptr null
+; Find the enclosing live storage for a Whole request through a base view.
 
 define internal ptr @cpn.slot.enclosing(ptr %view, ptr %virtual) {
   %first = load ptr, ptr @cpn.slots
@@ -181,101 +178,4 @@ item:
   br label %scan
 done:
   ret ptr %best
-}
-
-define internal ptr @cpn.owner.find(ptr %slot, ptr %base, ptr %type) {
-  %head = load ptr, ptr @cpn.owners
-  br label %scan
-scan:
-  %item = phi ptr [%head, %0], [%next, %advance]
-  %empty = icmp eq ptr %item, null
-  br i1 %empty, label %done, label %test
-test:
-  %sp = getelementptr %cpn.owner, ptr %item, i32 0, i32 1
-  %registered = load ptr, ptr %sp
-  %bp = getelementptr %cpn.owner, ptr %item, i32 0, i32 2
-  %address = load ptr, ptr %bp
-  %tp = getelementptr %cpn.owner, ptr %item, i32 0, i32 3
-  %nominal = load ptr, ptr %tp
-  %s = icmp eq ptr %slot, %registered
-  %b = icmp eq ptr %base, %address
-  %t = icmp eq ptr %type, %nominal
-  %sb = and i1 %s, %b
-  %match = and i1 %sb, %t
-  br i1 %match, label %done, label %advance
-advance:
-  %next = load ptr, ptr %item
-  br label %scan
-done:
-  ret ptr %item
-}
-
-define internal void @cpn.owner.assign(ptr %slot, ptr %base, ptr %type, ptr %target, ptr %target.type) {
-  %prior = call ptr @cpn.owner.find(ptr %slot, ptr %base, ptr %type)
-  %absent = icmp eq ptr %prior, null
-  br i1 %absent, label %allocate, label %store
-allocate:
-  %mem = call ptr @malloc(i64 ptrtoint (ptr getelementptr (%cpn.owner, ptr null, i32 1) to i64))
-  %oom = icmp eq ptr %mem, null
-  br i1 %oom, label %failed, label %link
-failed:
-  call void @llvm.trap()
-  unreachable
-link:
-  %head = load ptr, ptr @cpn.owners
-  store ptr %head, ptr %mem
-  %sp = getelementptr %cpn.owner, ptr %mem, i32 0, i32 1
-  store ptr %slot, ptr %sp
-  %bp = getelementptr %cpn.owner, ptr %mem, i32 0, i32 2
-  store ptr %base, ptr %bp
-  %tp = getelementptr %cpn.owner, ptr %mem, i32 0, i32 3
-  store ptr %type, ptr %tp
-  store ptr %mem, ptr @cpn.owners
-  br label %store
-store:
-  %item = phi ptr [%prior, %0], [%mem, %link]
-  %target.ptr = getelementptr %cpn.owner, ptr %item, i32 0, i32 4
-  store ptr %target, ptr %target.ptr
-  %type.ptr = getelementptr %cpn.owner, ptr %item, i32 0, i32 5
-  store ptr %target.type, ptr %type.ptr
-  ret void
-}
-
-define internal i1 @cpn.owner.matches(ptr %item, ptr %target, ptr %type) {
-  %absent = icmp eq ptr %item, null
-  br i1 %absent, label %none, label %test
-none:
-  ret i1 false
-test:
-  %ap = getelementptr %cpn.owner, ptr %item, i32 0, i32 4
-  %a = load ptr, ptr %ap
-  %tp = getelementptr %cpn.owner, ptr %item, i32 0, i32 5
-  %t = load ptr, ptr %tp
-  %address = icmp eq ptr %a, %target
-  %nominal = icmp eq ptr %t, %type
-  %both = and i1 %address, %nominal
-  ret i1 %both
-}
-
-define internal void @cpn.owner.forget(ptr %slot) {
-  br label %scan
-scan:
-  %link = phi ptr [@cpn.owners, %0], [%link, %unlink], [%item, %keep]
-  %item = load ptr, ptr %link
-  %empty = icmp eq ptr %item, null
-  br i1 %empty, label %done, label %test
-test:
-  %sp = getelementptr %cpn.owner, ptr %item, i32 0, i32 1
-  %registered = load ptr, ptr %sp
-  %same = icmp eq ptr %slot, %registered
-  br i1 %same, label %unlink, label %keep
-unlink:
-  %next = load ptr, ptr %item
-  store ptr %next, ptr %link
-  call void @free(ptr %item)
-  br label %scan
-keep:
-  br label %scan
-done:
-  ret void
 }
