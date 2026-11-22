@@ -1496,6 +1496,114 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_qualified_definitions_and_root_lookup(self):
+        self.assertEqual(
+            self.program("""
+            i32 destroyed; i32 offset(2); i32 add(){return 10;}
+            namespace ns {
+                i32 offset(1); i32 add(){return 20;}
+                declare i32 sum(i32 n(9));
+                class Box {
+                    i32 n;
+                public:
+                    declare Box(i32 v);
+                    declare Box(const<Box>&);
+                    declare ~Box();
+                    declare i32 read() const noexcept;
+                };
+            }
+            ns::Box::Box(i32 v){init n(v);}
+            ns::Box::Box(const<ns::Box>&) = default;
+            ns::Box::~Box(){++destroyed;}
+            i32 ns::Box::read() const noexcept{return n+::offset;}
+            i32 ns::sum(i32 n){return ::add()+add()+offset+n;}
+            i32 main(){
+                { ::ns::Box x(38); ::ns::Box y(x);
+                  if(y.read()!=40 || ::ns::sum()!=40){return 1;} }
+                return 40+destroyed;
+            }
+            """),
+            42,
+        )
+        for source, diagnostic in [
+            ("struct R{}; i32 R::extra(){return 1;}", "existing declaration"),
+            (
+                "struct R{declare i32 f(i32);};i32 R::f(bool x){return 0;}",
+                "existing declaration",
+            ),
+            (
+                "struct R{declare i32 f() const noexcept;};i32 R::f() const{return 1;}",
+                "incompatible redeclaration",
+            ),
+            (
+                "class R{declare i32 f();};i32 R::f(){return 1;}i32 g(R& r){return r.f();}",
+                "inaccessible",
+            ),
+            ("struct R{declare R();};R::Other(){}", "owning record"),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_nested_generic_names_and_union_alternatives(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T> struct Box{T item;};
+            generic<type T> union Maybe{case Some(T item);case None;};
+            alias MaybeInt = Maybe<i32>;
+            i32 main() {
+                Box<Box<i32>> nested;
+                nested.item.item=40;
+                MaybeInt sample(Maybe<i32>::Some(nested.item.item));
+                match(sample) {
+                    case MaybeInt::Some(ref n){return n+2;}
+                    case ::Maybe<i32>::None{return 1;}
+                }
+            }"""),
+            42,
+        )
+
+    def test_reserved_and_contextual_identifiers(self):
+        for word in (
+            "associated",
+            "declaration",
+            "destruction_owner",
+            "emit",
+            "export",
+            "generate",
+            "module",
+            "partial_typefn",
+            "quote",
+            "reflect_type",
+            "satisfy",
+            "specialize",
+            "splice_expr",
+        ):
+            with self.subTest(word=word):
+                result = self.compile("i32 " + word + ";", "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("identifier", result.stderr)
+        words = (
+            "Manual",
+            "Complete",
+            "aggregate",
+            "base",
+            "base_path",
+            "expression",
+            "final",
+            "move",
+            "override",
+            "postfix",
+            "prefix",
+            "ref",
+            "type",
+            "value",
+            "virtual_base",
+        )
+        result = self.compile(" ".join("i32 " + w + ";" for w in words), "--check")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_union_payload_rules(self):
         for source, message in [
             ("union U{case A(i32);};", "identifier"),

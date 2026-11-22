@@ -2,7 +2,7 @@
 using namespace cpn;
 
 void Context::tagged(const Node &D, const std::string &Name,
-                     const std::string &P) {
+                     const std::string &P, const Substitution &Env) {
   auto &R = Records[Name];
   if (R.IR && R.Decl.K != Node::Union)
     fail(D.At, "conflicting nominal declaration");
@@ -13,12 +13,14 @@ void Context::tagged(const Node &D, const std::string &Name,
     R.IR = llvm::StructType::create(C, "cpn." + Name);
   if (D.Prototype)
     return;
+  R.Env = Env;
+  R.Env.Types[D.Text] = Name;
   Frame F(*this, nullptr, nullptr, P);
+  F.Env = R.Env;
   const auto &DL = M.getDataLayout();
   uint64_t Size = 0;
   llvm::Type *AlignType = llvm::Type::getInt8Ty(C);
   auto &Alternatives = Variants[Name];
-  R.Env.Types[D.Text] = Name;
   for (const auto &Decl : D.Children) {
     if (Decl.K != Node::Variant) {
       if (Decl.K == Node::Field || Decl.K == Node::Init ||
@@ -62,6 +64,21 @@ void Context::tagged(const Node &D, const std::string &Name,
   declareMembers(Name, P);
 }
 
+const Case *Frame::findCase(const std::string &Name, const Token &At) {
+  auto Pos = Name.rfind("::");
+  if (Pos == std::string::npos || Pos == 0)
+    return nullptr;
+  auto Owner = Name.substr(0, Pos);
+  auto Base = Owner.substr(0, Owner.find('<'));
+  if (!Env.Types.count(Owner) &&
+      scopeKey(Prefix, Base, [&](const std::string &Key) {
+        return U.Records.count(Key) || U.Aliases.count(Key) ||
+               U.Families.count(Key);
+      }).empty())
+    return nullptr;
+  auto It = U.Cases.find(resolve(Owner, At) + Name.substr(Pos));
+  return It == U.Cases.end() ? nullptr : &It->second;
+}
 llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
                                    unsigned Index) {
   auto *Storage = B.CreateStructGEP(U.ir(C.Owner), Object, 2);
@@ -148,13 +165,12 @@ void Frame::match(const Node &N) {
       Wild = true;
       SW->setDefaultDest(BB);
     } else {
-      auto It = U.Cases.find(Prefix + Arm.Text);
-      if (It == U.Cases.end())
-        It = U.Cases.find(Arm.Text);
-      if (It == U.Cases.end() || It->second.Owner != Subject.Type)
+      const auto *Selected = findCase(Arm.Text, Arm.At);
+      if (!Selected || Selected->Owner != Subject.Type)
         fail(Arm.At, "unknown union case");
-      auto &C = It->second;
-      if (!Seen.insert(Arm.Text).second || C.Types.size() != Arm.Params.size())
+      const auto &C = *Selected;
+      if (!Seen.insert(C.Decl.Text).second ||
+          C.Types.size() != Arm.Params.size())
         fail(Arm.At, "duplicate case or incomplete payload pattern");
       SW->addCase(B.getInt32(C.Tag), BB);
       for (size_t J = 0; J < Arm.Params.size(); ++J) {

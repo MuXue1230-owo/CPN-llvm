@@ -123,6 +123,22 @@ cpn::Value Frame::load(cpn::Value V) {
   }
   return V;
 }
+std::string
+cpn::scopeKey(StringRef Prefix, StringRef Name,
+              llvm::function_ref<bool(const std::string &)> Contains) {
+  if (Name.consume_front("::"))
+    Prefix = {};
+  while (true) {
+    auto Key = (Prefix + Name).str();
+    if (Contains(Key))
+      return Key;
+    if (Prefix.empty())
+      return {};
+    Prefix = Prefix.drop_back(2);
+    auto Sep = Prefix.rfind("::");
+    Prefix = Sep == StringRef::npos ? StringRef() : Prefix.take_front(Sep + 2);
+  }
+}
 std::string Frame::resolve(std::string S, const Token &At) {
   if (StringRef(S).starts_with("function<") && StringRef(S).ends_with(">")) {
     size_t Open = S.find('('), Close = S.rfind(')');
@@ -136,6 +152,8 @@ std::string Frame::resolve(std::string S, const Token &At) {
   }
   if (floating(S) && !Opt.FloatFormats.count(S))
     fail(At, "floating format is disabled");
+  if (StringRef(S).starts_with("::") && builtin(StringRef(S).drop_front(2)))
+    S.erase(0, 2);
   if (S == "byte")
     return "u8";
   if (builtin(S) || S == "auto")
@@ -161,9 +179,12 @@ std::string Frame::resolve(std::string S, const Token &At) {
     auto T = resolve(S.substr(8), At);
     return StringRef(T).ends_with("&") ? T : T + "&&";
   }
-  std::string Base = S.substr(0, S.find('<'));
-  for (std::string P = Prefix;;) {
-    auto Key = P + Base;
+  auto Base = S.substr(0, S.find('<'));
+  auto Key = scopeKey(Prefix, Base, [&](const std::string &K) {
+    return U.Aliases.count(K) || U.Records.count(K) || U.Enums.count(K) ||
+           U.Families.count(K);
+  });
+  if (!Key.empty()) {
     if (U.Families.count(Key) && S.find('<') != std::string::npos) {
       auto &Fam = U.Families.at(Key);
       std::vector<Node> Explicit;
@@ -195,7 +216,10 @@ std::string Frame::resolve(std::string S, const Token &At) {
                  Probe.constantEval(Fam.Decl.Params[0]).IR)
                  ->getZExtValue())
           fail(At, "constraint is not satisfied");
-        U.record(Fam.Decl, Full, Fam.Prefix, E);
+        if (Fam.Decl.K == Node::Union)
+          U.tagged(Fam.Decl, Full, Fam.Prefix, E);
+        else
+          U.record(Fam.Decl, Full, Fam.Prefix, E);
       }
       return Full;
     }
@@ -203,11 +227,6 @@ std::string Frame::resolve(std::string S, const Token &At) {
       return U.Aliases.at(Key);
     if (U.Records.count(Key) || U.Enums.count(Key))
       return Key;
-    if (P.empty())
-      break;
-    P.resize(P.size() - 2);
-    auto Sep = P.rfind("::");
-    P = Sep == std::string::npos ? "" : P.substr(0, Sep + 2);
   }
   fail(At, "unsupported or unknown type '" + S + "'");
 }
@@ -354,7 +373,9 @@ Function *Context::declare(const Node &N, const std::string &Name,
         Prev->Decl.Settings["category"] ==
             (N.Settings.count("category") ? N.Settings.at("category") : "")) {
       if (Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
-          Prev->Decl.Noexcept != N.Noexcept)
+          Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
+          Prev->Decl.Required != N.Required ||
+          Prev->Decl.Settings.count("mode") != N.Settings.count("mode"))
         fail(N.At, "incompatible redeclaration");
       if (N.Prototype)
         return Prev;
@@ -364,7 +385,12 @@ Function *Context::declare(const Node &N, const std::string &Name,
         if (!Arg.Children.empty())
           fail(Arg.At, "defaults belong to the canonical declaration");
       auto Defaults = Prev->Decl.Params;
+      auto Canonical = Prev->Decl.Settings;
       Prev->Decl = N;
+      for (const auto *Key :
+           {"access", "virtual", "static", "override", "final"})
+        if (Canonical.count(Key))
+          Prev->Decl.Settings[Key] = Canonical[Key];
       Prev->Prefix = P;
       Prev->Definition = site();
       for (size_t I = 0; I < Defaults.size(); ++I)
@@ -372,6 +398,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
           Prev->Decl.Params[I].Children = Defaults[I].Children;
       return Prev;
     }
+  if (N.Settings.count("qualifier"))
+    fail(N.At, "qualified definition must match an existing declaration");
   bool Export = N.Foreign || Name == "main";
   if (Name == "main" && (D.Result != "i32" || !D.Params.empty()))
     fail(N.At, "the hosted entry point must be i32 main()");
@@ -550,13 +578,66 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   if (R.VirtualCount)
     for (auto *F : Members)
       if ((F->Decl.K == Node::Constructor || F->Decl.K == Node::Destructor) &&
-          !F->Decl.Prototype && !F->Decl.Settings.count("control"))
+          !F->Decl.Settings.count("control"))
         F->BaseIR = llvm::Function::Create(F->IR->getFunctionType(),
                                            llvm::GlobalValue::InternalLinkage,
                                            F->IR->getName() + ".base", M);
   buildTables(Name, Members);
   for (auto *F : Members)
     emit(*F);
+}
+void Context::defineQualified(const Node &D, const std::string &P) {
+  const bool Ctor = D.K == Node::Constructor, Dtor = D.K == Node::Destructor;
+  auto Method = Ctor ? "$ctor" : Dtor ? "$drop" : D.Text;
+  auto Key = scopeKey(P, D.Settings.at("qualifier") + Method,
+                      [&](const std::string &K) { return Overloads.count(K); });
+  if (Key.empty())
+    fail(D.At, "qualified definition must match an existing declaration");
+  auto *Previous = Overloads.at(Key).front();
+  auto Owner = Previous->Owner;
+  if ((Ctor || Dtor) &&
+      (Owner.empty() || Records.at(Owner).Decl.Text != D.Text))
+    fail(D.At, "special member must name its owning record");
+  if (Owner.empty() && (D.Const || D.Settings.count("category")))
+    fail(D.At, "a namespace function has no receiver");
+  auto *F = declare(D, Key, Previous->Prefix, Previous->Env, Owner);
+  if (!Owner.empty())
+    for (auto &[Op, Special] : Records.at(Owner).Special)
+      if (Special.Body == F)
+        Special.Decl = F->Decl;
+  if (D.Settings.count("control")) {
+    auto Control = D.Settings.at("control");
+    if (Control == "delete") {
+      if (!F->IR->use_empty() || (F->BaseIR && !F->BaseIR->use_empty()))
+        fail(D.At, "selected function is deleted");
+    } else {
+      if (!Ctor && !Dtor)
+        fail(D.At, "no generated default definition for this signature");
+      F->Decl.Children.emplace_back(Node::Block, D.At);
+      F->Decl.Settings.erase("control");
+      if (!D.Params.empty()) {
+        auto &R = Records.at(Owner);
+        auto Special = llvm::find_if(R.Special, [&](const auto &Entry) {
+          return Entry.second.Body == F;
+        });
+        if (Special == R.Special.end())
+          fail(D.At, "no generated default definition for this signature");
+        Special->second.Body = nullptr;
+        for (auto *Entry : {F->IR, F->BaseIR}) {
+          if (!Entry)
+            continue;
+          Frame Generated(*this, F, Entry);
+          Generated.B.SetInsertPoint(Generated.block("entry"));
+          Generated.transfer({Owner, nullptr, Entry->getArg(1)},
+                             Entry->getArg(0), Special->first, D.At,
+                             Entry == F->BaseIR);
+          Generated.B.CreateRetVoid();
+        }
+        F->Emitted = true;
+      }
+    }
+  }
+  emit(*F);
 }
 void Context::unit(const std::vector<Node> &Decls, std::string P) {
   for (auto &D : Decls) {
@@ -597,6 +678,10 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
           fail(D.At, "duplicate generic signature");
         Group.push_back({D, P, site()});
       }
+      continue;
+    }
+    if (D.Settings.count("qualifier")) {
+      defineQualified(D, P);
       continue;
     }
     if (D.K == Node::Function) {
@@ -687,11 +772,12 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));
   U.unit(AST);
   for (auto &F : U.Functions)
-    if (F.IR->isDeclaration() && !F.Decl.Foreign) {
-      if (!F.IR->use_empty())
-        fail(F.Decl.At, "function needs a definition");
-      F.IR->eraseFromParent();
-    }
+    for (auto *Entry : {F.IR, F.BaseIR})
+      if (Entry && Entry->isDeclaration() && !F.Decl.Foreign) {
+        if (!Entry->use_empty())
+          fail(F.Decl.At, "function needs a definition");
+        Entry->eraseFromParent();
+      }
   std::set<std::string> Ids, Previous;
   for (auto &[Name, N] : U.Statics) {
     if (N.Settings.count("static_id") &&

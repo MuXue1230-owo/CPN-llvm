@@ -5,20 +5,88 @@
 using namespace cpn;
 using llvm::StringRef;
 namespace {
-const std::set<std::string> Reserved = {
-    "alias",         "alignof",    "async",    "auto",         "await",
-    "break",         "case",       "catch",    "class",        "cleanup",
-    "configuration", "configured", "const",    "consteval",    "constexpr",
-    "constraint",    "continue",   "declare",  "decltype",     "default",
-    "define",        "delegate",   "delete",   "do",           "else",
-    "enum",          "extern",     "false",    "fallthrough",  "for",
-    "forward",       "function",   "generic",  "goto",         "if",
-    "import",        "init",       "match",    "mutable",      "namespace",
-    "noexcept",      "nullptr",    "operator", "private",      "protected",
-    "public",        "requires",   "return",   "sizeof",       "static",
-    "struct",        "switch",     "this",     "thread_local", "throw",
-    "true",          "try",        "typefn",   "union",        "virtual",
-    "while"};
+// Chapter 15 reserves alphabetic terminals except its contextual words.
+const std::set<std::string> Reserved = {"alias",
+                                        "alignof",
+                                        "associated",
+                                        "async",
+                                        "auto",
+                                        "await",
+                                        "break",
+                                        "case",
+                                        "catch",
+                                        "class",
+                                        "cleanup",
+                                        "configuration",
+                                        "configured",
+                                        "const",
+                                        "consteval",
+                                        "constexpr",
+                                        "constraint",
+                                        "continue",
+                                        "declaration",
+                                        "declare",
+                                        "decltype",
+                                        "default",
+                                        "define",
+                                        "delegate",
+                                        "delete",
+                                        "derive",
+                                        "derive_access",
+                                        "destruction_owner",
+                                        "do",
+                                        "else",
+                                        "emit",
+                                        "enum",
+                                        "export",
+                                        "extern",
+                                        "fallthrough",
+                                        "false",
+                                        "for",
+                                        "forward",
+                                        "function",
+                                        "generate",
+                                        "generic",
+                                        "goto",
+                                        "if",
+                                        "import",
+                                        "init",
+                                        "match",
+                                        "meta_grant",
+                                        "module",
+                                        "mutable",
+                                        "namespace",
+                                        "noexcept",
+                                        "nullptr",
+                                        "operator",
+                                        "partial_typefn",
+                                        "private",
+                                        "protected",
+                                        "public",
+                                        "quote",
+                                        "reflect_decl",
+                                        "reflect_expr",
+                                        "reflect_type",
+                                        "requires",
+                                        "return",
+                                        "satisfy",
+                                        "sizeof",
+                                        "specialize",
+                                        "splice_expr",
+                                        "splice_name",
+                                        "splice_type",
+                                        "static",
+                                        "struct",
+                                        "switch",
+                                        "this",
+                                        "thread_local",
+                                        "throw",
+                                        "true",
+                                        "try",
+                                        "typefn",
+                                        "union",
+                                        "virtual",
+                                        "while"};
 int precedence(const std::string &S) {
   static const std::vector<std::set<std::string>> Levels = {
       {"=", "+=", "-=", "*=", "/=", "%=", "<<=", ">>=", "&=", "|=", "^="},
@@ -81,19 +149,39 @@ class Parser {
       fail(T, "expected identifier");
     return T;
   }
-  Token qualified() {
-    auto T = take();
-    while (eat("::")) {
+  Token qualified(bool AllowBuiltin = false, Node *Application = nullptr) {
+    bool Root = eat("::");
+    auto T = AllowBuiltin && builtin(peek().Text) ? take() : name();
+    while (true) {
+      if (is("<") && (Families.count(T.Text) ||
+                      (Application &&
+                       (builtinPredicate(T.Text) || T.Text == "construct_at" ||
+                        T.Text == "destroy_base" || T.Text == "abandon_base" ||
+                        T.Text == "std::forward")))) {
+        auto Start = Pos;
+        auto Args = templateArgs(T.Text);
+        if (!Application || is("::") || Types.count(T.Text))
+          T.Text += spelling(Start);
+        else {
+          Application->ExplicitApplication = true;
+          Application->TemplateArgs = std::move(Args);
+        }
+      }
+      if (!eat("::"))
+        break;
       if (is("forward") && T.Text == "std")
         T.Text += "::" + take().Text;
       else
         T.Text += "::" + name().Text;
     }
+    if (Root)
+      T.Text = "::" + T.Text;
     return T;
   }
   bool known(StringRef S) const {
-    return builtin(S) || Types.count(S.str()) || S == "const" ||
-           S == "function";
+    S.consume_front("::");
+    return builtin(S) || Types.count(S.split('<').first.str()) ||
+           S == "const" || S == "function";
   }
   std::string spelling(size_t Start) const {
     std::string S;
@@ -104,7 +192,9 @@ class Parser {
   void closeAngle() {
     if (is(">>")) {
       Tokens[Pos].Text = ">";
-      ++Tokens[Pos].Column;
+      auto Second = Tokens[Pos++];
+      ++Second.Column;
+      Tokens.insert(Tokens.begin() + Pos, std::move(Second));
     } else
       expect(">");
   }
@@ -165,17 +255,12 @@ class Parser {
         S += " noexcept";
       closeAngle();
       S += ">";
-    } else if (eat("forward")) {
-      S = "forward " + type();
     } else {
-      S = qualified().Text;
+      if (!is("::") && !identifier(peek().Text))
+        fail(T, "unsupported or unknown type '" + T.Text + "'");
+      S = qualified(true).Text;
       if (!known(S))
         fail(T, "unsupported or unknown type '" + S + "'");
-      if (is("<") && Families.count(S)) {
-        size_t Begin = Pos;
-        templateArgs(S);
-        S += spelling(Begin);
-      }
     }
     for (;;) {
       if (is("*") || is("&") || is("&&"))
@@ -254,7 +339,7 @@ class Parser {
     } else if (is("sizeof") || is("alignof")) {
       N = Node(Node::Unary, take());
       expect("(");
-      if (known(peek().Text)) {
+      if (startsType()) {
         Node Ty(Node::TypeArg, peek());
         Ty.Type = type();
         N.Children.push_back(Ty);
@@ -265,17 +350,14 @@ class Parser {
       N = Node(realToken(T.Text) ? Node::Real : Node::Number, take());
     else if (!T.Text.empty() && (T.Text[0] == '\'' || T.Text[0] == '"'))
       N = Node(T.Text[0] == '\'' ? Node::Character : Node::String, take());
-    else if (identifier(T.Text)) {
-      if (Reserved.count(T.Text) && T.Text != "true" && T.Text != "false" &&
-          T.Text != "nullptr" && T.Text != "this")
+    else if (is("true") || is("false") || is("nullptr") || is("this"))
+      N = Node(Node::Name, take());
+    else if (identifier(T.Text) || is("::")) {
+      if (Reserved.count(T.Text))
         fail(T, "expected expression");
-      N = Node(Node::Name, qualified());
-      if (is("<") && (Families.count(N.Text) || builtinPredicate(N.Text) ||
-                      N.Text == "destroy_base" || N.Text == "abandon_base" ||
-                      N.Text == "construct_at" || N.Text == "std::forward")) {
-        N.ExplicitApplication = true;
-        N.TemplateArgs = templateArgs(N.Text);
-      }
+      N.K = Node::Name;
+      N.At = qualified(true, &N);
+      N.Text = N.At.Text;
     } else
       fail(T, "expected expression");
     for (;;) {
@@ -376,7 +458,7 @@ class Parser {
     Node B(Node::Block, expect("{"));
     while (!eat("}")) {
       if (Construction && eat("init")) {
-        Node I(Node::Init, take());
+        Node I(Node::Init, name());
         if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
           I.Text += "/" + type();
           closeAngle();
@@ -410,10 +492,20 @@ class Parser {
     return O;
   }
   bool startsType() const {
-    auto S = peek().Text;
-    for (size_t I = 1; peek(I).Text == "::"; I += 2)
+    size_t Start = is("::") ? 1 : 0;
+    auto S = peek(Start).Text;
+    for (size_t I = Start + 1; peek(I).Text == "::"; I += 2)
       S += "::" + peek(I + 1).Text;
     return known(S);
+  }
+  bool startsObject() {
+    if (!startsType())
+      return false;
+    auto Start = Pos;
+    type();
+    bool Object = identifier(peek().Text) && !Reserved.count(peek().Text);
+    Pos = Start;
+    return Object;
   }
   Node simple() {
     if (is("static") || is("thread_local")) {
@@ -429,8 +521,8 @@ class Parser {
     bool RO = is("const") && peek(1).Text != "<";
     if (RO)
       take();
-    bool CX = eat("constexpr");
-    if (RO || CX || is("auto") || (startsType() && peek(1).Text != "(")) {
+    bool CX = !RO && eat("constexpr");
+    if (RO || CX || is("auto") || startsObject()) {
       auto Ty = eat("auto") ? std::string("auto") : type();
       auto Id = name();
       return object(Id, Ty, RO, CX);
@@ -579,7 +671,10 @@ class Parser {
       P.Const = is("const") && peek(1).Text != "<";
       if (P.Const)
         take();
+      bool Forward = eat("forward");
       P.Type = type();
+      if (Forward)
+        P.Type = "forward " + P.Type;
       if (P.Const && P.Type.back() == '&') {
         auto I = P.Type.find_last_not_of('&') + 1;
         P.Type = "const<" + P.Type.substr(0, I) + ">" + P.Type.substr(I);
@@ -655,6 +750,56 @@ class Parser {
     auto Control = take().Text;
     expect(";");
     return Control;
+  }
+  // A special member has no return type. Its qualified name is followed
+  // immediately by the parameter list, unlike a function's result type.
+  bool separateSpecial() const {
+    size_t I = is("::") ? 1 : 0;
+    if (!identifier(peek(I).Text))
+      return false;
+    while (peek(I + 1).Text == "::") {
+      I += 2;
+      if (peek(I).Text == "~")
+        return true;
+      if (peek(I + 1).Text == "(")
+        return true;
+    }
+    return false;
+  }
+  Token declarationName(std::string &Qualifier, bool &Dtor) {
+    bool Root = eat("::");
+    auto Id = name();
+    while (eat("::")) {
+      Qualifier += Id.Text + "::";
+      Dtor = eat("~");
+      Id = name();
+      if (Dtor)
+        break;
+    }
+    if (Root)
+      Qualifier = "::" + Qualifier;
+    return Id;
+  }
+  void specialBody(Node &D, bool Proto, bool Separate = false) {
+    bool Drop = D.K == Node::Destructor;
+    D.Params = params();
+    if (Drop && !D.Params.empty())
+      fail(D.At, "a destructor takes no parameters");
+    D.Noexcept = eat("noexcept");
+    if (Drop && !Separate && eat("override"))
+      D.Settings["override"] = "1";
+    if (Drop && !Separate && eat("final"))
+      D.Settings["final"] = "1";
+    if (Proto) {
+      expect(";");
+      D.Prototype = true;
+    } else if (eat("="))
+      D.Settings["control"] = definitionControl();
+    else {
+      D.Children.push_back(block(!Drop));
+      if (Drop && eat("cleanup"))
+        D.Children.push_back(block());
+    }
   }
   Node declaration(bool Foreign = false, bool Member = false) {
     Nest Guard(Depth, peek());
@@ -782,7 +927,7 @@ class Parser {
     if (eat("generic"))
       G = generic();
     Node Requires;
-    if (eat("requires"))
+    if (!G.empty() && eat("requires"))
       Requires = condition();
     if (is("declare") && (peek(1).Text == "struct" || peek(1).Text == "class" ||
                           peek(1).Text == "union" || peek(1).Text == "enum")) {
@@ -874,7 +1019,7 @@ class Parser {
           Node I(Node::Init, peek());
           I.Type = "Complete";
           if (!is(";")) {
-            I.Text = take().Text;
+            I.Text = name().Text;
             if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
               I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type();
               closeAngle();
@@ -890,24 +1035,7 @@ class Parser {
           D = Node(Drop ? Node::Destructor : Node::Constructor, expect(R.Text));
           if (!Drop && Virt)
             fail(D.At, "a constructor cannot be virtual");
-          D.Params = params();
-          if (Drop && !D.Params.empty())
-            fail(D.At, "a destructor takes no parameters");
-          D.Noexcept = eat("noexcept");
-          if (eat("override"))
-            D.Settings["override"] = "1";
-          if (eat("final"))
-            D.Settings["final"] = "1";
-          if (SpecialProto) {
-            expect(";");
-            D.Prototype = true;
-          } else if (eat("="))
-            D.Settings["control"] = definitionControl();
-          else {
-            D.Children.push_back(block(!Drop));
-            if (Drop && eat("cleanup"))
-              D.Children.push_back(block());
-          }
+          specialBody(D, SpecialProto);
         } else {
           D = declaration(false, true);
           if (D.K == Node::Object)
@@ -944,6 +1072,15 @@ class Parser {
       expect(";");
       return E;
     }
+    if (!Member && !Foreign && separateSpecial()) {
+      std::string Q;
+      bool Dtor = false;
+      auto Id = declarationName(Q, Dtor);
+      Node D(Dtor ? Node::Destructor : Node::Constructor, Id);
+      D.Settings["qualifier"] = Q;
+      specialBody(D, false, true);
+      return D;
+    }
     if (Foreign && is("declare"))
       fail(peek(), "a foreign prototype uses its linkage declaration");
     if (!Foreign && is("define"))
@@ -953,7 +1090,7 @@ class Parser {
     bool RO = is("const") && peek(1).Text != "<";
     if (RO)
       take();
-    bool CE = eat("constexpr"), Eval = eat("consteval");
+    bool CE = !RO && eat("constexpr"), Eval = !RO && !CE && eat("consteval");
     auto Ty = eat("auto") ? std::string("auto") : type();
     if (Member && eat("operator")) {
       auto Id = expect("=");
@@ -971,9 +1108,13 @@ class Parser {
         F.Children.push_back(block());
       return F;
     }
-    auto Id = name();
-    bool Fn =
-        !Def && (Proto || (Foreign && is("(")) || !G.empty() || functionBody());
+    std::string Q;
+    bool Dtor = false;
+    auto Id = declarationName(Q, Dtor);
+    if (Dtor || (!Q.empty() && (Member || Foreign || Proto || Def)))
+      fail(Id, "invalid qualified declaration");
+    bool Fn = !Def && (!Q.empty() || Proto || (Foreign && is("(")) ||
+                       !G.empty() || functionBody());
     if (!Fn) {
       if (Foreign && !Def && !is(";"))
         fail(Id, "an external object initializer requires define");
@@ -985,6 +1126,8 @@ class Parser {
     Node F(Node::Function, Id);
     F.Type = Ty;
     F.Generics = G;
+    if (!Q.empty())
+      F.Settings["qualifier"] = Q;
     F.Foreign = Foreign;
     F.Required = CE || Eval;
     if (Eval)
@@ -994,7 +1137,7 @@ class Parser {
     if (Requires.K != Node::Empty)
       F.TemplateArgs.push_back(std::move(Requires));
     F.Params = params();
-    if (Member) {
+    if (Member || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))
         F.Settings["category"] = take().Text;

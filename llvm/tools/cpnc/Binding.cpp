@@ -21,12 +21,12 @@ struct Check {
       return true;
     if (!Owner.empty() && U.Records.count(Owner))
       return true;
-    for (auto &Key : {S, Prefix + S})
-      if (U.Globals.count(Key) || U.Overloads.count(Key) ||
-          U.Families.count(Key) || U.Constraints.count(Key) ||
-          U.Records.count(Key) || U.Enums.count(Key))
-        return true;
-    return false;
+    return !scopeKey(Prefix, S, [&](const std::string &Key) {
+              return U.Globals.count(Key) || U.Overloads.count(Key) ||
+                     U.Families.count(Key) || U.Constraints.count(Key) ||
+                     U.Records.count(Key) || U.Enums.count(Key) ||
+                     U.Aliases.count(Key) || U.Cases.count(Key);
+            }).empty();
   }
   void visit(const Node &N, Path &Active) {
     auto &A = N.Children;

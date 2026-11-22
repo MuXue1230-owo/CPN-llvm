@@ -189,16 +189,11 @@ bool cpn::builtinPredicate(llvm::StringRef Name) {
          Name == "CopyConstructible" || Name == "MoveConstructible";
 }
 const Family *Frame::constraint(const std::string &Name) const {
-  for (std::string P = Prefix;;) {
-    auto It = U.Constraints.find(P + Name);
-    if (It != U.Constraints.end() && It->second.Site.Through <= LookupLimit)
-      return &It->second;
-    if (P.empty())
-      return nullptr;
-    P.resize(P.size() - 2);
-    auto Sep = P.rfind("::");
-    P = Sep == std::string::npos ? "" : P.substr(0, Sep + 2);
-  }
+  auto Key = scopeKey(Prefix, Name, [&](const std::string &K) {
+    auto It = U.Constraints.find(K);
+    return It != U.Constraints.end() && It->second.Site.Through <= LookupLimit;
+  });
+  return Key.empty() ? nullptr : &U.Constraints.at(Key);
 }
 bool Frame::predicate(const Node &N) {
   U.chargeSolver(N.At);

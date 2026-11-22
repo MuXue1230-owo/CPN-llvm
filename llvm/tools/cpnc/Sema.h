@@ -134,12 +134,14 @@ struct Context {
   llvm::Type *ir(const std::string &T, const Token &At = {});
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
+  void defineQualified(const Node &, const std::string &);
   void declareMembers(const std::string &, const std::string &);
   void buildViews(const std::string &);
   std::optional<BasePath> lookupPath(const std::string &, const Token &,
                                      bool Method) const;
   void buildTables(const std::string &, const std::vector<Function *> &);
-  void tagged(const Node &, const std::string &, const std::string &);
+  void tagged(const Node &, const std::string &, const std::string &,
+              const Substitution & = {});
   void record(const Node &, const std::string &, const std::string &,
               const Substitution &);
   void unit(const std::vector<Node> &, std::string Prefix = "");
@@ -155,6 +157,9 @@ struct EnterDefinition {
       : OptionsScope(U.Opt, Site.Configuration),
         LookupScope(U.LookupLimit, Site.Through) {}
 };
+// Find the nearest namespace binding, or begin at the module root for ::names.
+std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
+                     llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
 bool betterPattern(const Node &, const Node &);
 Family expand(const Family &, size_t, const Token &);
@@ -284,6 +289,8 @@ public:
   const Family *constraint(const std::string &) const;
   bool predicate(const Node &);
   bool constructible(const std::string &, SpecialOperation, const Token &);
+  bool typeCallee(const std::string &) const;
+  const Case *findCase(const std::string &, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &,
                 llvm::Value *Dest = nullptr, bool Default = false);
   void visitPayload(Value, llvm::function_ref<void(const Case &)>);

@@ -49,10 +49,10 @@ Value Frame::lookup(const Token &T) {
         throw;
     }
   }
-  if (U.Globals.count(Prefix + T.Text))
-    return U.Globals.at(Prefix + T.Text);
-  if (U.Globals.count(T.Text))
-    return U.Globals.at(T.Text);
+  auto Key = scopeKey(Prefix, T.Text,
+                      [&](const std::string &K) { return U.Globals.count(K); });
+  if (!Key.empty())
+    return U.Globals.at(Key);
   fail(T, "unknown name '" + T.Text + "'");
 }
 void Frame::checkAccess(const Node &Decl, const std::string &Owner,
@@ -571,17 +571,12 @@ std::string Frame::callKey(const std::string &Name,
                            const std::string &Owner) const {
   if (!Owner.empty())
     return Owner + "::" + Name;
-  for (std::string P = Prefix; !P.empty();) {
-    auto Key = P + Name;
-    auto Fam = U.Families.find(Key);
-    if (!visibleOverloads(Key).empty() ||
-        (Fam != U.Families.end() && Fam->second.Site.Through <= LookupLimit))
-      return Key;
-    P.resize(P.size() - 2);
-    auto Sep = P.rfind("::");
-    P = Sep == std::string::npos ? "" : P.substr(0, Sep + 2);
-  }
-  return Name;
+  auto Key = scopeKey(Prefix, Name, [&](const std::string &K) {
+    auto Fam = U.Families.find(K);
+    return !visibleOverloads(K).empty() ||
+           (Fam != U.Families.end() && Fam->second.Site.Through <= LookupLimit);
+  });
+  return Key.empty() ? Name : Key;
 }
 Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
                                   const Node &N,
@@ -883,10 +878,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
   auto Name = C.Text;
-  if (U.Cases.count(Prefix + Name))
-    return variant(U.Cases.at(Prefix + Name), Args, C.At);
-  if (U.Cases.count(Name))
-    return variant(U.Cases.at(Name), Args, C.At);
+  if (const auto *Case = findCase(Name, C.At))
+    return variant(*Case, Args, C.At);
   if (Name == "std::forward" && C.TemplateArgs.size() == 1 &&
       Args.size() == 1) {
     auto Ty = resolve(C.TemplateArgs[0].Type, C.At);
@@ -971,12 +964,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
         B.CreateLoad(B.getInt64Ty(), Registrations.at(S.Storage).Stamp);
     return V;
   }
-  if (C.K == Node::Name &&
-      (builtin(Name) || Env.Types.count(Name) ||
-       U.Aliases.count(Prefix + Name) || U.Records.count(Name) ||
-       U.Records.count(Prefix + Name))) {
+  if (C.K == Node::Name && typeCallee(Name))
     return construct(resolve(Name, C.At), Args, C.At);
-  }
   if (Receiver.Type.empty() && !Self.Type.empty() &&
       !methodOwner(Self.Type, C.At).empty())
     Receiver = Self;
@@ -1001,6 +990,18 @@ std::string Frame::initSlot(const Node &N) {
     return "$virtual:" + resolve(N.Text.substr(13), N.At);
   return N.Text;
 }
+bool Frame::typeCallee(const std::string &Name) const {
+  if (builtin(Name) || Env.Types.count(Name))
+    return true;
+  auto Base = Name.substr(0, Name.find('<'));
+  return !scopeKey(Prefix, Base, [&](const std::string &Key) {
+            auto Family = U.Families.find(Key);
+            return U.Aliases.count(Key) || U.Records.count(Key) ||
+                   (Base != Name && Family != U.Families.end() &&
+                    (Family->second.Decl.K == Node::Record ||
+                     Family->second.Decl.K == Node::Union));
+          }).empty();
+}
 std::optional<Value> Frame::directConstruction(const Node &Arg,
                                                const std::string &T,
                                                llvm::Value *Dest) {
@@ -1012,15 +1013,10 @@ std::optional<Value> Frame::directConstruction(const Node &Arg,
   for (const auto &Scope : Scopes)
     if (Scope.Names.count(Key))
       return {};
-  auto Case = U.Cases.find(Prefix + Key);
-  if (Case == U.Cases.end())
-    Case = U.Cases.find(Key);
-  if (Case != U.Cases.end() && Case->second.Owner == T)
-    return variant(Case->second, {Arg.Children.begin() + 1, Arg.Children.end()},
+  if (const auto *Case = findCase(Key, Arg.At); Case && Case->Owner == T)
+    return variant(*Case, {Arg.Children.begin() + 1, Arg.Children.end()},
                    Arg.At, Dest);
-  if ((Key == T || Env.Types.count(Key) || U.Aliases.count(Prefix + Key) ||
-       U.Records.count(Prefix + Key)) &&
-      resolve(Key, Arg.At) == T)
+  if (typeCallee(Key) && resolve(Key, Arg.At) == T)
     return construct(T, {Arg.Children.begin() + 1, Arg.Children.end()}, Arg.At,
                      Dest);
   return {};
