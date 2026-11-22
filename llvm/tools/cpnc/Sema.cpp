@@ -277,7 +277,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
   D.DefaultParams = N.Params;
   D.Name = Name;
   D.Owner = Owner;
-  D.Prefix = P;
+  D.Prefix = D.DefaultPrefix = P;
   D.Env = E;
   D.Configuration = Opt;
   D.Result = N.K == Node::Constructor || N.K == Node::Destructor
@@ -303,6 +303,24 @@ Function *Context::declare(const Node &N, const std::string &Name,
     Types.push_back(ir(D.Params.back(), Arg.At));
   }
   auto &Group = Overloads[Name];
+  if (N.Foreign) {
+    auto Scalar = [&](const std::string &T) {
+      return integer(T) || floating(T) || T == "bool" || T == "char" ||
+             StringRef(T).ends_with("*") || Enums.count(T);
+    };
+    if ((D.Result != "void" && !Scalar(D.Result)) ||
+        !llvm::all_of(D.Params, Scalar))
+      fail(N.At, "no C ABI transport for this function signature");
+    if (auto Previous = ExternalFunctions.find(N.Text);
+        Previous != ExternalFunctions.end()) {
+      auto *Prev = Previous->second;
+      if (Prev->Params != D.Params || Prev->Result != D.Result ||
+          Prev->Decl.Noexcept != N.Noexcept)
+        fail(N.At, "conflicting C function declarations for '" + N.Text + "'");
+      if (!llvm::is_contained(Group, Prev))
+        Group.push_back(Prev);
+    }
+  }
   for (auto *Prev : Group)
     if (!Owner.empty() && Prev->Params == D.Params &&
         Prev->Decl.Const == N.Const &&
@@ -326,6 +344,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
           fail(Arg.At, "defaults belong to the canonical declaration");
       auto Defaults = Prev->Decl.Params;
       Prev->Decl = N;
+      Prev->Prefix = P;
+      Prev->Configuration = Opt;
       for (size_t I = 0; I < Defaults.size(); ++I)
         if (!Defaults[I].Children.empty())
           Prev->Decl.Params[I].Children = Defaults[I].Children;
@@ -335,8 +355,12 @@ Function *Context::declare(const Node &N, const std::string &Name,
   if (Name == "main" && (D.Result != "i32" || !D.Params.empty()))
     fail(N.At, "the hosted entry point must be i32 main()");
   auto *FT = llvm::FunctionType::get(ir(D.Result, N.At), Types, false);
-  std::string Symbol =
-      Export ? Name : "cpn." + std::to_string(Serial++) + "." + Name;
+  std::string Symbol = N.Foreign ? N.Text
+                       : Export
+                           ? Name
+                           : "cpn." + std::to_string(Serial++) + "." + Name;
+  if (Export && M.getNamedValue(Symbol))
+    fail(N.At, "conflicting external symbol '" + Symbol + "'");
   D.IR = llvm::Function::Create(FT,
                                 Export ? llvm::GlobalValue::ExternalLinkage
                                        : llvm::GlobalValue::InternalLinkage,
@@ -354,6 +378,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
   }
   Functions.push_back(std::move(D));
   Group.push_back(&Functions.back());
+  if (N.Foreign)
+    ExternalFunctions[N.Text] = Group.back();
   return Group.back();
 }
 void Context::record(const Node &N, const std::string &Name,
@@ -418,7 +444,9 @@ void Context::record(const Node &N, const std::string &Name,
   for (auto &D : N.Children)
     if (D.K == Node::Constructor || D.K == Node::Destructor ||
         D.K == Node::Function) {
-      if (D.Settings.count("control"))
+      if (D.Settings.count("control") &&
+          (D.Settings.at("control") == "default" || D.K == Node::Destructor ||
+           D.Text == "operator="))
         continue;
       auto Key = Name + "::" +
                  (D.K == Node::Constructor  ? "$ctor"
@@ -500,7 +528,8 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
   }
 }
 void Context::emit(Function &D) {
-  if (D.Emitted || D.Emitting || D.Decl.Prototype)
+  if (D.Emitted || D.Emitting || D.Decl.Prototype ||
+      D.Decl.Settings.count("control"))
     return;
   D.Emitting = true;
   Frame F(*this, &D, D.IR);

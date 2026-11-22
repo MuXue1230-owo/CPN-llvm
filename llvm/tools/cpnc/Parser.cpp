@@ -609,7 +609,7 @@ class Parser {
            peek(I).Text == "override" || peek(I).Text == "final" ||
            peek(I).Text == "&" || peek(I).Text == "&&")
       ++I;
-    return peek(I).Text == "{";
+    return peek(I).Text == "{" || peek(I).Text == "=";
   }
   std::vector<Node> generic() {
     std::vector<Node> G;
@@ -643,6 +643,13 @@ class Parser {
     } while (eat(","));
     closeAngle();
     return G;
+  }
+  std::string definitionControl() {
+    if (!is("default") && !is("delete"))
+      fail(peek(), "expected default or delete");
+    auto Control = take().Text;
+    expect(";");
+    return Control;
   }
   Node declaration(bool Foreign = false, bool Member = false) {
     Nest Guard(Depth, peek());
@@ -685,7 +692,7 @@ class Parser {
         expect("\"C\"");
       if (eat("{")) {
         while (!eat("}"))
-          N.Children.push_back(declaration(!NS));
+          N.Children.push_back(declaration(Foreign || !NS));
       } else if (!NS)
         N.Children.push_back(declaration(true));
       else
@@ -778,8 +785,8 @@ class Parser {
       Types.insert(D.Text);
       return D;
     }
-    if (eat("struct") || eat("class")) {
-      bool Class = T.Text == "class";
+    if (is("struct") || is("class")) {
+      bool Class = take().Text == "class";
       bool Manual = Class && eat("Manual");
       Node R(Node::Record, name());
       R.Generics = G;
@@ -810,6 +817,13 @@ class Parser {
           expect(":");
           continue;
         }
+        bool SpecialProto =
+            is("declare") &&
+            ((peek(1).Text == R.Text && peek(2).Text == "(") ||
+             peek(1).Text == "~" ||
+             (peek(1).Text == "virtual" && peek(2).Text == "~"));
+        if (SpecialProto)
+          take();
         bool Virt = eat("virtual");
         Node D;
         if (is("Complete")) {
@@ -831,16 +845,22 @@ class Parser {
         if ((is(R.Text) && peek(1).Text == "(") || is("~")) {
           bool Drop = eat("~");
           D = Node(Drop ? Node::Destructor : Node::Constructor, expect(R.Text));
+          if (!Drop && Virt)
+            fail(D.At, "a constructor cannot be virtual");
           D.Params = params();
+          if (Drop && !D.Params.empty())
+            fail(D.At, "a destructor takes no parameters");
           D.Noexcept = eat("noexcept");
           if (eat("override"))
             D.Settings["override"] = "1";
           if (eat("final"))
             D.Settings["final"] = "1";
-          if (eat("=")) {
-            D.Settings["control"] = take().Text;
+          if (SpecialProto) {
             expect(";");
-          } else {
+            D.Prototype = true;
+          } else if (eat("="))
+            D.Settings["control"] = definitionControl();
+          else {
             D.Children.push_back(block(!Drop));
             if (Drop && eat("cleanup"))
               D.Children.push_back(block());
@@ -898,6 +918,10 @@ class Parser {
       expect(";");
       return E;
     }
+    if (Foreign && is("declare"))
+      fail(peek(), "a foreign prototype uses its linkage declaration");
+    if (!Foreign && is("define"))
+      fail(peek(), "define requires an external object definition");
     bool Proto = eat("declare"), Def = eat("define");
     eat("static");
     bool RO = is("const") && peek(1).Text != "<";
@@ -913,14 +937,15 @@ class Parser {
       F.Params = params();
       F.Noexcept = eat("noexcept");
       expect("=");
-      F.Settings["control"] = take().Text;
-      expect(";");
+      F.Settings["control"] = definitionControl();
       return F;
     }
     auto Id = name();
     bool Fn =
-        Proto || (!Def && Foreign && is("(")) || !G.empty() || functionBody();
+        !Def && (Proto || (Foreign && is("(")) || !G.empty() || functionBody());
     if (!Fn) {
+      if (Foreign && !Def && !is(";"))
+        fail(Id, "an external object initializer requires define");
       auto O = object(Id, Ty, RO, CE);
       O.Foreign = Foreign;
       O.Definition = Def;
@@ -951,6 +976,10 @@ class Parser {
     if (Proto || (Foreign && is(";"))) {
       expect(";");
       F.Prototype = true;
+    } else if (eat("=")) {
+      F.Settings["control"] = definitionControl();
+      if (F.Settings["control"] == "default")
+        fail(F.At, "this function has no generated default definition");
     } else
       F.Children.push_back(block());
     Types = std::move(Saved);

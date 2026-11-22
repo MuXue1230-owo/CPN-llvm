@@ -39,6 +39,14 @@ bool fits(const APInt &N, const std::string &T) {
                        : !N.isNegative() && N.isIntN(width(T));
 }
 } // namespace
+bool cpn::implicitInteger(cpn::Value V, const std::string &T) {
+  if (isa<ConstantInt>(V.IR))
+    return fits(math(V), T);
+  return StringRef(V.Type).ends_with("size") ==
+             StringRef(T).ends_with("size") &&
+         !(signedType(V.Type) && !signedType(T)) &&
+         width(V.Type) + (signedType(T) && !signedType(V.Type)) <= width(T);
+}
 cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
   if (V.Type == T)
     return V;
@@ -79,9 +87,7 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
       fail(At, "integer constant is outside the range of " + T);
     return constant(N.sextOrTrunc(width(T)), T);
   }
-  if (StringRef(V.Type).ends_with("size") != StringRef(T).ends_with("size") ||
-      (signedType(V.Type) && !signedType(T)) ||
-      width(V.Type) + (signedType(T) && !signedType(V.Type)) > width(T))
+  if (!implicitInteger(V, T))
     fail(At, "no implicit lossless conversion from " + V.Type + " to " + T);
   return {T, B.CreateIntCast(V.IR, U.ir(T), signedType(V.Type))};
 }

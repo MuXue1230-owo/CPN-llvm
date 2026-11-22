@@ -40,8 +40,8 @@ Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
       if (!Outcome) {
         std::string Detail;
         llvm::raw_string_ostream Message(Detail);
-        llvm::logAllUnhandledErrors(Outcome.takeError(),Message);
-        fail(At,"malformed real literal: "+Detail);
+        llvm::logAllUnhandledErrors(Outcome.takeError(), Message);
+        fail(At, "malformed real literal: " + Detail);
       }
       Status = *Outcome;
     }

@@ -24,7 +24,7 @@ struct Substitution {
 };
 struct Function {
   Node Decl;
-  std::string Name, Result, Owner, Prefix;
+  std::string Name, Result, Owner, Prefix, DefaultPrefix;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
   Substitution Env;
@@ -63,7 +63,8 @@ struct Context {
   Options Opt;
   std::map<std::string, std::string> Aliases, Enums;
   std::map<std::string, Record> Records;
-  std::map<std::string, Value> Globals;
+  std::map<std::string, Value> Globals, ExternalObjects;
+  std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
   llvm::Function *cleanupEntry(const std::string &);
   std::map<std::string, Case> Cases;
@@ -97,6 +98,7 @@ struct Context {
 Family expand(const Family &, size_t, const Token &);
 std::string element(const std::string &T);
 bool integer(const std::string &T);
+bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);
 unsigned width(const std::string &T);
 struct Local {
@@ -165,12 +167,16 @@ public:
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
   Value invoke(Function &, std::vector<Value>, const Token &,
                Value Receiver = {});
+  std::optional<unsigned> conversionRank(Value, const std::string &,
+                                         const Token &);
   Function *select(std::string, const Node &, const std::vector<Value> &,
                    Value Receiver = {});
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr);
+  void checkAccess(const Node &, const std::string &Owner, const Token &);
+  Function *checkSelected(Function *, const Token &);
   Value member(Value, const Token &);
   void stmt(const Node &);
   void object(const Node &, bool Global = false);

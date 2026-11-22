@@ -149,6 +149,117 @@ class CompilerTests(unittest.TestCase):
             30,
         )
 
+    def test_argumentwise_overload_ranking(self):
+        declarations = [
+            "i32 pick(i8 a, i32 b, i32 c) { return 1; }",
+            "i32 pick(i32 a, i8 b, i8 c) { return 2; }",
+        ]
+        main = "i32 main() { i8 x(1); return pick(x,x,x); }"
+        for order in (declarations, declarations[::-1]):
+            r = self.compile("\n".join([*order, main]), "--check")
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("ambiguous overload", r.stderr)
+            best = "i32 pick(i8 a, i8 b, i8 c) { return 42; }"
+            for i in range(3):
+                self.assertEqual(
+                    self.program("\n".join([*order[:i], best, *order[i:], main])),
+                    42,
+                )
+
+    def test_viable_reference_pointer_and_numeric_bindings(self):
+        self.assertEqual(
+            self.program("""
+            struct Base { i32 value(38); };
+            struct Derived : Base {};
+            i32 pick(Base* p) { return p->value; }
+            i32 pick(i32 n) { return 0; }
+            i32 get(i32& n) { return 1; }
+            i32 get(const<i32>& n) { return 2; }
+            i32 get(i32&& n) { return 3; }
+            i32 width(i32 n) { return 100; }
+            i32 width(i64 n) { return 1; }
+            i32 main() {
+                Derived d; u32 u; i32 v; const i32 c(2);
+                return pick(&d) + get(v) + get(c) + get(5) + width(u) - 3;
+            }"""),
+            42,
+        )
+        r = self.compile(
+            "i32 f(i32&& n){return n;} i32 main(){i32 x(2);return f(x);}",
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no viable overload", r.stderr)
+
+    def test_linkage_regions_and_external_symbol_identity(self):
+        self.assertEqual(
+            self.program(
+                """
+                extern "C" {
+                    namespace first { i32 counter; i32 apply(i32 v); }
+                    namespace second {
+                        define i32 counter(40);
+                        i32 apply(i32 v) { return counter + v; }
+                    }
+                }
+                extern "C" i32 probe() {
+                    return first::apply(1) + first::counter - second::counter;
+                }""",
+                host="""
+                extern int counter, apply(int), probe(void);
+                int main(void) {
+                    return counter == 40 && apply(2) == 42 ? probe() + 1 : 0;
+                }""",
+            ),
+            42,
+        )
+        for source in (
+            "define i32 x(5);",
+            'extern "C" declare i32 f();',
+            'extern "C" i32 x(10);',
+            'extern "C" i32 f(i32 x); extern "C" i32 f(u32 x);',
+            'extern "C" i32 x; extern "C" i32 x();',
+            'extern "C" i32 x(); extern "C" i32 x;',
+            'extern "C" { define i32 x(1); define i32 x(2); }',
+            'extern "C" { i32 x; u32 x; }',
+        ):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_selected_deleted_or_inaccessible_overload(self):
+        self.assertEqual(
+            self.program("""
+            class Base {
+            protected:
+                i32 read() const { return 40; }
+            };
+            struct Derived : Base { i32 go() { return read() + 2; } };
+            i32 choose(i32 n) = delete;
+            i32 choose(i8 n) { Derived d; return d.go(); }
+            i32 main() { return choose(i8(0)); }"""),
+            42,
+        )
+        for source, message in (
+            (
+                "i32 f(i8 n)=delete; i32 f(i32 n){return 0;} "
+                "i32 main(){return f(i8(2));}",
+                "deleted",
+            ),
+            (
+                "class T { i32 f(i8 n){return 1;} public: i32 f(i32 n){return 0;} }; "
+                "i32 main(){T t;return t.f(i8(2));}",
+                "inaccessible",
+            ),
+            ("class T { T() {} }; i32 main(){T t;return 0;}", "inaccessible"),
+            ("struct T { T() = delete; }; i32 main(){T t;return 0;}", "deleted"),
+            ("struct T { T() = later; };", "default or delete"),
+            ("struct T { ~T(i32 x) {} };", "no parameters"),
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_native_c_link(self):
         self.assertEqual(
             self.program(

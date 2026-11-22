@@ -54,6 +54,26 @@ Value Frame::lookup(const Token &T) {
     return U.Globals.at(T.Text);
   fail(T, "unknown name '" + T.Text + "'");
 }
+void Frame::checkAccess(const Node &Decl, const std::string &Owner,
+                        const Token &At) {
+  auto Access = Decl.Settings.find("access");
+  if (Access == Decl.Settings.end() || Access->second == "public" ||
+      (F && F->Owner == Owner))
+    return;
+  if (F && Access->second == "protected") {
+    Value SelfView{F->Owner};
+    if (adjust(SelfView, Owner, At, false))
+      return;
+  }
+  fail(At, "inaccessible member '" + Decl.Text + "'");
+}
+Function *Frame::checkSelected(Function *D, const Token &At) {
+  checkAccess(D->Decl, D->Owner, At);
+  if (auto It = D->Decl.Settings.find("control");
+      It != D->Decl.Settings.end() && It->second == "delete")
+    fail(At, "selected function is deleted");
+  return D;
+}
 Value Frame::member(Value Obj, const Token &T) {
   auto It = U.Records.find(Obj.Type);
   if (It == U.Records.end() || !It->second.Complete)
@@ -66,10 +86,7 @@ Value Frame::member(Value Obj, const Token &T) {
         fail(T, "use before initialization");
       if (Transaction && Obj.Address == Self.Address)
         Transaction->checkAccess(*this, T);
-      auto Access = Field.Decl.Settings.find("access");
-      if (Access != Field.Decl.Settings.end() && Access->second != "public" &&
-          (!F || F->Owner != Obj.Type))
-        fail(T, "inaccessible member");
+      checkAccess(Field.Decl, Obj.Type, T);
       if (Obj.Address)
         return {Field.Type, nullptr, B.CreateStructGEP(R.IR, Obj.Address, I),
                 Obj.Readonly};
@@ -339,7 +356,7 @@ Value Frame::eval(const Node &N, std::string Expected) {
         }
         if (!Match)
           fail(N.At, "no unique compatible function");
-        return {Expected, Match->IR};
+        return {Expected, checkSelected(Match, N.At)->IR};
       }
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
@@ -493,6 +510,64 @@ Value Frame::eval(const Node &N, std::string Expected) {
     fail(N.At, "expected a value expression");
   }
 }
+// Ranks order exact binding, then qualification/base/null conversions, then
+// numeric conversions. Each argument retains its own rank during selection.
+std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
+                                              const Token &At) {
+  auto Base = baseRef(Param), T = unconst(Base);
+  bool Ref = Base != Param, RO = T != Base, Lvalue = V.Address && !V.Expiring;
+  if (Ref && ((ends(Param, "&&") && Lvalue) ||
+              (!ends(Param, "&&") && !RO && !Lvalue) || (!RO && V.Readonly)))
+    return {};
+  unsigned Qual = Ref && RO && !V.Readonly ? 1 : 0;
+  if (V.Type == T)
+    return Qual;
+  if (Ref && U.Records.count(V.Type) && adjust(V, T, At, false))
+    return 1 + Qual;
+  if (Ref && (Lvalue || (!RO && !ends(Param, "&&"))))
+    return {};
+  if (ends(T, "*")) {
+    if (V.Type == "nullptr_t")
+      return 1;
+    if (ends(V.Type, "*")) {
+      auto From = element(V.Type), To = element(T);
+      if (From != unconst(From) && To == unconst(To))
+        return {};
+      Value View{unconst(From)};
+      if (adjust(View, unconst(To), At, false))
+        return 1;
+      if (U.Signatures.count(From) && U.Signatures.count(To) &&
+          U.Signatures.at(From) == U.Signatures.at(To) &&
+          (!ends(To, " noexcept>") || ends(From, " noexcept>")))
+        return 1;
+    }
+  }
+  if (integer(V.Type) && integer(T) && implicitInteger(V, T))
+    return V.Type == "integer" && T == Opt.DefaultInt ? Qual : 3;
+  if (floating(T)) {
+    if (V.Type == "real" || V.Type == "integer") {
+      try {
+        floatingConvert(V, T, At);
+      } catch (const Diagnostic &) {
+        return {};
+      }
+      return V.Type == "real" && T == Opt.DefaultReal ? Qual : 3;
+    }
+    if (V.Type == "f32" && T == "f64")
+      return 3;
+    if (V.Type == "f64" && T == "f32") {
+      if (auto *C = llvm::dyn_cast<llvm::ConstantFP>(V.IR)) {
+        auto Number = C->getValueAPF();
+        bool Lost;
+        Number.convert(llvm::APFloat::IEEEsingle(),
+                       llvm::RoundingMode::NearestTiesToEven, &Lost);
+        if (!Lost)
+          return 3;
+      }
+    }
+  }
+  return {};
+}
 Function *Frame::select(std::string Name, const Node &N,
                         const std::vector<Value> &Args, Value Receiver) {
   std::string Key =
@@ -541,11 +616,22 @@ Function *Frame::select(std::string Name, const Node &N,
       }
       U.emit(*D);
     }
-    return U.Instances.at(ID);
+    return checkSelected(U.Instances.at(ID), N.At);
   }
-  Function *Best = nullptr;
-  int Cost = 0;
-  bool Ambiguous = false;
+  struct Candidate {
+    Function *Decl;
+    std::vector<unsigned> Ranks;
+  };
+  auto Better = [](const Candidate &A, const Candidate &B) {
+    bool Strict = false;
+    for (size_t I = 0; I < A.Ranks.size(); ++I) {
+      if (A.Ranks[I] > B.Ranks[I])
+        return false;
+      Strict |= A.Ranks[I] < B.Ranks[I];
+    }
+    return Strict;
+  };
+  std::vector<Candidate> Best;
   auto It = U.Overloads.find(Key);
   if (It == U.Overloads.end())
     fail(N.At, "unknown name '" + Name + "'");
@@ -562,69 +648,24 @@ Function *Frame::select(std::string Name, const Node &N,
         (Args.size() < D->Params.size() &&
          D->Decl.Params[Args.size()].Children.empty()))
       continue;
-    int Rank = D->Decl.Const && !Receiver.Readonly ? 1 : 0;
-    bool OK = true;
+    Candidate Current{D, {unsigned(D->Decl.Const && !Receiver.Readonly)}};
     for (size_t I = 0; I < Args.size(); ++I) {
-      auto T = unconst(baseRef(D->Params[I]));
-      auto &V = Args[I];
-      if (ends(D->Params[I], "&") && !ends(D->Params[I], "&&") &&
-          unconst(baseRef(D->Params[I])) == baseRef(D->Params[I]) &&
-          !V.Address) {
-        OK = false;
+      auto Rank = conversionRank(Args[I], D->Params[I], N.At);
+      if (!Rank)
         break;
-      }
-      if (V.Type == "real" && floating(T)) {
-        Rank += T != Opt.DefaultReal;
-        continue;
-      }
-      if (V.Type == "f32" && T == "f64") {
-        ++Rank;
-        continue;
-      }
-      if (V.Type == T)
-        continue;
-      if (ends(D->Params[I], "&")) {
-        auto View = V;
-        if (adjust(View, T, N.At, false)) {
-          ++Rank;
-          continue;
-        }
-      }
-      if (integer(T) && integer(V.Type)) {
-        if (V.Type == "integer" && T == Opt.DefaultInt)
-          continue;
-        try {
-          if (llvm::isa<llvm::ConstantInt>(V.IR))
-            convert(V, T, N.At);
-          else if (width(V.Type) > width(T) ||
-                   (signedType(V.Type) && !signedType(T)))
-            throw Diagnostic{};
-        } catch (const Diagnostic &) {
-          OK = false;
-          break;
-        }
-        ++Rank;
-        continue;
-      }
-      if (V.Type == "nullptr_t" && ends(T, "*")) {
-        ++Rank;
-        continue;
-      }
-      OK = false;
-      break;
+      Current.Ranks.push_back(*Rank);
     }
-    if (OK) {
-      if (!Best || Rank < Cost) {
-        Best = D;
-        Cost = Rank;
-        Ambiguous = false;
-      } else if (Rank == Cost)
-        Ambiguous = true;
-    }
+    if (Current.Ranks.size() != Args.size() + 1 ||
+        llvm::any_of(Best,
+                     [&](const Candidate &C) { return Better(C, Current); }))
+      continue;
+    llvm::erase_if(Best,
+                   [&](const Candidate &C) { return Better(Current, C); });
+    Best.push_back(std::move(Current));
   }
-  if (!Best || Ambiguous)
-    fail(N.At, Ambiguous ? "ambiguous overload" : "no viable overload");
-  return Best;
+  if (Best.size() != 1)
+    fail(N.At, Best.empty() ? "no viable overload" : "ambiguous overload");
+  return checkSelected(Best.front().Decl, N.At);
 }
 Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                     Value Receiver) {
@@ -634,7 +675,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   auto Original = std::move(Scopes);
   auto OldPrefix = Prefix;
   Scopes = {Local{}};
-  Prefix = D.Prefix;
+  Prefix = D.DefaultPrefix;
   bool Defaults = Actual.size() < D.Params.size(),
        Constant = !IR || D.Decl.Settings.count("mode");
   std::vector<Value> Cells;
@@ -647,13 +688,13 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if (ends(Ty, "&")) {
       auto T = unconst(baseRef(Ty));
       if (V.Type != T && !adjust(V, T, P.At)) {
-        if (!V.Address && T != baseRef(Ty))
+        if (!V.Address && (T != baseRef(Ty) || ends(Ty, "&&")))
           V = convert(V, T, P.At);
         else
           fail(P.At, "incompatible reference binding");
       }
       if (!V.Address) {
-        if (unconst(baseRef(Ty)) == baseRef(Ty))
+        if (unconst(baseRef(Ty)) == baseRef(Ty) && !ends(Ty, "&&"))
           fail(P.At, "reference requires an lvalue");
         V.Address = allocate(T, P.At);
         B.CreateStore(V.IR, V.Address);
@@ -1153,7 +1194,7 @@ void Frame::object(const Node &N, bool Global) {
   };
   auto Found = names().find(Name);
   bool Existing = Found != names().end();
-  if (Existing && !(Global && N.Foreign && N.Definition))
+  if (Existing && !(Global && N.Foreign))
     fail(N.At, "duplicate declaration '" + Name + "'");
   auto Ty = resolve(N.Type, N.At);
   std::vector<Node> Args = N.Children;
@@ -1166,11 +1207,6 @@ void Frame::object(const Node &N, bool Global) {
     names()[Name] = {};
   if (Global) {
     llvm::GlobalVariable *G = nullptr;
-    if (Existing) {
-      G = llvm::dyn_cast_or_null<llvm::GlobalVariable>(Found->second.Address);
-      if (!G || G->hasInitializer() || Found->second.Type != Ty)
-        fail(N.At, "conflicting external object declaration");
-    }
     if (Ty == "auto") {
       Ty = constantEval(Args.at(0)).Type;
       if (Ty == "real")
@@ -1181,12 +1217,24 @@ void Frame::object(const Node &N, bool Global) {
     auto *LT = U.ir(Ty, N.At);
     if (!LT->isSized())
       fail(N.At, "static requires a complete type");
+    if (N.Foreign) {
+      auto Prev = U.ExternalObjects.find(N.Text);
+      if (Prev != U.ExternalObjects.end()) {
+        G = llvm::cast<llvm::GlobalVariable>(Prev->second.Address);
+        if (Prev->second.Type != Ty || Prev->second.Readonly != N.Const ||
+            (N.Definition && G->hasInitializer()))
+          fail(N.At, "conflicting external object declaration");
+      } else if (Existing || U.M.getNamedValue(N.Text))
+        fail(N.At, "conflicting external symbol '" + N.Text + "'");
+    }
     if (!G)
-      G = new llvm::GlobalVariable(U.M, LT, false,
-                                   N.Foreign
-                                       ? llvm::GlobalValue::ExternalLinkage
-                                       : llvm::GlobalValue::InternalLinkage,
-                                   nullptr, N.Foreign ? Name : "cpn.g." + Name);
+      G = new llvm::GlobalVariable(
+          U.M, LT, false,
+          N.Foreign ? llvm::GlobalValue::ExternalLinkage
+                    : llvm::GlobalValue::InternalLinkage,
+          nullptr, N.Foreign ? N.Text : "cpn.g." + Name);
+    if (N.Foreign)
+      U.ExternalObjects[N.Text] = {Ty, nullptr, G, N.Const};
     if (N.Foreign && !N.Definition) {
       names()[Name] = {Ty, nullptr, G, N.Const};
       return;
@@ -1607,8 +1655,11 @@ bool Frame::adjust(Value &V, const std::string &T, const Token &At, bool Emit) {
   Walk(V.Type, {});
   if (Paths.empty())
     return false;
-  if (Paths.size() != 1)
+  if (Paths.size() != 1) {
+    if (!Emit)
+      return false;
     fail(At, "ambiguous inherited base conversion");
+  }
   if (Emit) {
     std::vector<llvm::Value *> Indices{B.getInt32(0)};
     for (auto I : Paths[0])
