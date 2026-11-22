@@ -22,21 +22,9 @@ Value Frame::closure(const Node &N) {
     } else {
       if (V.Type == "integer")
         V = convert(V, Opt.DefaultInt, C.At);
-      if (U.Records.count(V.Type) && V.Address && !V.Expiring) {
-        auto &D = U.Records.at(V.Type).Decl;
-        bool Copyable =
-            D.K == Node::Lambda || llvm::any_of(D.Children, [&](auto &Member) {
-              return Member.K == Node::Constructor &&
-                     Member.Settings.count("control") &&
-                     Member.Settings.at("control") == "default" &&
-                     !Member.Params.empty() &&
-                     llvm::StringRef(Member.Params[0].Type).ends_with("&") &&
-                     !llvm::StringRef(Member.Params[0].Type).ends_with("&&");
-            });
-        if (!Copyable)
-          fail(C.At, "copy capture requires an available copy constructor");
-      }
-      consume(V);
+      if (V.Type == "real")
+        V = floatingConvert(V, Opt.DefaultReal, C.At);
+      V = materialize(V, C.At);
     }
     Values.push_back(V);
   }
@@ -68,7 +56,7 @@ Value Frame::closure(const Node &N) {
   for (size_t I = 0; I < Values.size(); ++I)
     B.CreateStore(Values[I].IR, B.CreateStructGEP(R.IR, Ptr, I));
   Value V{Type, B.CreateLoad(R.IR, Ptr), Ptr};
-  V.Expiring = true;
+  V.Expiring = V.Prvalue = true;
   Temps.push_back(V);
   return V;
 }

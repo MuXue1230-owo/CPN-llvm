@@ -1,5 +1,6 @@
 #include "Sema.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Support/ConvertUTF.h"
 #include <algorithm>
 
@@ -478,6 +479,13 @@ Value Frame::eval(const Node &N, std::string Expected) {
         R = binary(Math, Old, R);
       }
       R = convert(R, D.Type, N.At);
+      if (U.Records.count(D.Type) || ends(D.Type, "]")) {
+        transfer(R, D.Address,
+                 R.Expiring || !R.Address ? SpecialOperation::MoveAssign
+                                          : SpecialOperation::CopyAssign,
+                 N.At);
+        return load(D);
+      }
       B.CreateStore(R.IR, D.Address);
       return {D.Type, R.IR, D.Address};
     }
@@ -667,6 +675,19 @@ Function *Frame::select(std::string Name, const Node &N,
     fail(N.At, Best.empty() ? "no viable overload" : "ambiguous overload");
   return checkSelected(Best.front().Decl, N.At);
 }
+Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
+  if (!conversionRank(V, Ty, At))
+    fail(At, "incompatible reference binding");
+  auto T = unconst(baseRef(Ty));
+  if (V.Type != T && !adjust(V, T, At))
+    V = convert(V, T, At);
+  if (!V.Address && IR) {
+    V.Address = allocate(T, At);
+    B.CreateStore(V.IR, V.Address);
+  }
+  V.Readonly |= T != baseRef(Ty);
+  return V;
+}
 Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                     Value Receiver) {
   std::vector<llvm::Value *> Values;
@@ -686,22 +707,10 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                  ? Actual[I]
                  : construct(unconst(baseRef(Ty)), P.Children, P.At);
     if (ends(Ty, "&")) {
-      auto T = unconst(baseRef(Ty));
-      if (V.Type != T && !adjust(V, T, P.At)) {
-        if (!V.Address && (T != baseRef(Ty) || ends(Ty, "&&")))
-          V = convert(V, T, P.At);
-        else
-          fail(P.At, "incompatible reference binding");
-      }
-      if (!V.Address) {
-        if (unconst(baseRef(Ty)) == baseRef(Ty) && !ends(Ty, "&&"))
-          fail(P.At, "reference requires an lvalue");
-        V.Address = allocate(T, P.At);
-        B.CreateStore(V.IR, V.Address);
-      }
+      V = bindReference(V, Ty, P.At);
     } else {
       V = convert(V, Ty, T);
-      consume(V);
+      V = materialize(V, T);
       if (Defaults && !Constant) {
         auto *Addr = allocate(Ty, P.At);
         B.CreateStore(V.IR, Addr);
@@ -716,7 +725,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto &P = D.DefaultParams[I];
     auto V =
         Defaults && !P.Text.empty() ? Scopes.back().Names.at(P.Text) : Cells[I];
-    Values.push_back(ends(D.Params[I], "&") ? V.Address : load(V).IR);
+    Values.push_back(ends(D.Params[I], "&") && !Constant ? V.Address
+                                                         : load(V).IR);
   }
   Scopes = std::move(Original);
   Prefix = std::move(OldPrefix);
@@ -736,7 +746,9 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       auto *C = llvm::dyn_cast<llvm::Constant>(Values[I]);
       if (!C)
         fail(T, "constant argument required");
-      CF.Scopes[0].Names[D.Decl.Params[I].Text] = {D.Params[I], C};
+      auto Base = baseRef(D.Params[I]);
+      CF.Scopes[0].Names[D.Decl.Params[I].Text] = {unconst(Base), C, nullptr,
+                                                   Base != unconst(Base)};
     }
     try {
       CF.stmt(D.Decl.Children[0]);
@@ -758,7 +770,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   } else
     Call = B.CreateCall(D.IR, Values);
   Call->setAttributes(D.IR->getAttributes());
-  return {D.Result, Call};
+  return callResult(D.Result, Call, T);
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
@@ -792,11 +804,13 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       Args.size() == 1) {
     auto Ty = resolve(C.TemplateArgs[0].Type, C.At);
     auto V = eval(Args[0]);
+    V.Prvalue = false;
     V.Expiring = !ends(Ty, "&");
     return V;
   }
   if (Name == "std::move" && Args.size() == 1) {
     auto V = eval(Args[0]);
+    V.Prvalue = false;
     V.Expiring = true;
     return V;
   }
@@ -932,10 +946,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Args.size() == 1 && Args[0].K == Node::Name &&
         lookup(Args[0].At).Type == T) {
       auto V = eval(Args[0]);
-      if (U.Records.count(element(T)))
-        fail(At, "no available element copy constructor");
-      B.CreateStore(V.IR, Ptr);
-      return {T, V.IR, Ptr};
+      materialize(V, At, Ptr);
+      return {T, B.CreateLoad(Ty, Ptr), Ptr};
     }
     if (Count > 65536)
       fail(At, "array construction exceeds compiler resource limit");
@@ -975,19 +987,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         if (S.K == Node::Init && !Producers.emplace(S.Text, &S).second)
           fail(S.At, "duplicate initialization producer");
     if (Actual.size() == 1 && Actual[0].Type == T) {
-      auto Kind = Actual[0].Expiring ? "move" : "copy";
-      bool Allowed =
-          !Actual[0].Address || llvm::any_of(Temps, [&](const Value &V) {
-            return V.Address == Actual[0].Address;
-          });
-      for (auto &M : R.Decl.Children)
-        if (M.K == Node::Constructor && M.Settings.count("control") &&
-            !M.Params.empty() && M.Settings.at("control") == "default")
-          Allowed = true;
-      if (!Allowed)
-        fail(At, std::string("no available ") + Kind + " constructor");
-      consume(Actual[0]);
-      B.CreateStore(Actual[0].IR, Ptr);
+      materialize(Actual[0], At, Ptr);
     } else {
       auto It = U.Overloads.find(T + "::$ctor");
       bool Authored =
@@ -1015,8 +1015,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             if (!ends(Ty, "&")) {
               V = convert(V, Ty, At);
               auto *Addr = allocate(Ty, At);
-              B.CreateStore(V.IR, Addr);
+              materialize(V, At, Addr);
               V = {Ty, nullptr, Addr, P.Const};
+              Root.Scopes[0].Drops.push_back(V);
             } else
               V.IR = nullptr;
             Root.Scopes[0].Names[P.Text] = V;
@@ -1051,7 +1052,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             if (Found != Producers.end())
               fail(At, "duplicate aggregate initialization producer");
             auto V = convert(Actual[I - R.Bases.size()], Field.Type, At);
-            B.CreateStore(V.IR, P);
+            materialize(V, At, P);
           } else {
             construct(Field.Type,
                       Found == Producers.end() ? Field.Decl.Children
@@ -1087,7 +1088,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (!Dest)
       Temps.push_back(Obj);
     Obj.IR = B.CreateLoad(Ty, Ptr);
-    Obj.Expiring = !Dest;
+    Obj.Expiring = Obj.Prvalue = !Dest;
     return Obj;
   }
   if (Args.empty() && U.Enums.count(T) &&
@@ -1311,13 +1312,12 @@ void Frame::object(const Node &N, bool Global) {
          : V.Type == "real"  ? Opt.DefaultReal
                              : V.Type;
     V = convert(V, Ty, N.At);
-    if (llvm::any_of(Temps,
-                     [&](auto &Tmp) { return Tmp.Address == V.Address; })) {
+    if (V.Prvalue && V.Address) {
       Ptr = V.Address;
       consume(V);
     } else {
       Ptr = allocate(Ty, N.At);
-      B.CreateStore(V.IR, Ptr);
+      materialize(V, N.At, Ptr);
     }
   } else {
     Ptr = allocate(Ty, N.At);
@@ -1404,8 +1404,19 @@ void Frame::stmt(const Node &N) {
       fail(N.At, "borrow of automatic storage escapes the function");
     if (F->Result == "void" && V.Type != "void")
       fail(N.At, "void function cannot return a value");
-    if (F->Result != "void")
+    if (ends(F->Result, "&")) {
+      if (!V.Address || !conversionRank(V, F->Result, N.At) ||
+          llvm::isa<llvm::AllocaInst>(llvm::getUnderlyingObject(V.Address)))
+        fail(N.At, "invalid reference return or borrow of automatic storage");
+      auto Base = unconst(baseRef(F->Result));
+      if (!adjust(V, Base, N.At))
+        fail(N.At, "incompatible reference return");
+      V.IR = V.Address;
+    } else if (F->Result != "void") {
       V = convert(V, F->Result, N.At);
+      if (IR)
+        V = materialize(V, N.At);
+    }
     if (!IR)
       throw Transfer{Node::Return, V};
     endExpression();

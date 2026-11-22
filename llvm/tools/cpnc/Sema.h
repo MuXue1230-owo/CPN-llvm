@@ -12,7 +12,7 @@ struct Value {
   bool Readonly = false, Expiring = false;
   std::string Storage, RealText;
   llvm::Value *Generation = nullptr;
-  bool BaseView = false;
+  bool BaseView = false, Prvalue = false;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
         bool RO = false)
@@ -37,10 +37,21 @@ struct Field {
   Node Decl;
   std::string Type;
 };
+enum class SpecialOperation {
+  CopyConstruct,
+  MoveConstruct,
+  CopyAssign,
+  MoveAssign
+};
+struct SpecialMember {
+  Node Decl;
+  Function *Body = nullptr;
+};
 struct Record {
   Node Decl;
   llvm::StructType *IR = nullptr;
   std::vector<Field> Fields;
+  std::map<SpecialOperation, SpecialMember> Special;
   std::vector<std::string> Bases;
   Substitution Env;
   bool Complete = false, Polymorphic = false, VirtualDestructor = false;
@@ -150,6 +161,10 @@ public:
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
   Value load(Value);
+  Value materialize(Value, const Token &, llvm::Value *Dest = nullptr);
+  void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &);
+  Value bindReference(Value, const std::string &, const Token &);
+  Value callResult(const std::string &, llvm::Value *, const Token &);
   Value constant(llvm::APInt, std::string Type = "integer");
   Value literal(int64_t, const std::string &Ty = "integer");
   Value convert(Value, const std::string &, const Token &);

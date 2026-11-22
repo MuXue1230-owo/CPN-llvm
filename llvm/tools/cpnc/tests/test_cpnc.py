@@ -1206,6 +1206,86 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_memberwise_operations_call_authored_members_in_order(self):
+        self.assertEqual(
+            self.program("""
+            i32 calls;
+            struct Element {
+                i32 n;
+                Element(i32 v){init n(v);}
+                Element(const<Element>& v){init n(v.n); calls=calls*10+n;}
+                Element(Element&& v){init n(v.n); v.n=0; calls=calls*10+n;}
+                Element& operator=(const<Element>& v){n=v.n; calls=calls*10+n; return *this;}
+                Element& operator=(Element&& v){n=v.n; v.n=0; calls=calls*10+n; return *this;}
+            };
+            struct Pair {
+                Element[2] value;
+                Pair(){init value(Element(1),Element(2));}
+                Pair(const<Pair>& p)=default;
+                Pair(Pair&& p)=default;
+                Pair& operator=(const<Pair>& p)=default;
+                Pair& operator=(Pair&& p)=default;
+            };
+            i32 main(){
+                Pair first;
+                Pair second(first);
+                Pair third(std::move(first));
+                second = third;
+                third = std::move(second);
+                if (calls==12121212 && first.value[0].n==0 &&
+                    second.value[1].n==0 && third.value[1].n==2) {return 42;}
+                return 0;
+            }"""),
+            42,
+        )
+
+    def test_value_parameters_returns_and_elided_results(self):
+        self.assertEqual(
+            self.program("""
+            i32 copies; i32 moves; i32 drops;
+            struct Item {
+                i32 v;
+                Item(i32 x){init v(x);}
+                Item(const<Item>& s){init v(s.v); ++copies;}
+                Item(Item&& s){init v(s.v); s.v=0; ++moves;}
+                ~Item(){++drops;}
+            };
+            Item by_copy(Item arg){ return arg; }
+            Item by_move(Item arg){ return std::move(arg); }
+            void use(){
+                Item a(42);
+                auto b(by_copy(a));
+                Item c(by_move(Item(7)));
+                auto d(b);
+                by_move(Item(0));
+            }
+            i32 main(){use(); if(copies==3 && moves==2 && drops==8){return 42;}
+                       return 0;}
+            """),
+            42,
+        )
+        for statements, diagnostic in (
+            ("Only a; Only b(a);", "copy constructor"),
+            ("Only a; auto b(a);", "copy constructor"),
+            ("Only a; accept(a);", "copy constructor"),
+            ("Only a; Only b; a=b;", "copy assignment"),
+            ("Only a; Only b; a=std::move(b);", "move assignment"),
+        ):
+            with self.subTest(statements=statements):
+                result = self.compile(
+                    "struct Only { Only(Only&& v)=default; }; "
+                    "void accept(Only v){} i32 main(){" + statements + "return 0;}",
+                    "--check",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+        result = self.compile(
+            "struct Only { Only(Only&& v)=default; }; Only f(){ Only a; return a; }",
+            "--check",
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("copy constructor", result.stderr)
+
     def test_small_integer_domains_with_c_caller(self):
         source = """
             configuration { numeric.integer.overflow = saturating; };

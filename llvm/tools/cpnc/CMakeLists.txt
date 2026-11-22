@@ -22,6 +22,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Parser.cpp
     Reservations.cpp
     Sema.cpp
+    SpecialMembers.cpp
     Storage.cpp
     Tagged.cpp
     ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc

@@ -397,8 +397,9 @@ void Context::record(const Node &N, const std::string &Name,
   }
   R.Decl = N;
   R.Env = E;
+  R.Env.Types[N.Text] = Name;
   Frame Check(*this, nullptr, nullptr, P);
-  Check.Env = E;
+  Check.Env = R.Env;
   std::vector<llvm::Type *> Layout;
   for (auto &Base : N.TemplateArgs) {
     auto T = Check.resolve(Base.Type, Base.At);
@@ -444,15 +445,39 @@ void Context::record(const Node &N, const std::string &Name,
   for (auto &D : N.Children)
     if (D.K == Node::Constructor || D.K == Node::Destructor ||
         D.K == Node::Function) {
-      if (D.Settings.count("control") &&
-          (D.Settings.at("control") == "default" || D.K == Node::Destructor ||
-           D.Text == "operator="))
-        continue;
-      auto Key = Name + "::" +
-                 (D.K == Node::Constructor  ? "$ctor"
-                  : D.K == Node::Destructor ? "$drop"
-                                            : D.Text);
-      Members.push_back(declare(D, Key, P, E, Name));
+      bool Assign = D.Text == "operator=";
+      bool Defaulted =
+          D.Settings.count("control") && D.Settings.at("control") == "default";
+      std::optional<SpecialOperation> Op;
+      if ((Assign || D.K == Node::Constructor) && D.Params.size() == 1) {
+        auto T = Check.resolve(D.Params[0].Type, D.At);
+        if (T == "const<" + Name + ">&")
+          Op = Assign ? SpecialOperation::CopyAssign
+                      : SpecialOperation::CopyConstruct;
+        if (T == Name + "&&")
+          Op = Assign ? SpecialOperation::MoveAssign
+                      : SpecialOperation::MoveConstruct;
+      }
+      if (Op && Assign && Check.resolve(D.Type, D.At) != Name + "&")
+        fail(
+            D.At,
+            "copy and move assignment must return a reference to the receiver");
+      if (Defaulted && !Op &&
+          !(D.Params.empty() &&
+            (D.K == Node::Destructor || D.K == Node::Constructor)))
+        fail(D.At, "no generated default definition for this signature");
+      Function *Body = nullptr;
+      if (!Defaulted &&
+          !(D.K == Node::Destructor && D.Settings.count("control"))) {
+        auto Key = Name + "::" +
+                   (D.K == Node::Constructor  ? "$ctor"
+                    : D.K == Node::Destructor ? "$drop"
+                                              : D.Text);
+        Body = declare(D, Key, P, R.Env, Name);
+        Members.push_back(Body);
+      }
+      if (Op && !R.Special.emplace(*Op, SpecialMember{D, Body}).second)
+        fail(D.At, "duplicate special operation");
     }
   buildTables(Name, Members);
   for (auto *F : Members)

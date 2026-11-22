@@ -194,7 +194,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
     } else {
       V = Next.convert(V, T, Param.At);
       auto *P = Next.allocate(T, Param.At);
-      Next.B.CreateStore(V.IR, P);
+      Next.materialize(V, Param.At, P);
       V = {T, nullptr, P, Param.Const};
       Next.Scopes[0].Drops.push_back(V);
     }

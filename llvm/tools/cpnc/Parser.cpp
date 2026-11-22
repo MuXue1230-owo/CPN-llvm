@@ -579,6 +579,10 @@ class Parser {
       if (P.Const)
         take();
       P.Type = type();
+      if (P.Const && P.Type.back() == '&') {
+        auto I = P.Type.find_last_not_of('&') + 1;
+        P.Type = "const<" + P.Type.substr(0, I) + ">" + P.Type.substr(I);
+      }
       if (P.Type == "void")
         fail(P.At, "void parameter is invalid; use ()");
       P.Pack = eat("...");
@@ -936,8 +940,13 @@ class Parser {
       F.Type = Ty;
       F.Params = params();
       F.Noexcept = eat("noexcept");
-      expect("=");
-      F.Settings["control"] = definitionControl();
+      if (Proto) {
+        expect(";");
+        F.Prototype = true;
+      } else if (eat("="))
+        F.Settings["control"] = definitionControl();
+      else
+        F.Children.push_back(block());
       return F;
     }
     auto Id = name();

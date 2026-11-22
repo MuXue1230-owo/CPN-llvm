@@ -138,8 +138,13 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   std::vector<llvm::Value *> Vals;
   for (size_t I = 0; I < Args.size(); ++I) {
     Types.push_back(U.ir(Sig[I + 1]));
-    Vals.push_back(convert(eval(Args[I], Sig[I + 1]), Sig[I + 1], At).IR);
+    auto &Param = Sig[I + 1];
+    auto V = eval(Args[I], Param);
+    if (llvm::StringRef(Param).ends_with("&"))
+      Vals.push_back(bindReference(V, Param, At).Address);
+    else
+      Vals.push_back(materialize(convert(V, Param, At), At).IR);
   }
   auto *FT = llvm::FunctionType::get(U.ir(Sig.front()), Types, false);
-  return {Sig[0], B.CreateCall(FT, Ptr.IR, Vals)};
+  return callResult(Sig[0], B.CreateCall(FT, Ptr.IR, Vals), At);
 }
