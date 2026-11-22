@@ -132,7 +132,8 @@ void Frame::visitPayload(Value Object,
 void Frame::dropPayload(Value Object) {
   visitPayload(Object, [&](const Case &C) {
     for (size_t I = C.Types.size(); I; --I)
-      drop({C.Types[I - 1], nullptr, payloadAddress(C, Object.Address, I - 1)});
+      dropChild(Object, {C.Types[I - 1], nullptr,
+                         payloadAddress(C, Object.Address, I - 1)});
   });
 }
 void Frame::match(const Node &N) {
@@ -180,6 +181,8 @@ void Frame::match(const Node &N) {
         auto *Ptr = payloadAddress(C, Address, J);
         Value Binding{C.Types[J], nullptr, Ptr,
                       Subject.Readonly || C.Decl.Params[J].Const};
+        Binding = subobject(Subject, Binding);
+        ensureLive(Binding, P.At);
         if (P.Type != "ref") {
           bool Move = P.Type == "move";
           if (Move && !Subject.Expiring)

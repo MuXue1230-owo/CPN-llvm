@@ -12,7 +12,17 @@ struct Value {
   llvm::Value *IR = nullptr, *Address = nullptr;
   bool Readonly = false, Expiring = false;
   std::string Storage, RealText;
-  llvm::Value *Generation = nullptr;
+  llvm::Value *Generation = nullptr, *Slot = nullptr;
+  std::string ExtentType;
+  bool Subobject = false;
+  void borrow(const Value &V) {
+    Generation = V.Generation;
+    Slot = V.Slot;
+    Storage = V.Storage;
+    ExtentType = V.ExtentType;
+    Subobject = V.Subobject;
+    BaseView = V.BaseView;
+  }
   bool BaseView = false, Prvalue = false;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
@@ -107,6 +117,10 @@ struct Context {
   std::map<std::string, Value> Globals, ExternalObjects;
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
+  llvm::StructType *SlotType = nullptr;
+  std::map<std::string, llvm::Constant *> TypeIDs;
+  void enableStorage();
+  llvm::Constant *typeID(const std::string &);
   llvm::Function *cleanupEntry(const std::string &);
   std::map<std::string, Case> Cases;
   std::map<std::string, std::vector<std::string>> Variants;
@@ -200,7 +214,7 @@ public:
   std::vector<Value> Temps;
   std::map<std::string, int> Active;
   struct Registration {
-    llvm::Value *Stamp, *Destructor;
+    llvm::Value *Slot;
   };
   bool TracksStorage = false;
   std::map<std::string, Registration> Registrations;
@@ -240,7 +254,7 @@ public:
                         bool Explicit = false);
   Value floatingBinary(const Node &, Value, Value,
                        const std::string &Expected = "");
-  Value place(const Node &);
+  Value place(const Node &, bool NeedLive = true);
   Value subscript(const Node &);
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
@@ -273,7 +287,11 @@ public:
   void stmt(const Node &);
   void object(const Node &, bool Global = false);
   void drop(Value, bool AsBase = false);
-  void track(Value &);
+  llvm::Value *slotFor(Value);
+  Value subobject(Value, Value);
+  void dropChild(Value, Value, bool AsBase = false);
+  Value storageCall(const Node &, const std::vector<Node> &);
+  void track(Value &, llvm::GlobalVariable *GlobalSlot = nullptr);
   void ensureLive(const Value &, const Token &);
   void replaceGeneration(const Value &, const std::string &, const Token &);
   void retireStorage(const Value &, bool);

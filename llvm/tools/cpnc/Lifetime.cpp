@@ -27,9 +27,9 @@ void Frame::endField(const std::string &Slot, const Token &At,
   Token Name = At;
   Name.Text = Slot;
   if (RunDestructor)
-    drop(member(Self, Name),
-         llvm::StringRef(Slot).starts_with("$base:") ||
-             llvm::StringRef(Slot).starts_with("$virtual:"));
+    dropChild(Self, member(Self, Name),
+              llvm::StringRef(Slot).starts_with("$base:") ||
+                  llvm::StringRef(Slot).starts_with("$virtual:"));
   branch(Done);
   B.SetInsertPoint(Done);
 }

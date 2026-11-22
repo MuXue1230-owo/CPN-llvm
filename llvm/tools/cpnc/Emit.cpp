@@ -116,8 +116,11 @@ Value Frame::member(Value Obj, const Token &T) {
       if (Transaction && Obj.Address == Self.Address)
         Transaction->checkAccess(*this, T);
       checkAccess(Field.Decl, Obj.Type, T);
-      if (Obj.Address)
-        return {Field.Type, nullptr, fieldAddress(Obj, I), Obj.Readonly};
+      if (Obj.Address) {
+        Value V{Field.Type, nullptr, fieldAddress(Obj, I),
+                Obj.Readonly || Field.Decl.Const};
+        return I < R.Bases.size() ? V : subobject(Obj, V);
+      }
       return {Field.Type, B.CreateExtractValue(Obj.IR, I)};
     }
   fail(T, "unknown member '" + T.Text + "'");
@@ -138,10 +141,21 @@ void Frame::bindParams() {
     if (ends(T, "&")) {
       auto Base = baseRef(T);
       V = {unconst(Base), nullptr, A, P.Const || Base != unconst(Base)};
+      if (TracksStorage) {
+        V.Slot = slotFor(V);
+        V.Generation = B.CreateCall(U.M.getFunction("cpn.generation"),
+                                    {V.Slot, B.getFalse()});
+      }
     } else {
       auto *Ptr = allocate(T, P.At);
       B.CreateStore(A, Ptr);
       V = {T, nullptr, Ptr, P.Const};
+      if (TracksStorage && !ends(T, "*")) {
+        V.Storage = "parameter." + std::to_string(U.Serial++);
+        track(V);
+        Extents[V.Storage] = V;
+        Active[V.Storage] = 1;
+      }
       Scopes[0].Drops.push_back(V);
     }
     if (!P.Text.empty())
@@ -156,7 +170,7 @@ Value Frame::boolean(const Node &N) {
     Opt.warn(N.At, "assignment used directly as a Boolean condition");
   return V;
 }
-Value Frame::place(const Node &N) {
+Value Frame::place(const Node &N, bool NeedLive) {
   Value V;
   if (N.K == Node::Name)
     V = lookup(N.At);
@@ -166,9 +180,7 @@ Value Frame::place(const Node &N) {
       fail(N.At, "typed object pointer required");
     auto Base = element(P.Type);
     V = {unconst(Base), nullptr, P.IR, Base != unconst(Base)};
-    V.Storage = P.Storage;
-    V.Generation = P.Generation;
-    V.BaseView = P.BaseView;
+    V.borrow(P);
     if (llvm::isa<llvm::ConstantPointerNull>(P.IR))
       fail(N.At, "null pointer access");
   } else if (N.K == Node::Member) {
@@ -177,7 +189,10 @@ Value Frame::place(const Node &N) {
       if (!ends(Base.Type, "*"))
         fail(N.At, "typed object pointer required");
       auto T = element(Base.Type);
-      Base = {unconst(T), nullptr, Base.IR, unconst(T) != T};
+      Value Receiver{unconst(T), nullptr, Base.IR, unconst(T) != T};
+      Receiver.borrow(Base);
+      ensureLive(Receiver, N.At);
+      Base = Receiver;
     }
     V = member(Base, N.At);
   } else if (N.K == Node::Index)
@@ -186,11 +201,12 @@ Value Frame::place(const Node &N) {
     V = eval(N);
   if (!V.Address)
     fail(N.At, "object lvalue required");
-  ensureLive(V, N.At);
+  if (NeedLive)
+    ensureLive(V, N.At);
   return V;
 }
 Value Frame::subscript(const Node &N) {
-  auto Base = eval(N.Children[0]);
+  auto Base = place(N.Children[0]);
   auto Index = eval(N.Children[1]);
   if (U.Records.count(Base.Type))
     return applyOperator("operator[]", N.At, {{Base, Index}, {}, {}});
@@ -204,9 +220,10 @@ Value Frame::subscript(const Node &N) {
   auto *I = B.CreateIntCast(Index.IR, B.getInt64Ty(), signedType(Index.Type));
   guard(B.CreateICmpUGE(I, B.getInt64(Array->getNumElements())));
   auto E = element(Base.Type);
-  return {unconst(E), nullptr,
-          B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
-          Base.Readonly || E != unconst(E)};
+  return subobject(
+      Base, {unconst(E), nullptr,
+             B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
+             Base.Readonly || E != unconst(E)});
 }
 Value Frame::constantEval(const Node &N) {
   if (IR) {
@@ -377,9 +394,7 @@ Value Frame::eval(const Node &N, std::string Expected) {
       }
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
-      P.Storage = V.Storage;
-      P.Generation = V.Generation;
-      P.BaseView = V.BaseView;
+      P.borrow(V);
       return P;
     }
     if (Op == "*")
@@ -957,6 +972,14 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     Call =
         B.CreateCall(Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR, Values);
   Call->setAttributes(D.IR->getAttributes());
+  // A helper can end or replace an extent reached through its receiver or
+  // a borrowed argument. Its live state is subsequently checked at runtime.
+  if (!Receiver.Storage.empty() && Active.count(Receiver.Storage))
+    Active[Receiver.Storage] = -1;
+  for (size_t I = 0; I < Actual.size(); ++I)
+    if ((ends(D.Params[I], "&") || ends(D.Params[I], "*")) &&
+        !Actual[I].Storage.empty() && Active.count(Actual[I].Storage))
+      Active[Actual[I].Storage] = -1;
   return callResult(D.Result, Call, T);
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
@@ -1021,55 +1044,10 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       return {"void"};
     }
   }
-  if ((Name == "destroy" || Name == "abandon" || Name == "storage_of") &&
-      Args.size() == 1) {
-    auto V = place(Args[0]);
-    if (V.Storage.empty())
-      fail(C.At, "automatic storage extent required");
-    if (Name == "storage_of") {
-      Value S{"storage", V.Address};
-      S.Storage = V.Storage;
-      return S;
-    }
-    if (!Extents.count(V.Storage))
-      fail(C.At, "local storage extent required");
-    if (V.BaseView && Extents.at(V.Storage).Type != V.Type &&
-        (!U.Records.count(V.Type) || !U.Records.at(V.Type).VirtualDestructor))
-      fail(C.At,
-           "complete destruction through a base requires virtual destruction");
-    retireStorage(V, Name == "destroy");
-    return {"void"};
-  }
-  if (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1) {
-    auto S = eval(Args[0]);
-    if (S.Type != "storage" || S.Storage.empty())
-      fail(C.At, "storage view required");
-    if (Active[S.Storage] == 1)
-      fail(C.At, "storage contains a live generation");
-    if (Active[S.Storage] < 0 && Registrations.count(S.Storage))
-      guard(B.CreateTrunc(
-          B.CreateLoad(B.getInt64Ty(), Registrations.at(S.Storage).Stamp),
-          B.getInt1Ty()));
-    auto T = resolve(C.TemplateArgs[0].Type, C.At);
-    auto *Alloca =
-        Extents.count(S.Storage)
-            ? llvm::dyn_cast<llvm::AllocaInst>(Extents.at(S.Storage).Address)
-            : nullptr;
-    auto &DL = U.M.getDataLayout();
-    if (!Alloca ||
-        DL.getABITypeAlign(Alloca->getAllocatedType()) <
-            DL.getABITypeAlign(U.ir(T)) ||
-        DL.getTypeAllocSize(Alloca->getAllocatedType()) <
-            DL.getTypeAllocSize(U.ir(T)))
-      fail(C.At, "insufficient storage capacity");
-    construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR);
-    replaceGeneration(S, T, C.At);
-    Value V{T + "*", S.IR};
-    V.Storage = S.Storage;
-    V.Generation =
-        B.CreateLoad(B.getInt64Ty(), Registrations.at(S.Storage).Stamp);
-    return V;
-  }
+  if (((Name == "destroy" || Name == "abandon" || Name == "storage_of") &&
+       Args.size() == 1) ||
+      (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1))
+    return storageCall(C, Args);
   if (C.K == Node::Name && typeCallee(Name))
     return construct(resolve(Name, C.At), Args, C.At);
   if (Receiver.Type.empty() && !Self.Type.empty() &&
@@ -1369,13 +1347,21 @@ void Frame::drop(Value V, bool AsBase) {
     return;
   if (ends(V.Type, "]")) {
     auto E = element(V.Type);
-    if (!U.Records.count(E) && !ends(E, "]"))
+    if (!TracksStorage && !U.Records.count(E) && !ends(E, "]"))
       return;
     auto *Ty = llvm::cast<llvm::ArrayType>(U.ir(V.Type));
-    for (size_t I = Ty->getNumElements(); I; --I)
-      drop({E, nullptr,
-            B.CreateInBoundsGEP(Ty, V.Address,
-                                {B.getInt32(0), B.getInt64(I - 1)})});
+    auto *Entry = B.GetInsertBlock(), *Loop = block("array.drop"),
+         *Done = block("array.end");
+    branch(Loop);
+    B.SetInsertPoint(Loop);
+    auto *Count = B.CreatePHI(B.getInt64Ty(), 2);
+    Count->addIncoming(B.getInt64(Ty->getNumElements()), Entry);
+    auto *Index = B.CreateSub(Count, B.getInt64(1));
+    auto *Ptr = B.CreateInBoundsGEP(Ty, V.Address, {B.getInt32(0), Index});
+    dropChild(V, {E, nullptr, Ptr});
+    Count->addIncoming(Index, B.GetInsertBlock());
+    B.CreateCondBr(B.CreateIsNotNull(Index), Loop, Done);
+    B.SetInsertPoint(Done);
     return;
   }
   if (!U.Records.count(V.Type))
@@ -1393,14 +1379,19 @@ void Frame::drop(Value V, bool AsBase) {
   installTables(V);
   for (size_t I = R.Fields.size(); I > (AsBase ? R.VirtualCount : 0); --I) {
     auto &F = R.Fields[I - 1];
-    drop({F.Type, nullptr, fieldAddress(V, I - 1)}, I - 1 < R.Bases.size());
+    dropChild(V, {F.Type, nullptr, fieldAddress(V, I - 1)},
+              I - 1 < R.Bases.size());
   }
 }
 void Frame::cleanup(size_t From) {
   for (size_t I = Scopes.size(); I > From; --I)
     for (auto V = Scopes[I - 1].Drops.rbegin(); V != Scopes[I - 1].Drops.rend();
-         ++V)
+         ++V) {
       drop(*V);
+      if (V->Slot && !V->Subobject && Extents.count(V->Storage) &&
+          Extents.at(V->Storage).Address == V->Address)
+        B.CreateCall(U.M.getFunction("cpn.slot.release"), {V->Slot});
+    }
 }
 void Frame::consume(Value V) {
   if (V.Address)
@@ -1500,12 +1491,15 @@ void Frame::object(const Node &N, bool Global) {
                      Args[0].K == Node::Character ||
                      (Args[0].K == Node::Name &&
                       (Args[0].Text == "true" || Args[0].Text == "false")))));
+    llvm::Value *StaticConstant = nullptr;
     if (Simple) {
       auto V = construct(Ty, Args, N.At);
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
       G->setConstant(N.Const);
-      names()[Name] = {Ty, N.Required ? V.IR : nullptr, G, N.Const};
-      return;
+      StaticConstant = N.Required ? V.IR : nullptr;
+      names()[Name] = {Ty, StaticConstant, G, N.Const};
+      if (!U.SlotType || N.Const)
+        return;
     }
     auto FT = llvm::FunctionType::get(B.getVoidTy(), false);
     auto *Fn = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
@@ -1513,22 +1507,35 @@ void Frame::object(const Node &N, bool Global) {
     Frame Init(U, nullptr, Fn, Prefix);
     Init.Env = Env;
     Init.B.SetInsertPoint(Init.block("entry"));
-    Init.construct(Ty, Args, N.At, G, Tail);
-    Init.endExpression();
-    auto *Ready = new llvm::GlobalVariable(U.M, B.getInt1Ty(), false,
-                                           llvm::GlobalValue::InternalLinkage,
-                                           B.getFalse(), "cpn.ready");
-    U.Ready[G] = Ready;
-    Init.B.CreateStore(B.getTrue(), Ready);
+    if (!Simple) {
+      Init.construct(Ty, Args, N.At, G, Tail);
+      Init.endExpression();
+      auto *Ready = new llvm::GlobalVariable(U.M, B.getInt1Ty(), false,
+                                             llvm::GlobalValue::InternalLinkage,
+                                             B.getFalse(), "cpn.ready");
+      U.Ready[G] = Ready;
+      Init.B.CreateStore(B.getTrue(), Ready);
+    }
+    Value Cell{Ty, StaticConstant, G, N.Const};
+    if (U.SlotType) {
+      auto *GlobalSlot = new llvm::GlobalVariable(
+          U.M, U.SlotType, false, llvm::GlobalValue::InternalLinkage,
+          llvm::Constant::getNullValue(U.SlotType), "cpn.static.slot");
+      Init.track(Cell, GlobalSlot);
+    }
     Init.B.CreateRetVoid();
     U.Startup.push_back(Fn);
-    names()[Name] = {Ty, nullptr, G, N.Const};
-    if (U.Records.count(Ty) || ends(Ty, "]")) {
+    names()[Name] = Cell;
+    if (Cell.Slot || U.Records.count(Ty) || ends(Ty, "]")) {
       auto *D = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                        "cpn.static.drop", U.M);
       Frame DF(U, nullptr, D);
       DF.B.SetInsertPoint(DF.block("entry"));
-      DF.drop(names()[Name]);
+      if (Cell.Slot) {
+        DF.retireStorage(Cell, true);
+        DF.B.CreateCall(U.M.getFunction("cpn.slot.release"), {Cell.Slot});
+      } else
+        DF.drop(Cell);
       DF.B.CreateRetVoid();
       U.Shutdown.push_back(D);
     }
@@ -1577,9 +1584,8 @@ void Frame::object(const Node &N, bool Global) {
   if (N.Required && !llvm::isa_and_nonnull<llvm::Constant>(V.IR))
     fail(N.At, "constexpr initializer requires a constant");
   Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, N.Const};
-  Cell.Storage = V.Storage;
-  Cell.Generation = V.Generation;
-  Cell.BaseView = V.BaseView;
+  if (Ty == "storage" || ends(Ty, "*"))
+    Cell.borrow(V);
   if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {
     Cell.Storage = "local." + std::to_string(U.Serial++);
     Active[Cell.Storage] = true;

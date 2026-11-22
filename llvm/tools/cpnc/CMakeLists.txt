@@ -1,5 +1,5 @@
 if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
-  set(LLVM_LINK_COMPONENTS Core Support Target MC CodeGen X86)
+  set(LLVM_LINK_COMPONENTS AsmParser Core Support Target MC CodeGen X86)
   set(LLVM_REQUIRES_EH ON)
   set(LLVM_REQUIRES_RTTI ON)
   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc
@@ -7,6 +7,9 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
             "${CMAKE_CURRENT_SOURCE_DIR}/unicode/ucd17.json.gz"
             "${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc"
     DEPENDS utils/native_ucd.py unicode/ucd17.json.gz VERBATIM)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS StorageRuntime.ll)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/StorageRuntime.ll" CPN_STORAGE_IR)
+  configure_file(StorageRuntime.inc.in StorageRuntime.inc @ONLY)
   add_llvm_tool(cpnc
     Binding.cpp
     Closure.cpp

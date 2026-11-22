@@ -90,7 +90,7 @@ Frame::Frame(Context &U, Function *F, llvm::Function *IR, std::string P)
       Prefix(F ? F->Prefix : std::move(P)), IR(IR),
       Env(F ? F->Env : Substitution()) {
   Scopes.emplace_back();
-  TracksStorage = F && IR && usesStorage(F->Decl);
+  TracksStorage = IR && U.SlotType;
 }
 llvm::BasicBlock *Frame::block(llvm::StringRef Name) {
   return llvm::BasicBlock::Create(U.C, Name, IR);
@@ -450,12 +450,18 @@ Function *Context::declare(const Node &N, const std::string &Name,
                        : Export
                            ? Name
                            : "cpn." + std::to_string(Serial++) + "." + Name;
-  if (Export && M.getNamedValue(Symbol))
-    fail(N.At, "conflicting external symbol '" + Symbol + "'");
-  D.IR = llvm::Function::Create(FT,
-                                Export ? llvm::GlobalValue::ExternalLinkage
-                                       : llvm::GlobalValue::InternalLinkage,
-                                Symbol, M);
+  if (Export && M.getNamedValue(Symbol)) {
+    auto *Existing = M.getFunction(Symbol);
+    if (!SlotType || !N.Foreign || (Symbol != "malloc" && Symbol != "free") ||
+        !Existing || !Existing->isDeclaration() ||
+        Existing->getFunctionType() != FT)
+      fail(N.At, "conflicting external symbol '" + Symbol + "'");
+    D.IR = Existing;
+  } else
+    D.IR = llvm::Function::Create(FT,
+                                  Export ? llvm::GlobalValue::ExternalLinkage
+                                         : llvm::GlobalValue::InternalLinkage,
+                                  Symbol, M);
   if (N.Foreign) {
     auto ext = [&](const std::string &Ty) {
       return signedType(Ty) ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
@@ -834,6 +840,8 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
 }
 void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));
+  if (llvm::any_of(AST, Frame::usesStorage))
+    U.enableStorage();
   U.unit(AST);
   for (auto &F : U.Functions)
     for (auto *Entry : {F.IR, F.BaseIR})

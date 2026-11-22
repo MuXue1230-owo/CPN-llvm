@@ -1496,6 +1496,94 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_registered_static_and_borrowed_extent(self):
+        self.assertEqual(
+            self.program("""
+            struct Item{i32 n;}; Item global;
+            void end(Item& object){destroy(object);}
+            i32 use(Item object){end(object);
+                auto p(construct_at<Item>(storage_of(object),40));
+                return p->n;}
+            i32 main(){Item item(1);end(global);
+                auto p(construct_at<Item>(storage_of(global),2));
+                return use(Item(1))+p->n;}"""),
+            42,
+        )
+        self.assertLess(
+            self.program("""
+            struct Pair{i32 n;};i32 main(){
+                Pair p; auto inner(storage_of(p.n)); auto outer(storage_of(p));
+                destroy(p);construct_at<Pair>(outer);
+                construct_at<i32>(inner,42);return 1;}"""),
+            0,
+        )
+
+    def test_nullable_virtual_base_conversion(self):
+        self.assertEqual(
+            self.program("""
+            struct A{i32 x;}; struct B:virtual A{};
+            A* convert(B* b){return b;}
+            i32 main(){B* empty;if(convert(empty)==nullptr){return 42;}return 1;}
+            """),
+            42,
+        )
+
+    def test_element_storage_replacement_and_reverse_registration_order(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace; i32 calls;
+            i32 index(){++calls;return 1;}
+            struct Item {i32 n;Item(i32 v){init n(v);}~Item(){trace=10*trace+n;}};
+            struct Other {i32 n;Other(i32 v){init n(v);}~Other(){trace=10*trace+n;}};
+            void change(Item[3]& items){
+                destroy(items[index()]);
+                auto view(storage_of(items[1]));
+                auto replacement(construct_at<Other>(view,7));
+                if(replacement->n!=7){trace=9;}
+            }
+            i32 main(){
+                { Item[3] items(Item(1),Item(2),Item(3));
+                  change(items); abandon(items[0]); }
+                if(trace==237 && calls==1){return 42;}return 1;
+            }"""),
+            42,
+        )
+
+    def test_member_replacement_in_aggregate_and_authored_destructor(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct A {i32 n;A(i32 v){init n(v);}~A(){trace=trace*10+n;}};
+            struct B {i32 n;B(i32 v){init n(v);}~B(){trace=trace*10+n;}};
+            struct Pair {A first(1);A last(2);~Pair(){trace=trace*10+3;}
+                         cleanup {trace=trace*10+4;}};
+            i32 main(){
+                {Pair p; abandon(p.first); auto view(storage_of(p.first));
+                 construct_at<B>(view,7);}
+                if(trace==3274){return 42;}return 1;
+            }"""),
+            42,
+        )
+        for expr in ("*old", "values[0]"):
+            with self.subTest(expr=expr):
+                self.assertLess(
+                    self.program(
+                        "i32 main(){i32[2] values(10,20);auto old(&values[0]);"
+                        "destroy(values[0]);construct_at<i32>(storage_of(values[0]),42);"
+                        "return " + expr + ";}"
+                    ),
+                    0,
+                )
+
+    def test_storage_view_after_ending_complete_object(self):
+        self.assertEqual(
+            self.program("""
+            i32 main(){i32 n(5);destroy(n);
+                       auto replacement(construct_at<i32>(storage_of(n),42));
+                       return *replacement;}"""),
+            42,
+        )
+
     def test_static_members_and_modifier_order(self):
         self.assertEqual(
             self.program("""

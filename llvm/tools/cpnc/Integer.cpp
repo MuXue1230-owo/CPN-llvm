@@ -60,13 +60,31 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
                  : S;
     };
     cpn::Value View{unqualified(A), nullptr, V.IR};
-    if ((A == unqualified(A) || D != unqualified(D)) &&
-        adjust(View, unqualified(D), At)) {
-      auto *Null = ConstantPointerNull::get(B.getPtrTy());
-      V.BaseView |= unqualified(A) != unqualified(D);
-      V.IR = B.CreateSelect(B.CreateICmpEQ(V.IR, Null), Null, View.Address);
+    auto Target = unqualified(D);
+    if ((A == unqualified(A) || D != Target) &&
+        adjust(View, Target, At, false)) {
+      bool Base = View.Type != Target;
       V.Type = T;
       V.Address = nullptr;
+      if (!Base || llvm::isa<llvm::ConstantPointerNull>(V.IR))
+        return V;
+      V.BaseView = true;
+      if (!IR)
+        fail(At, "base adjustment requires runtime storage");
+      // Virtual offsets reside in the object and are readable only on the
+      // nonnull path, even when the converted pointer is never dereferenced.
+      auto *Entry = B.GetInsertBlock(), *NonNull = block("pointer.base"),
+           *End = block("pointer.end");
+      B.CreateCondBr(B.CreateIsNotNull(V.IR), NonNull, End);
+      B.SetInsertPoint(NonNull);
+      adjust(View, Target, At);
+      auto *Adjusted = B.GetInsertBlock();
+      branch(End);
+      B.SetInsertPoint(End);
+      auto *P = B.CreatePHI(B.getPtrTy(), 2);
+      P->addIncoming(llvm::ConstantPointerNull::get(B.getPtrTy()), Entry);
+      P->addIncoming(View.Address, Adjusted);
+      V.IR = P;
       return V;
     }
     if (U.Signatures.count(A) && U.Signatures.count(D) &&
