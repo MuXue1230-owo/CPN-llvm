@@ -151,16 +151,96 @@ cpn::scopeKey(StringRef Prefix, StringRef Name,
     Prefix = Sep == StringRef::npos ? StringRef() : Prefix.take_front(Sep + 2);
   }
 }
+std::string cpn::borrowEffects(const std::set<unsigned> &NoEscape,
+                               const std::set<unsigned> &Borrowed) {
+  std::string Effects;
+  auto append = [&](StringRef Key, const std::set<unsigned> &Positions) {
+    for (auto I : Positions)
+      Effects += (" " + Key + "#").str() + std::to_string(I);
+  };
+  append("noescape", NoEscape);
+  append("borrow", Borrowed);
+  return Effects;
+}
+std::string Context::callableType(const Function &D) {
+  std::string T = "function<" + D.Result + "(";
+  for (size_t I = 0; I < D.Params.size(); ++I) {
+    if (I)
+      T += ",";
+    T += D.Params[I];
+  }
+  T += ")";
+  if (D.Decl.Noexcept)
+    T += " noexcept";
+  if (D.MayWhole)
+    T += " whole";
+  T += borrowEffects(D.NoEscape, D.BorrowedResult) + ">";
+  if (!Signatures.count(T)) {
+    std::vector<std::string> Sig{D.Result};
+    Sig.insert(Sig.end(), D.Params.begin(), D.Params.end());
+    Signatures.emplace(T, std::move(Sig));
+  }
+  return T;
+}
+std::set<StringRef> cpn::callableFlags(StringRef T) {
+  llvm::SmallVector<StringRef> Parts;
+  T.drop_back().drop_front(T.rfind(')') + 1).split(Parts, ' ', -1, false);
+  return {Parts.begin(), Parts.end()};
+}
+bool Context::compatibleCallable(const std::string &From,
+                                 const std::string &To) const {
+  if (!Signatures.count(From) || !Signatures.count(To) ||
+      Signatures.at(From) != Signatures.at(To))
+    return false;
+  if ((callableFlag(To, " noexcept") && !callableFlag(From, " noexcept")) ||
+      (callableFlag(From, " whole") && !callableFlag(To, " whole")))
+    return false;
+  auto Source = callableFlags(From), Target = callableFlags(To);
+  for (auto Flag : Target)
+    if (Flag.starts_with("noescape#") && !Source.count(Flag))
+      return false;
+  if (llvm::any_of(Target,
+                   [](StringRef F) { return F.starts_with("borrow#"); })) {
+    bool Bounded = false;
+    for (auto F : Source)
+      if (F.starts_with("borrow#")) {
+        Bounded = true;
+        if (!Target.count(F))
+          return false;
+      }
+    if (!Bounded)
+      return false;
+  }
+  return true;
+}
 std::string Frame::resolve(std::string S, const Token &At) {
+  if (auto Q = U.TypeQueries.find(S); Q != U.TypeQueries.end())
+    return unevaluatedType(Q->second.Children.front(), true);
   if (StringRef(S).starts_with("function<") && StringRef(S).ends_with(">")) {
-    size_t Open = S.find('('), Close = S.rfind(')');
-    if (Open == std::string::npos || Close == std::string::npos)
+    size_t Open = 9, Close = S.rfind(')');
+    unsigned Depth = 0;
+    for (; Open < S.size(); ++Open) {
+      if (S[Open] == '(' && !Depth)
+        break;
+      if (S[Open] == '<')
+        ++Depth;
+      if (S[Open] == '>' && Depth)
+        --Depth;
+    }
+    if (Open >= S.size() || Close == std::string::npos || Close < Open)
       fail(At, "invalid function type");
     std::vector<std::string> Sig = {resolve(S.substr(9, Open - 9), At)};
     for (auto &P : splitArguments(StringRef(S).slice(Open + 1, Close)))
       Sig.push_back(resolve(P, At));
-    U.Signatures[S] = std::move(Sig);
-    return S;
+    auto Canonical = "function<" + Sig.front() + "(";
+    for (size_t I = 1; I < Sig.size(); ++I) {
+      if (I > 1)
+        Canonical += ",";
+      Canonical += Sig[I];
+    }
+    Canonical += S.substr(Close);
+    U.Signatures.try_emplace(Canonical, std::move(Sig));
+    return Canonical;
   }
   if (floating(S) && !Opt.FloatFormats.count(S))
     fail(At, "floating format is disabled");
@@ -762,6 +842,8 @@ void Context::defineQualified(const Node &D, const std::string &P) {
 }
 void Context::unit(const std::vector<Node> &Decls, std::string P) {
   for (auto &D : Decls) {
+    if (D.K == Node::TypeQuery)
+      continue;
     ++Sequence;
     auto Name = P + D.Text;
     if (D.K == Node::Config) {
@@ -904,6 +986,9 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
 }
 void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));
+  for (const auto &N : AST)
+    if (N.K == Node::TypeQuery)
+      U.TypeQueries.emplace(N.Text, N);
   U.Whole = llvm::any_of(AST, Frame::usesWhole);
   if (U.Whole || llvm::any_of(AST, Frame::usesStorage))
     U.enableStorage();

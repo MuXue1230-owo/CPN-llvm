@@ -87,10 +87,7 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
       V.IR = P;
       return V;
     }
-    if (U.Signatures.count(A) && U.Signatures.count(D) &&
-        U.Signatures.at(A) == U.Signatures.at(D) &&
-        (!callableFlag(D, " noexcept") || callableFlag(A, " noexcept")) &&
-        (!callableFlag(A, " whole") || callableFlag(D, " whole"))) {
+    if (U.compatibleCallable(A, D)) {
       V.Type = T;
       return V;
     }

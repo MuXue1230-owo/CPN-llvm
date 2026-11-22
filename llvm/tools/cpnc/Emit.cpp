@@ -287,6 +287,50 @@ Value Frame::subscript(const Node &N) {
       B.CreateGEP(Array->getElementType(), Base.Address, B.getInt64(Count));
   return V;
 }
+std::string Frame::unevaluatedType(const Node &N, bool IncludeCategory) {
+  const bool Address = N.K == Node::Unary && N.Text == "&";
+  const Node &Subject = Address ? N.Children.front() : N;
+  if (Subject.K == Node::Name && llvm::none_of(Scopes, [&](const Local &S) {
+        return S.Names.count(Subject.Text);
+      })) {
+    auto Group = visibleOverloads(callKey(Subject.Text));
+    if (!Group.empty()) {
+      if (Group.size() != 1 ||
+          (!Group.front()->Owner.empty() && !Group.front()->isStatic()))
+        fail(N.At, "type query requires a unique native function");
+      return U.callableType(*checkSelected(Group.front(), N.At)) +
+             (Address ? "*" : "");
+    }
+  }
+  auto *Tmp = llvm::Function::Create(
+      llvm::FunctionType::get(B.getVoidTy(), false),
+      llvm::GlobalValue::InternalLinkage, "cpn.unevaluated", U.M);
+  struct Discard {
+    llvm::Function *Fn;
+    ~Discard() { Fn->eraseFromParent(); }
+  } Guard{Tmp};
+  // Type checking uses the caller's bindings, but unevaluated calls do not
+  // add a lifecycle effect to the surrounding function.
+  Function QueryOwner;
+  if (F)
+    QueryOwner = *F;
+  Frame Probe(U, F ? &QueryOwner : nullptr, Tmp, Prefix);
+  Probe.Opt = Opt;
+  Probe.LookupLimit = LookupLimit;
+  Probe.Env = Env;
+  Probe.Scopes = Scopes;
+  Probe.Self = Self;
+  Probe.B.SetInsertPoint(Probe.block("entry"));
+  auto V = Probe.eval(N);
+  auto T = V.Type == "integer" ? Opt.DefaultInt
+           : V.Type == "real"  ? Opt.DefaultReal
+                               : V.Type;
+  if (IncludeCategory && V.Readonly)
+    T = "const<" + T + ">";
+  if (IncludeCategory && V.Address && !V.Prvalue)
+    T += V.Expiring ? "&&" : "&";
+  return T;
+}
 Value Frame::constantEval(const Node &N) {
   if (IR) {
     Frame CF(U, F, nullptr, Prefix);
@@ -415,18 +459,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
                    ? "u8[" + std::to_string(unquote(A[0].At).size() + 1) + "]"
                : A[0].K == Node::Name ? lookup(A[0].At).Type
                                       : "";
-      if (T.empty()) {
-        auto *Tmp = llvm::Function::Create(
-            llvm::FunctionType::get(B.getVoidTy(), false),
-            llvm::GlobalValue::InternalLinkage, "cpn.unevaluated", U.M);
-        Frame Probe(U, F, Tmp, Prefix);
-        Probe.Scopes = Scopes;
-        Probe.Self = Self;
-        Probe.Env = Env;
-        Probe.B.SetInsertPoint(Probe.block("entry"));
-        T = Probe.eval(A[0]).Type;
-        Tmp->eraseFromParent();
-      }
+      if (T.empty())
+        T = unevaluatedType(A[0], false);
       auto *Ty = U.ir(T, N.At);
       if (!Ty->isSized())
         fail(N.At, "complete object type required");
@@ -460,7 +494,13 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           fail(N.At, "no unique compatible function");
         if (!callableFlag(element(Expected), " whole"))
           U.RestrictedPointers.emplace_back(Match, N.At);
-        return {Expected, checkSelected(Match, N.At)->IR};
+        auto Source = U.callableType(*checkSelected(Match, N.At));
+        auto Target = element(Expected);
+        if (callableFlag(Source, " whole") && !callableFlag(Target, " whole"))
+          fail(N.At, "function pointer must preserve lifecycle_effect(whole)");
+        if (!U.compatibleCallable(Source, Target))
+          fail(N.At, "incompatible function-pointer borrow contract");
+        return {Expected, Match->IR};
       }
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
@@ -728,10 +768,7 @@ std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
       Value View{unconst(From)};
       if (adjust(View, unconst(To), At, false))
         return 1;
-      if (U.Signatures.count(From) && U.Signatures.count(To) &&
-          U.Signatures.at(From) == U.Signatures.at(To) &&
-          (!callableFlag(To, " noexcept") || callableFlag(From, " noexcept")) &&
-          (!callableFlag(From, " whole") || callableFlag(To, " whole")))
+      if (U.compatibleCallable(From, To))
         return 1;
     }
   }

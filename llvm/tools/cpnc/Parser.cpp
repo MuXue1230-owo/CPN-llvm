@@ -110,6 +110,7 @@ class Parser {
   std::vector<Token> Tokens;
   size_t Pos = 0;
   std::set<std::string> Types;
+  std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
   unsigned Depth = 0;
   struct Nest {
@@ -200,15 +201,16 @@ class Parser {
              T.Text == "destroy_base" || T.Text == "abandon_base" ||
              T.Text == "transfer_destruction" || T.Text == "std::forward")))) {
         auto Start = Pos;
+        std::string Canonical;
         std::vector<Node> Args;
         if (T.Text == "destroy_base" || T.Text == "abandon_base") {
           expect("<");
           Args.push_back(baseSelector());
           closeAngle();
         } else
-          Args = templateArgs(T.Text);
+          Args = templateArgs(T.Text, &Canonical);
         if (!Application || is("::") || Types.count(T.Text))
-          T.Text += spelling(Start);
+          T.Text += Canonical.empty() ? spelling(Start) : Canonical;
         else {
           Application->ExplicitApplication = true;
           Application->TemplateArgs = std::move(Args);
@@ -230,7 +232,7 @@ class Parser {
   bool known(StringRef S) const {
     S.consume_front("::");
     return builtin(S) || Types.count(S.split('<').first.str()) ||
-           S == "const" || S == "function";
+           S == "const" || S == "function" || S == "decltype";
   }
   std::string spelling(size_t Start) const {
     std::string S;
@@ -247,14 +249,20 @@ class Parser {
     } else
       expect(">");
   }
-  std::vector<Node> templateArgs(const std::string &Name) {
+  std::vector<Node> templateArgs(const std::string &Name,
+                                 std::string *Canonical = nullptr) {
     expect("<");
+    if (Canonical)
+      *Canonical = "<";
     std::vector<Node> Out;
-    if (eat(">"))
+    if (eat(">")) {
+      if (Canonical)
+        *Canonical += ">";
       return Out;
+    }
     auto It = Families.find(Name);
     do {
-      size_t I = Out.size();
+      size_t I = Out.size(), Begin = Pos;
       bool T = It != Families.end() && !It->second.empty()
                    ? It->second[std::min(I, It->second.size() - 1)].K ==
                          Node::TypeParam
@@ -265,9 +273,18 @@ class Parser {
         Out.push_back(A);
       } else
         Out.push_back(expr(1, true));
+      if (Canonical) {
+        if (I)
+          *Canonical += ",";
+        *Canonical += T ? Out.back().Type : spelling(Begin);
+      }
       Out.back().Pack = eat("...");
+      if (Canonical && Out.back().Pack)
+        *Canonical += "...";
     } while (eat(","));
     closeAngle();
+    if (Canonical)
+      *Canonical += ">";
     return Out;
   }
   std::string type() {
@@ -277,36 +294,67 @@ class Parser {
     if (eat("(")) {
       S = type();
       expect(")");
+    } else if (eat("decltype")) {
+      expect("(");
+      Node Query(Node::TypeQuery, T);
+      Query.Children.push_back(expr());
+      expect(")");
+      S = "$decltype." + std::to_string(T.Line) + "." +
+          std::to_string(T.Column);
+      Query.Text = S;
+      TypeQueries[S] = std::move(Query);
     } else if (eat("const")) {
       expect("<");
       S = "const<" + type() + ">";
       closeAngle();
     } else if (eat("function")) {
       expect("<");
-      S = "function<" + type() + "(";
-      expect("(");
-      bool First = true;
-      if (!eat(")")) {
-        do {
-          if (!First)
-            S += ",";
-          First = false;
-          S += type();
-          if (identifier(peek().Text))
-            name();
-          if (is("("))
-            fail(peek(), "callable type cannot contain a parameter default");
-        } while (eat(","));
-        expect(")");
+      auto Return = type();
+      S = "function<" + Return + "(";
+      auto Parameters = params();
+      std::map<std::string, unsigned> Named;
+      for (size_t I = 0; I < Parameters.size(); ++I) {
+        const auto &P = Parameters[I];
+        if (!P.Children.empty())
+          fail(P.At, "callable type cannot contain a parameter default");
+        if (StringRef(P.Type).starts_with("forward "))
+          fail(P.At, "forward requires a generic function declaration");
+        if (!P.Text.empty() && !Named.emplace(P.Text, I).second)
+          fail(P.At, "duplicate parameter in callable type");
+        if (I)
+          S += ",";
+        S += P.Type;
+        if (P.Pack)
+          S += "...";
       }
       S += ")";
       if (eat("noexcept"))
         S += " noexcept";
+      std::set<unsigned> NoEscape, Borrowed;
       for (const auto &[Key, Value] : attributes()) {
-        if (Key != "lifecycle_effect")
+        if (Key == "lifecycle_effect") {
+          S += " whole";
+          continue;
+        }
+        if (Key != "noescape" && Key != "returns_borrowed_from")
           fail(T, "invalid callable type attribute");
-        S += " whole";
+        if (Key == "returns_borrowed_from" &&
+            !StringRef(Return).ends_with("&") &&
+            !StringRef(Return).ends_with("*"))
+          fail(T, "borrowed return requires a pointer or reference result");
+        llvm::SmallVector<StringRef> List;
+        StringRef(Value).split(List, ',');
+        for (auto Name : List) {
+          auto It = Named.find(Name.str());
+          if (It == Named.end() ||
+              (!StringRef(Parameters[It->second].Type).ends_with("&") &&
+               !StringRef(Parameters[It->second].Type).ends_with("*")))
+            fail(T,
+                 "borrow contract must name a pointer or reference parameter");
+          (Key == "noescape" ? NoEscape : Borrowed).insert(It->second);
+        }
       }
+      S += borrowEffects(NoEscape, Borrowed);
       closeAngle();
       S += ">";
     } else {
@@ -1309,6 +1357,8 @@ public:
     std::vector<Node> V;
     while (!is(""))
       V.push_back(declaration());
+    for (auto &[Key, Query] : TypeQueries)
+      V.push_back(std::move(Query));
     return V;
   }
   Node expression() {

@@ -86,6 +86,7 @@ struct Node {
     TypeParam,
     ValueParam,
     TypeArg,
+    TypeQuery,
     Alias,
     Record,
     Field,
@@ -115,6 +116,8 @@ struct Node {
   Node() = default;
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
+std::string borrowEffects(const std::set<unsigned> &NoEscape,
+                          const std::set<unsigned> &Borrowed);
 std::vector<Node> parse(llvm::StringRef, const Options &);
 Node parseExpression(llvm::StringRef, const Options &);
 void configure(Options &, const Node &);

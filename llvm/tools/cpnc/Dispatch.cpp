@@ -100,7 +100,7 @@ void Context::buildTables(const std::string &Name,
     if (It != R.Virtuals.end()) {
       if (!Override || (*It)->Decl.Settings.count("final") ||
           ((*It)->Decl.Noexcept && !D->Decl.Noexcept) ||
-          (*It)->Result != D->Result)
+          !compatibleCallable(callableType(*D), callableType(**It)))
         fail(D->Decl.At, "invalid override of inherited virtual slot");
       D->Slot = It - R.Virtuals.begin();
       *It = D;
@@ -258,6 +258,10 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   std::vector<llvm::Type *> Types;
   std::vector<llvm::Value *> Vals;
   auto *Storage = resultAddress(Sig.front(), At);
+  auto Flags = callableFlags(T);
+  std::set<unsigned> Origins;
+  std::string StorageOrigin;
+  unsigned Sources = 0;
   if (Storage) {
     Types.push_back(B.getPtrTy());
     Vals.push_back(Storage);
@@ -266,6 +270,11 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
     Types.push_back(U.aggregate(Sig[I + 1]) ? B.getPtrTy() : U.ir(Sig[I + 1]));
     auto &Param = Sig[I + 1];
     auto V = eval(Args[I], Param);
+    if (Flags.count("borrow#" + std::to_string(I))) {
+      Origins.insert(V.Origins.begin(), V.Origins.end());
+      StorageOrigin = V.Storage;
+      ++Sources;
+    }
     if (llvm::StringRef(Param).ends_with("&"))
       Vals.push_back(bindReference(V, Param, At).Address);
     else {
@@ -278,5 +287,9 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto *Before = wholeEpoch();
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
   propagateWhole(Before);
-  return callResult(Sig[0], Call, At, Storage);
+  auto Result = callResult(Sig[0], Call, At, Storage);
+  Result.Origins = std::move(Origins);
+  if (Sources == 1)
+    Result.Storage = std::move(StorageOrigin);
+  return Result;
 }

@@ -129,6 +129,10 @@ Value Frame::closurePointer(const Value &Source, const std::string &T,
     fail(At, "closure signature is incompatible with function pointer");
   if (!callableFlag(Contract, " whole"))
     U.RestrictedPointers.emplace_back(&Op, At);
+  if (!U.compatibleCallable(U.callableType(Op), Contract))
+    fail(At, Op.MayWhole && !callableFlag(Contract, " whole")
+                 ? "function pointer must preserve lifecycle_effect(whole)"
+                 : "incompatible closure borrow contract");
   if (!R.ClosureEntry) {
     // The native entry omits the receiver. Preserve the result slot and
     // parameter objects supplied by the indirect caller.

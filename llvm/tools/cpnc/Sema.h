@@ -155,6 +155,7 @@ struct Context {
   void checkNormalForm(const Node &);
   void checkDomain(const Node &, const std::string &);
 
+  std::map<std::string, Node> TypeQueries;
   std::map<std::string, Family> Families;
   std::map<std::string, std::vector<Family>> Specializations;
   std::map<std::string, std::deque<Family>> FunctionFamilies;
@@ -189,6 +190,8 @@ struct Context {
               const Substitution & = {});
   void record(const Node &, const std::string &, const std::string &,
               const Substitution &);
+  std::string callableType(const Function &);
+  bool compatibleCallable(const std::string &From, const std::string &To) const;
   void unit(const std::vector<Node> &, std::string Prefix = "");
   void emit(Function &);
   void emitBody(Function &, llvm::Function *, bool);
@@ -209,6 +212,7 @@ inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
+std::set<llvm::StringRef> callableFlags(llvm::StringRef);
 std::vector<std::string> splitArguments(llvm::StringRef);
 bool betterTypePattern(const Node &, const Node &);
 bool betterPattern(const Node &, const Node &);
@@ -296,6 +300,7 @@ public:
   Value eval(const Node &, std::string Expected = "",
              llvm::Value *Dest = nullptr);
   Value constantEval(const Node &);
+  std::string unevaluatedType(const Node &, bool IncludeCategory);
   Value floatingConvert(Value, const std::string &, const Token &,
                         bool Explicit = false);
   Value floatingBinary(const Node &, Value, Value,

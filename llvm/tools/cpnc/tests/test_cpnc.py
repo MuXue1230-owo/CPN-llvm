@@ -42,6 +42,42 @@ class CompilerTests(unittest.TestCase):
         subprocess.run([*cmd, "-o", exe], check=True)
         return subprocess.run([exe], cwd=self.dir).returncode
 
+    def test_decltype_uses_lexical_binding_and_preserves_category(self):
+        self.assertEqual(
+            self.program("""
+            i32 calls; i32 next(){++calls;return 10;}
+            struct S{i32 n;};generic<type T> struct Box{T value;};
+            generic<type T> i32 query(T& v){
+              decltype(v) ref(v);ref+=1;
+              return SameType<decltype(std::move(v)),T&&> ? 1 : 0;
+            }
+            i32 main(){i32 v(40);const i32 c(0);S item(1);
+              decltype(next()) result(0);Box<decltype(next())> box(0);
+              decltype(item.n) field(item.n);++field;
+              if(!SameType<decltype(c),const<i32>&> || field!=2 || calls!=0){return 1;}
+              if(query(v)!=1 || calls!=0){return 2;}return v+1;
+            }"""),
+            42,
+        )
+
+    def test_callable_type_queries_preserve_parameter_contracts(self):
+        src = """
+            [[noescape(a),returns_borrowed_from(a)]] i32& id(i32& a) noexcept{return a;}
+            alias Pointer=decltype(id)*;
+            alias Renamed=function<i32&(i32& value) noexcept [[returns_borrowed_from(value),noescape(value)]]>*;
+            i32 main(){Pointer p(&id);i32 n(40);p(n)+=2;
+              return SameType<decltype(&id),Renamed> && SameType<Pointer,Renamed> ? n : 1;}
+        """
+        self.assertEqual(self.program(src), 42)
+        for src in (
+            "i32& f(i32& x){return x;}void g(){function<i32&(i32& a) [[noescape(a)]]>* p(&f);}",
+            "i32 f(i32 x){return x;}i64 f(i64 x){return x;}alias T=decltype(f);",
+            "void f(){decltype(unknown()) x;}",
+            "alias P=function<void(i32* a) [[noescape(missing)]]>*;",
+            "[[noescape(x)]] i32* f(i32* x){return x;}",
+        ):
+            self.assertNotEqual(self.compile(src, "--check").returncode, 0, src)
+
     def test_empty_arrays_and_extent_pointer_arithmetic(self):
         self.assertEqual(
             self.program("""
