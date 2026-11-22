@@ -25,12 +25,18 @@ void Context::tagged(const Node &D, const std::string &Name,
     if (nestedType(Decl, Name, F))
       continue;
     if (Decl.K != Node::Variant) {
+      if (Decl.K == Node::Field && Decl.Settings.count("storage") &&
+          Decl.Settings.at("storage") == "static") {
+        if (!StaticMembers
+                 .emplace(Name + "::" + Decl.Text, std::make_pair(Name, Decl))
+                 .second)
+          fail(Decl.At, "duplicate static member");
+        continue;
+      }
       if (Decl.K == Node::Field || Decl.K == Node::Init ||
           Decl.Settings.count("virtual"))
         fail(Decl.At,
              "union members cannot add common fields or virtual bases");
-      if (Decl.K == Node::Constructor && !Decl.Settings.count("control"))
-        fail(Decl.At, "authored union constructors are unavailable");
       if (Decl.Text == "operator=" && Decl.Settings.count("control") &&
           Decl.Settings.at("control") == "default")
         fail(Decl.At,
@@ -65,6 +71,21 @@ void Context::tagged(const Node &D, const std::string &Name,
   R.Layer = R.IR;
   R.Complete = true;
   declareMembers(Name, Name + "::");
+  // Default case viability is a declaration requirement, even if the root
+  // unit never default-constructs this union.
+  if (auto I = DefaultCase.find(Name); I != DefaultCase.end()) {
+    auto &Case = Cases.at(I->second);
+    if (!Case.Types.empty()) {
+      auto *Probe = llvm::Function::Create(
+          llvm::FunctionType::get(F.B.getVoidTy(), false),
+          llvm::GlobalValue::InternalLinkage, "cpn.union.default.check", M);
+      Frame Check(*this, nullptr, Probe, Name + "::");
+      Check.B.SetInsertPoint(Check.block("entry"));
+      Check.variant(Case, {}, Case.Decl.At, Check.allocate(Name, Case.Decl.At),
+                    true);
+      Probe->eraseFromParent();
+    }
+  }
 }
 
 const Case *Frame::findCase(const std::string &Name, const Token &At) {
@@ -125,6 +146,35 @@ void Frame::visitPayload(Value Object,
   B.SetInsertPoint(End);
 }
 
+void Frame::transferPayload(Value Source, llvm::Value *Dest,
+                            SpecialOperation Op, const Token &At) {
+  auto *Ty = U.ir(Source.Type);
+  visitPayload(Source, [&](const Case &C) {
+    for (size_t I = 0; I < C.Types.size(); ++I)
+      transfer({C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
+                Source.Readonly || C.Decl.Params[I].Const},
+               payloadAddress(C, Dest, I), Op, At);
+    B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(Ty, Dest, 0));
+  });
+}
+
+void Frame::beginUnionConstructor() {
+  const auto &R = U.Records.at(F->Owner);
+  for (auto Op :
+       {SpecialOperation::CopyConstruct, SpecialOperation::MoveConstruct}) {
+    auto I = R.Special.find(Op);
+    if (I != R.Special.end() && I->second.Body == F) {
+      Value Source{F->Owner, nullptr, IR->getArg(1),
+                   Op == SpecialOperation::CopyConstruct};
+      transferPayload(Source, Self.Address, Op, F->Decl.At);
+      return;
+    }
+  }
+  auto Default = U.DefaultCase.find(F->Owner);
+  if (Default == U.DefaultCase.end())
+    fail(F->Decl.At, "union construction requires a selected case");
+  variant(U.Cases.at(Default->second), {}, F->Decl.At, Self.Address, true);
+}
 void Frame::dropPayload(Value Object) {
   visitPayload(Object, [&](const Case &C) {
     for (size_t I = C.Types.size(); I; --I)

@@ -59,7 +59,10 @@ Value Frame::lookup(const Token &T) {
       return U.Globals.at(Key);
     }
   }
-  auto Key = scopeKey(Prefix, T.Text,
+  std::string Tail, Name = T.Text;
+  if (auto Owner = memberQualifier(Name, T, Tail))
+    Name = *Owner + "::" + Tail;
+  auto Key = scopeKey(Prefix, Name,
                       [&](const std::string &K) { return U.Globals.count(K); });
   if (!Key.empty()) {
     auto Qualified = llvm::StringRef(Key);
@@ -169,6 +172,8 @@ void Frame::bindParams() {
     }
     if (carriesPointerBounds(T))
       V.BoundsCell = incomingPointerCell(J + 1);
+    else if (ends(T, "&"))
+      readReferent(V, incomingPointerCell(J + 1));
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
     if (!P.Text.empty())
@@ -517,10 +522,15 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           P.Storage.clear();
         }
       }
-      P.Lower = V.ElementLower ? V.ElementLower : V.Address;
+      auto *End = B.CreateGEP(U.ir(V.Type), V.Address, B.getInt64(1));
+      P.Lower = V.ElementLower
+                    ? B.CreateSelect(B.CreateIsNotNull(V.ElementLower),
+                                     V.ElementLower, V.Address)
+                    : V.Address;
       P.Upper = V.ElementUpper
-                    ? V.ElementUpper
-                    : B.CreateGEP(U.ir(V.Type), V.Address, B.getInt64(1));
+                    ? B.CreateSelect(B.CreateIsNotNull(V.ElementUpper),
+                                     V.ElementUpper, End)
+                    : End;
       return P;
     }
     if (Op == "*")
@@ -615,10 +625,33 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         return V;
       };
       std::vector<Value> YesTemps, NoTemps;
+      auto EntryState = Active;
+      auto EntryPositions =
+          Transaction ? Transaction->positions() : Construction::Positions{};
       auto X = arm(1, Yes, YesTemps);
       auto *EndYes = B.GetInsertBlock();
+      auto YesState = Active;
+      auto YesPositions =
+          Transaction ? Transaction->positions() : Construction::Positions{};
+      Active = std::move(EntryState);
+      if (Transaction)
+        Transaction->restore(EntryPositions);
       auto Y = arm(2, No, NoTemps);
       auto *EndNo = B.GetInsertBlock();
+      if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(C.IR)) {
+        if (!Known->isZero()) {
+          Active = std::move(YesState);
+          if (Transaction)
+            Transaction->restore(YesPositions);
+        }
+      } else {
+        joinStorage(YesState);
+        if (Transaction) {
+          auto Joined = Transaction->positions();
+          Joined.insert(YesPositions.begin(), YesPositions.end());
+          Transaction->restore(Joined);
+        }
+      }
       auto T = X.Type == "integer" ? Y.Type : X.Type;
       if (T == "integer")
         T = Expected.empty() ? Opt.DefaultInt : Expected;
@@ -675,6 +708,31 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         if (V.Prvalue && V.Address != Dest)
           Temps.push_back(V);
       }
+      auto metadata = [&](llvm::Value *Left,
+                          llvm::Value *Right) -> llvm::Value * {
+        if (!Left && !Right)
+          return nullptr;
+        auto *Zero =
+            llvm::Constant::getNullValue((Left ? Left : Right)->getType());
+        return merge(Left ? Left : Zero, Right ? Right : Zero);
+      };
+      V.Lower = metadata(X.Lower, Y.Lower);
+      V.Upper = metadata(X.Upper, Y.Upper);
+      V.ElementLower = metadata(X.ElementLower, Y.ElementLower);
+      V.ElementUpper = metadata(X.ElementUpper, Y.ElementUpper);
+      V.ArraySlot = metadata(X.ArraySlot, Y.ArraySlot);
+      V.ArrayGeneration = metadata(X.ArrayGeneration, Y.ArrayGeneration);
+      V.Slot = metadata(X.Slot, Y.Slot);
+      V.Generation = metadata(X.Generation, Y.Generation);
+      if (X.BoundsCell && Y.BoundsCell)
+        V.BoundsCell = merge(X.BoundsCell, Y.BoundsCell);
+      if (X.Storage == Y.Storage)
+        V.Storage = X.Storage;
+      if (X.ExtentType == Y.ExtentType)
+        V.ExtentType = X.ExtentType;
+      V.Subobject = X.Subobject || Y.Subobject;
+      V.Origins = X.Origins;
+      V.Origins.insert(Y.Origins.begin(), Y.Origins.end());
       return V;
     }
     if (assignment(Op)) {
@@ -1519,19 +1577,30 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (auto Direct = directConstruction(Args[0], T, Dest))
       return *Direct;
   if (U.Variants.count(T)) {
-    if (Args.empty() && U.DefaultCase.count(T)) {
-      auto V = variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Dest, true);
-      runConstructionTail(V, Tail);
-      return V;
-    }
-    if (Args.size() != 1)
-      fail(At, "union construction requires a selected case");
-    const auto &Arg = Args.front();
     if (!IR)
       fail(At, "union construction requires object storage");
     auto *Ptr = Dest ? Dest : allocate(T, At);
-    auto V = convert(eval(Arg, T, Ptr), T, At);
-    materialize(V, At, Ptr);
+    auto Group = visibleOverloads(T + "::$ctor");
+    auto A = evaluateArguments(
+        Args, Group.size() == 1 ? Group.front() : nullptr, {T, nullptr, Ptr});
+    if (A.Values.size() == 1 && A.Values[0].Type == T) {
+      materialize(A.Values.front(), At, Ptr);
+    } else if (Args.empty() &&
+               !llvm::any_of(Group,
+                             [](const Function *D) {
+                               return D->Params.empty() ||
+                                      !D->Decl.Params.front().Children.empty();
+                             }) &&
+               U.DefaultCase.count(T)) {
+      variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Ptr, true);
+    } else {
+      if (Group.empty())
+        fail(At, "union construction requires a selected case");
+      Value Receiver{T, nullptr, Ptr};
+      auto *D = select("$ctor", Node(Node::Name, At), A.Values, Receiver);
+      admitArguments(A, D, At);
+      invoke(*D, std::move(A.Values), At, Receiver, true);
+    }
     Value Result{T, nullptr, Ptr};
     runConstructionTail(Result, Tail);
     Result.IR = B.CreateLoad(Ty, Ptr);
@@ -2037,6 +2106,10 @@ void Frame::stmt(const Node &N) {
   }
   if (N.K == Node::Init || N.K == Node::Empty)
     return;
+  if (N.K == Node::Record || N.K == Node::Enumeration || N.K == Node::Union) {
+    localType(N);
+    return;
+  }
   if (N.K == Node::Alias) {
     auto &Scope = Scopes.back();
     auto Type = resolve(N.Type, N.At);

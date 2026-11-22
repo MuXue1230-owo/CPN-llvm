@@ -144,6 +144,7 @@ struct Context {
   std::map<std::string, std::string> Aliases, Enums;
   std::map<std::string, Node::Kind> Declarations;
   std::set<std::string> DefinedEnums;
+  std::set<std::pair<std::string, SourcePosition>> LocalTypeSites;
   std::map<std::string, Record> Records;
   std::map<std::string, std::pair<std::string, Node>> StaticMembers,
       MemberTypes;
@@ -244,6 +245,7 @@ bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);
 unsigned width(const std::string &T);
 struct Local {
+  std::map<std::string, Node::Kind> Nominals;
   std::map<std::string, std::string> Aliases;
   std::map<std::string, Value> Names;
   std::vector<Value> Drops;
@@ -263,6 +265,7 @@ struct PointerCall {
   llvm::Value *Previous = nullptr, *Rows = nullptr;
 };
 bool carriesPointerBounds(const std::string &);
+bool carriesBorrow(const std::string &);
 void forwardPointerCall(llvm::IRBuilder<> &, llvm::Function *,
                         llvm::Function *);
 struct CallArguments {
@@ -324,6 +327,8 @@ public:
   Value convert(Value, const std::string &, const Token &);
   Value pointerBinary(const Node &, Value, Value);
   llvm::StructType *pointerMetadataType();
+  void readBounds(Value &, llvm::Value *);
+  void readReferent(Value &, llvm::Value *);
   llvm::Value *IncomingPointerRows = nullptr;
   void receivePointerCall();
   llvm::Value *incomingPointerCell(size_t);
@@ -379,6 +384,7 @@ public:
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
                   bool AsBase = false);
+  void localType(const Node &);
   void runConstructionTail(Value, const Node *, bool BoundSlots = false);
   void checkAccess(const Node &, const std::string &Owner, const Token &);
   Function *checkSelected(Function *, const Token &);
@@ -427,6 +433,8 @@ public:
                 llvm::Value *Dest = nullptr, bool Default = false);
   void visitPayload(Value, llvm::function_ref<void(const Case &)>);
   void dropPayload(Value);
+  void transferPayload(Value, llvm::Value *, SpecialOperation, const Token &);
+  void beginUnionConstructor();
   llvm::Value *payloadAddress(const Case &, llvm::Value *, unsigned);
   void match(const Node &);
   llvm::Value *fieldAddress(Value, unsigned);

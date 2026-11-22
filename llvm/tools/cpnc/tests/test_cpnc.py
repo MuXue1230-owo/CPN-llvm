@@ -99,7 +99,7 @@ class CompilerTests(unittest.TestCase):
               Count read(){return data.value;}
             };
           }
-          constraint HasCount<type T> {type T::Count;};
+          constraint HasCount<type T> {type T::Count; expression(T& x){x.read() -> T::Count;}};
           class Hidden { alias Count=i8; };
           generic<type T> requires(HasCount<T>) T::Count read(T& value){
             return value.read();}
@@ -207,6 +207,157 @@ class CompilerTests(unittest.TestCase):
             "struct S{i32 x -> {init missing(1);};};void f(){S s;}",
         ):
             self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_dependent_member_index_and_call_witnesses(self):
+        self.assertEqual(
+            self.program("""
+          struct View {i32 n; i32 operator[](i32 i){return n+i;} i32 plus(i32 x){return n+x;}};
+          constraint Readable<type T> {
+            expression(T& v,i32 i) {v.n -> i32&; v[i] -> i32; v.plus(i) -> i32;}
+          };
+          generic<type T> requires(Readable<T>) i32 read(T& v,i32 i) {
+            return v.n + v[i] + v.plus(i);
+          }
+          i32 main(){View v(12);return read(v,3);}
+        """),
+            42,
+        )
+        for expr in ("x.missing", "x.missing(1)", "x[i]", "x(i)", "p->missing"):
+            r = self.compile(
+                "generic<type T> i32 bad(T& x,T* p,i32 i){return " + expr + ";}",
+                "--check",
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("declared constraints", r.stderr)
+        r = self.compile(
+            """
+          constraint WithMember<type T>{expression(T& v){v.n -> i32&;}};
+          generic<type T> requires(WithMember<T>) i32 wrong(T& x){return x.other;}
+        """,
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("declared constraints", r.stderr)
+
+    def test_authored_union_copy_move_default_and_static_member(self):
+        self.assertEqual(
+            self.program("""
+            i32 copies; i32 moves; i32 dropped;
+            struct Cell {i32 n; Cell(i32 v){init n(v);}
+              Cell(const<Cell>& c){init n(c.n);++copies;}
+              Cell(Cell&& c){init n(c.n);++moves;} ~Cell(){++dropped;}};
+            union U {default case Empty;case Data(Cell c);
+              static i32 visits;
+              U(i32 n){visits+=n;}
+              U(const<U>& other){++visits;} declare U(U&& other);
+              i32 get() const {match(*this){case U::Empty{return 0;}
+                                            case U::Data(ref v){return v.n;}}}
+            };
+            U::U(U&& other){++visits;}
+            i32 main(){i32 got;
+              {U d(1); U a(U::Data(Cell(42))); U b(a); U c(std::move(b));U empty(d);
+               got=c.get();if(d.get()!=0 || empty.get()!=0){return 0;}}
+              return copies==1 && moves==1 && dropped==3 && U::visits==4 ? got : 1;}
+        """),
+            42,
+        )
+        for source in (
+            "enum E:i8{case One(1)};union U{default case Missing(E e);};",
+            "struct X{X(const<X>& o)=delete;};union U{case D(X x);U(const<U>& y){}};",
+        ):
+            self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_conditional_construction_and_pointer_state(self):
+        self.assertEqual(
+            self.program("""
+          i32 defaults;
+          struct Item {i32 n;Item(){++defaults;}Item(i32 x){init n(x);}
+                       Item& operator=(const<Item>& x)=delete;};
+          struct One {Item item;
+            [[initializes(item)]] i32 fill(i32 x){item=Item(x);return x;}
+            One(bool flag){i32 k(flag?fill(20):fill(22));}
+          };
+          i32 main(){One a(true);One b(false);return defaults==0?a.item.n+b.item.n:0;}
+        """),
+            42,
+        )
+        for choice, expected in (("true", 42), ("false", -4)):
+            self.assertEqual(
+                self.program(
+                    """
+              i32* pick(bool choose,i32* a,i32* b){return choose?a:b;}
+              i32 main(){i32[2] a(1,42);i32[1] b(2);
+                auto p(pick(CHOICE,&a[0],&b[0]));return *(p+1);}
+            """.replace("CHOICE", choice)
+                ),
+                expected,
+            )
+
+    def test_special_member_attribute_positions(self):
+        self.assertEqual(
+            self.program("""
+          struct X{[[lifecycle_effect(whole)]] X(){} [[lifecycle_effect(whole)]] ~X(){}};
+          i32 main(){X value;return 42;}
+        """),
+            42,
+        )
+        for source in (
+            "[[lifecycle_effect(whole)]] configured(numeric.integer.overflow=checked) void f(){}",
+            "struct X{[[initializes(x)]] X(){}i32 x;};",
+        ):
+            self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_block_nominal_declarations_and_distinct_owners(self):
+        self.assertEqual(
+            self.program("""
+            i32 main(){
+              alias Number=i32;
+              declare struct Local;
+              alias Before=Local*;
+              struct Local{Number n;Local* self;Local(Number v){init n(v);init self(this);}
+                Number read() const{return n;}};
+              enum State:i8{case Ready(0),case Other(1)};
+              union Value{case Some(Number n);default case None;};
+              Local l(40);Before pointer(&l);
+              State s(State::Ready);Value v(Value::Some(2));
+              {struct Local{i8 n;};Local inner(1);if(inner.n!=1){return 1;}}
+              if(s!=State::Ready || pointer!=l.self){return 0;}
+              match(v){case Value::Some(value x){return pointer->read()+x;}
+                       case Value::None{return 1;}}
+            }
+        """),
+            42,
+        )
+        for source in (
+            "void f(){{struct A{};}A out;}",
+            "void f(){struct A{};i32 A;}",
+            "void f(){declare struct A; union A{case Empty;};}",
+        ):
+            self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_reference_arguments_and_results_preserve_element_extent(self):
+        self.assertEqual(
+            self.program("""
+          [[returns_borrowed_from(x)]] i32& ref(i32& x){return x;}
+          i32 next(i32& x){return *(&x+1);}
+          i32 main(){i32[3] a(4,5,42);return next(ref(a[1]));}
+        """),
+            42,
+        )
+        for last in ("return next(ref(a[1]));", "return read(a[0],replace(a[0]));"):
+            self.assertEqual(
+                self.program(
+                    """
+              [[returns_borrowed_from(x)]] i32& ref(i32& x){return x;}
+              i32 next(i32& x){return *(&x+1);}
+              i32 read(i32& x,i32 ignored){return x;}
+              i32 replace(i32& x){auto cap(storage_of(x));destroy(x);
+                construct_at<i32>(cap,42);return 0;}
+              i32 main(){i32[2] a(7,8);BODY}
+            """.replace("BODY", last)
+                ),
+                -4,
+            )
 
     def test_construction_state_contracts_and_deferred_producers(self):
         self.assertEqual(
@@ -1263,7 +1414,8 @@ class CompilerTests(unittest.TestCase):
                 i32 kind() & {return 1;}
                 i32 kind() && {return 2;}
             };
-            generic<type T> i32 kind(forward T v){return std::forward<T>(v).kind();}
+            generic<type T> requires(SameType<T,R&> || SameType<T,R>)
+            i32 kind(forward T v){return std::forward<T>(v).kind();}
             i32 main(){
                 R r;
                 return nested(10,11,12)+constants<1,2,3>()+relay()+kind(r)+kind(R());
@@ -1286,7 +1438,8 @@ class CompilerTests(unittest.TestCase):
     def test_compile_time_branch_and_definition_lookup(self):
         self.assertEqual(
             self.program("""
-            generic<const bool Field, type T> i32 read(T value) {
+            constraint HasN<type T>{expression(T& v){v.n -> i32&;}};
+            generic<const bool Field, type T> requires(!Field || HasN<T>) i32 read(T value) {
                 if constexpr (Field) { return value.n; }
                 else { return value; }
             }
@@ -1555,7 +1708,8 @@ class CompilerTests(unittest.TestCase):
     def test_closure_captures_and_mutable_receiver(self):
         self.assertEqual(
             self.program("""
-            generic<type F> i32 invoke(F& fn,i32 v){return fn(v);}
+            constraint Invocable<type F>{expression(F& fn,i32 arg){fn(arg) -> i32;}};
+            generic<type F> requires(Invocable<F>) i32 invoke(F& fn,i32 v){return fn(v);}
             struct Seed {
               i32 seed;
               i32 read() const {

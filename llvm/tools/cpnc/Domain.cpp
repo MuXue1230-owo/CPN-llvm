@@ -1,11 +1,11 @@
 #include "Sema.h"
-#include <tuple>
 using namespace cpn;
 namespace {
 using Bindings = std::map<std::string, std::string>;
-using Operation = std::tuple<std::string, std::string, std::string>;
+using Operation = std::pair<std::string, std::vector<std::string>>;
 struct Domain {
   Bindings Equal;
+  std::map<std::string, bool> Predicates;
   std::map<Operation, std::string> Operations;
 };
 using Alternatives = std::vector<Domain>;
@@ -26,6 +26,8 @@ std::string operatorKey(const Node &N) {
 }
 
 std::string valueType(std::string T) {
+  if (llvm::StringRef(T).starts_with("forward "))
+    T.erase(0, 8);
   while (llvm::StringRef(T).ends_with("&"))
     T.pop_back();
   if (llvm::StringRef(T).starts_with("const<") && T.back() == '>')
@@ -56,6 +58,8 @@ struct Checker {
   }
   std::string operand(const Node &E, const Bindings &Scope) const {
     if (E.K == Node::Name) {
+      if (E.Text == "true" || E.Text == "false")
+        return "bool";
       auto I = Scope.find(E.Text);
       return I == Scope.end() ? "" : valueType(I->second);
     }
@@ -63,10 +67,56 @@ struct Checker {
       return "integer";
     if (E.K == Node::Real)
       return "real";
-    if (E.K == Node::Call && E.Children[0].K == Node::Name &&
-        (builtin(E.Children[0].Text) || Parameters.count(E.Children[0].Text)))
-      return E.Children[0].Text;
+    if (E.K == Node::Call && E.Children[0].K == Node::Name) {
+      const auto &C = E.Children[0];
+      if (builtin(C.Text) || Parameters.count(C.Text))
+        return C.Text;
+      if ((C.Text == "std::move" || C.Text == "std::forward") &&
+          E.Children.size() == 2)
+        return operand(E.Children[1], Scope);
+    }
     return "";
+  }
+
+  // A method designator is bound together with its arguments. It does not
+  // independently require a data field with the same spelling.
+  template <class Child>
+  static std::optional<Operation> operation(const Node &N,
+                                            const Bindings &Scope, Child type) {
+    const auto &A = N.Children;
+    Operation Op;
+    if (N.K == Node::Call) {
+      const auto &C = A.front();
+      if (C.K == Node::Member) {
+        Op.first = "." + C.Text + "()";
+        Op.second.push_back(type(C.Children.front()));
+        if (C.Definition && llvm::StringRef(Op.second.front()).ends_with("*"))
+          Op.second.front().pop_back();
+      } else if (C.K == Node::Name && Scope.count(C.Text)) {
+        Op.first = "()";
+        Op.second.push_back(type(C));
+      } else
+        return {};
+      for (const auto &Arg : llvm::ArrayRef(A).drop_front())
+        Op.second.push_back(type(Arg));
+      return Op;
+    }
+    if (N.K == Node::Member) {
+      Op.first = "." + N.Text;
+      Op.second.push_back(type(A.front()));
+      if (N.Definition && llvm::StringRef(Op.second.front()).ends_with("*"))
+        Op.second.front().pop_back();
+      return Op;
+    }
+    if (N.K == Node::Index)
+      Op.first = "[]";
+    else if (needsWitness(N))
+      Op.first = operatorKey(N);
+    else
+      return {};
+    for (const auto &Arg : A)
+      Op.second.push_back(type(Arg));
+    return Op;
   }
 
   Alternatives refine(const Node &Q, bool True, Alternatives Alts,
@@ -114,6 +164,12 @@ struct Checker {
       return Alts;
     }
     auto *C = Names.constraint(Q.Text);
+    if (!C && Variables.count(Q.Text) && Variables.at(Q.Text) == "bool") {
+      llvm::erase_if(Alts, [&](Domain &D) {
+        auto [I, New] = D.Predicates.emplace(Q.Text, True);
+        return !New && I->second != True;
+      });
+    }
     if (!True || !C)
       return Alts;
     Bindings Actual;
@@ -133,14 +189,12 @@ struct Checker {
       Bindings Locals;
       for (auto &P : R.Params)
         Locals[P.Text] = substitute(P.Type, Actual);
-      for (auto &E : R.Children)
-        if (needsWitness(E)) {
-          Operation Op{operatorKey(E), operand(E.Children[0], Locals),
-                       E.K == Node::Binary ? operand(E.Children[1], Locals)
-                                           : ""};
+      for (auto &E : R.Children) {
+        if (auto Op = operation(
+                E, Locals, [&](const Node &N) { return operand(N, Locals); }))
           for (auto &D : Alts)
-            D.Operations[Op] = substitute(E.Type, Actual);
-        }
+            D.Operations[*Op] = substitute(E.Type, Actual);
+      }
     }
     return Alts;
   }
@@ -162,41 +216,54 @@ struct Checker {
         visit(N.Children[2], refine(N.Children[0], false, Alts));
       return "";
     }
-    std::vector<std::string> Types;
-    for (auto &C : N.Children)
-      Types.push_back(visit(C, Alts));
-    if (N.K == Node::Object)
-      Variables[N.Text] =
-          N.Type == "auto" && !Types.empty() ? Types.front() : N.Type;
-    if (!needsWitness(N) || Types[0].empty() ||
-        (N.K == Node::Binary && Types[1].empty()))
+    auto Op =
+        operation(N, Variables, [&](const Node &C) { return visit(C, Alts); });
+    if (!Op) {
+      std::string First;
+      for (size_t I = 0; I < N.Children.size(); ++I) {
+        auto T = visit(N.Children[I], Alts);
+        if (!I)
+          First = T;
+      }
+      if (N.K == Node::Object)
+        Variables[N.Text] = N.Type == "auto" ? First : N.Type;
       return operand(N, Variables);
-    auto A = Types[0], B = N.K == Node::Binary ? Types[1] : "";
+    }
+    const auto &Types = Op->second;
+    if (llvm::any_of(Types, [](const auto &T) { return T.empty(); }))
+      return "";
     bool Boolean = N.Text == "!" || N.Text == "==" || N.Text == "!=" ||
                    N.Text == "<" || N.Text == ">" || N.Text == "<=" ||
                    N.Text == ">=";
-    if (!Parameters.count(A) && !Parameters.count(B))
-      return Boolean ? "bool" : A == "integer" && !B.empty() ? B : A;
-    auto OpKey = operatorKey(N);
+    bool Intrinsic = needsWitness(N);
     std::string Result;
     for (const auto &D : Alts) {
-      auto X = representative(A, D), Y = representative(B, D);
-      // A concrete binding will undergo ordinary intrinsic/overload checking.
-      if (!Parameters.count(X) && !Parameters.count(Y))
+      bool Dependent = llvm::any_of(Types, [&](const auto &T) {
+        return Parameters.count(representative(T, D));
+      });
+      if (!Dependent)
         continue;
-      auto W = llvm::find_if(D.Operations, [&](auto &Entry) {
-        auto &[Op, Left, Right] = Entry.first;
-        return Op == OpKey && representative(Left, D) == X &&
-               representative(Right, D) == Y;
+      auto W = llvm::find_if(D.Operations, [&](const auto &Entry) {
+        const auto &Other = Entry.first;
+        if (Other.first != Op->first || Other.second.size() != Types.size())
+          return false;
+        for (size_t I = 0; I < Types.size(); ++I)
+          if (representative(Other.second[I], D) != representative(Types[I], D))
+            return false;
+        return true;
       });
       if (W == D.Operations.end())
-        fail(N.At, "dependent operation '" + N.Text +
+        fail(N.At, "dependent operation '" + Op->first +
                        "' is not established by the declared constraints");
       Result = W->second;
     }
     if (!Result.empty())
       return Result;
-    return Boolean ? "bool" : Parameters.count(A) ? A : B;
+    if (!Intrinsic)
+      return "";
+    return Boolean                                     ? "bool"
+           : Types.size() > 1 && Types[0] == "integer" ? Types[1]
+                                                       : Types[0];
   }
 };
 } // namespace

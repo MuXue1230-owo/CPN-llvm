@@ -30,7 +30,17 @@ struct Check {
     if (Names.count(S) || Intrinsics.count(S) || builtin(S) ||
         builtinPredicate(S) || U.Aliases.count(S) || U.Cases.count(S))
       return true;
-    if (!Owner.empty() && U.Records.count(Owner))
+    if (!Owner.empty() && U.Records.count(Owner)) {
+      const auto &R = U.Records.at(Owner);
+      Token T{S};
+      if (S == R.Decl.Text || R.Env.Types.count(S) || R.Env.Values.count(S) ||
+          U.lookupPath(Owner, T, true) || U.lookupPath(Owner, T, false) ||
+          llvm::any_of(R.Decl.Children,
+                       [&](const Node &D) { return D.Text == S; }))
+        return true;
+    }
+    if (Dependent && llvm::StringRef(S).contains("::") &&
+        Names.count(llvm::StringRef(S).split("::").first.str()))
       return true;
     return !scopeKey(Prefix, S, [&](const std::string &Key) {
               return U.Globals.count(Key) || U.Overloads.count(Key) ||
@@ -71,6 +81,10 @@ struct Check {
     }
     if (N.K == Node::Name && !known(N.Text))
       fail(N.At, "unknown name '" + N.Text + "'");
+    if (N.K == Node::Record || N.K == Node::Enumeration || N.K == Node::Union) {
+      Names.insert(N.Text);
+      return;
+    }
     if (N.K == Node::Alias)
       Names.insert(N.Text);
     if (N.K == Node::Object) {
@@ -157,6 +171,10 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
   // Ordinary expressions bind as they are emitted. Check discarded arms and
   // dependent definitions here since neither necessarily has a runtime entry.
   std::function<void(const Node &)> collect = [&](const Node &S) {
+    if (S.K == Node::Record || S.K == Node::Enumeration || S.K == Node::Union) {
+      Ch.Names.insert(S.Text);
+      return;
+    }
     if (S.K == Node::Object || S.K == Node::Alias)
       Ch.Names.insert(S.Text);
     if (S.K == Node::If && S.Required) {

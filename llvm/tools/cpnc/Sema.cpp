@@ -140,22 +140,24 @@ cpn::Value Frame::load(cpn::Value V) {
                ? snapshot(V)
                : B.CreateLoad(U.ir(V.Type), V.Address);
   }
-  if (V.BoundsCell && IR) {
-    auto *Meta = pointerMetadataType();
-    auto read = [&](unsigned I) {
-      return B.CreateLoad(Meta->getElementType(I),
-                          B.CreateStructGEP(Meta, V.BoundsCell, I));
-    };
-    V.Lower = read(0);
-    V.Upper = read(1);
-    if (TracksStorage) {
-      V.ArraySlot = read(2);
-      V.ArrayGeneration = read(3);
-      V.Slot = read(4);
-      V.Generation = read(5);
-    }
-  }
+  if (V.BoundsCell && IR)
+    readBounds(V, V.BoundsCell);
   return V;
+}
+void Frame::readBounds(Value &V, llvm::Value *Cell) {
+  auto *Meta = pointerMetadataType();
+  auto read = [&](unsigned I) {
+    return B.CreateLoad(Meta->getElementType(I),
+                        B.CreateStructGEP(Meta, Cell, I));
+  };
+  V.Lower = read(0);
+  V.Upper = read(1);
+  if (TracksStorage) {
+    V.ArraySlot = read(2);
+    V.ArrayGeneration = read(3);
+    V.Slot = read(4);
+    V.Generation = read(5);
+  }
 }
 llvm::StructType *Frame::pointerMetadataType() {
   auto *P = B.getPtrTy();
@@ -765,6 +767,39 @@ Function *Context::declare(const Node &N, const std::string &Name,
     ExternalFunctions[N.Text] = Group.back();
   return Group.back();
 }
+// The first declaration in a block owns the nominal identity, including a
+// forward declaration. Emitting an inlined activation again reuses that type.
+void Frame::localType(const Node &N) {
+  auto &Scope = Scopes.back();
+  auto [It, New] = Scope.Nominals.emplace(N.Text, N.K);
+  if (New) {
+    auto Key = (F ? F->Name : Prefix) + "::$local." +
+               std::to_string(N.At.Line) + "." + std::to_string(N.At.Column) +
+               "::" + N.Text;
+    if (Scope.Names.count(N.Text) || !Scope.Aliases.emplace(N.Text, Key).second)
+      fail(N.At, "duplicate declaration '" + N.Text + "'");
+  } else if (It->second != N.K)
+    fail(N.At, "conflicting local type declaration");
+  auto Key = Scope.Aliases.at(N.Text);
+  if (!U.LocalTypeSites.emplace(Key, SourcePosition{N.At.Line, N.At.Column})
+           .second)
+    return;
+  Substitution Lexical = Env;
+  for (const auto &Scope : Scopes) {
+    for (const auto &[Name, T] : Scope.Aliases)
+      Lexical.Types[Name] = T;
+    for (const auto &[Name, V] : Scope.Names)
+      if (V.Readonly && llvm::isa_and_nonnull<llvm::Constant>(V.IR))
+        Lexical.Values[Name] = V;
+  }
+  if (N.K == Node::Enumeration)
+    U.enumeration(*this, N, Key);
+  else if (N.K == Node::Union)
+    U.tagged(N, Key, Prefix, Lexical);
+  else
+    U.record(N, Key, Prefix, Lexical);
+}
+
 void Context::enumeration(Frame &F, const Node &D, const std::string &Name) {
   auto Ty = F.resolve(D.Type, D.At);
   if (!integer(Ty))
@@ -1101,6 +1136,7 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
     else
       F.Env.Values[Q.Text] = Original.Values.at(P.Text);
   }
+  F.ExitedLifetimes = validate(Body, F.Prefix, F.Owner);
   for (size_t I = 0; I < Body.Params.size(); ++I) {
     Body.Params[I].Children = Public.Params[I].Children;
     Body.Params[I].Const |= Public.Params[I].Const;
@@ -1109,7 +1145,6 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
   Body.Settings.insert(Public.Settings.begin(), Public.Settings.end());
   F.Decl = std::move(Body);
   F.Definition = *FamilyDecl.BodySite;
-  F.ExitedLifetimes = validate(F.Decl, F.Prefix, F.Owner);
 }
 
 void Context::genericFunction(const Node &D, const std::string &Name,
@@ -1284,7 +1319,14 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
   if (D.Decl.Settings.count("closure"))
     F.bindCaptures();
   auto &Body = D.Decl.Children.front();
-  if (D.Decl.K == Node::Constructor) {
+  if (D.Decl.K == Node::Constructor &&
+      Records.at(D.Owner).Decl.K == Node::Union) {
+    for (auto &S : Body.Children)
+      if (S.K == Node::Init)
+        fail(S.At, "a union case is not a common field initializer");
+    F.beginUnionConstructor();
+    F.stmt(Body);
+  } else if (D.Decl.K == Node::Constructor) {
     Construction Transaction(F, D, F.Self, nullptr, nullptr);
     Transaction.run(F);
   } else if (D.Decl.K == Node::Destructor)

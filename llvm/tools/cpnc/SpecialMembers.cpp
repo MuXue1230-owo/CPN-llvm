@@ -131,13 +131,7 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     }
   }
   if (R.Decl.K == Node::Union) {
-    visitPayload(Source, [&](const Case &C) {
-      for (size_t I = 0; I < C.Types.size(); ++I)
-        transfer({C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
-                  Source.Readonly || C.Decl.Params[I].Const},
-                 payloadAddress(C, Dest, I), Op, At);
-      B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(Ty, Dest, 0));
-    });
+    transferPayload(Source, Dest, Op, At);
     return;
   }
   if (!assignment(Op) && R.Fields.empty())
@@ -198,7 +192,7 @@ Value Frame::callResult(const std::string &T, llvm::Value *IRValue,
     Value Ref{RO ? Base.substr(6, Base.size() - 7) : Base, nullptr, IRValue,
               RO};
     Ref.Expiring = llvm::StringRef(T).ends_with("&&");
-    return load(Ref);
+    return Ref;
   }
   auto Mutable = unconst(T);
   if (!Storage)

@@ -697,7 +697,11 @@ class Parser {
     auto T = peek();
     if (is("{"))
       return block();
-    if (is("alias"))
+    if (is("alias") || is("struct") || is("class") || is("union") ||
+        is("enum") ||
+        (is("declare") &&
+         (peek(1).Text == "struct" || peek(1).Text == "class" ||
+          peek(1).Text == "union" || peek(1).Text == "enum")))
       return declaration();
     if (eat("if")) {
       Node N(Node::If, T);
@@ -1060,6 +1064,8 @@ class Parser {
     }
     if (is("[") && peek(1).Text == "[") {
       auto Attributes = attributes();
+      if (is("configured"))
+        fail(peek(), "configuration wrappers must precede attributes");
       auto D = declaration(Foreign, Member);
       applyAttributes(D, Attributes);
       return D;
@@ -1250,6 +1256,11 @@ class Parser {
           R.Children.push_back(std::move(D));
           continue;
         }
+        // Leading attributes belong to special members as well as ordinary
+        // member declarations. The latter keep the same decoration order.
+        auto Leading = attributes();
+        if (!Leading.empty() && is("configured"))
+          fail(peek(), "configuration wrappers must precede attributes");
         bool SpecialProto =
             is("declare") &&
             ((peek(1).Text == R.Text && peek(2).Text == "(") ||
@@ -1283,9 +1294,10 @@ class Parser {
           specialBody(D, SpecialProto);
         } else {
           D = declaration(false, true);
-          if (D.K == Node::Object)
-            D.K = Node::Field;
         }
+        applyAttributes(D, Leading);
+        if (D.K == Node::Object)
+          D.K = Node::Field;
         if (Virt)
           D.Settings["virtual"] = "1";
         D.Settings["access"] = Access;

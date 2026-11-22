@@ -196,6 +196,11 @@ struct SourceAnalysis {
       }
       return Out;
     }
+    case Node::Record:
+    case Node::Enumeration:
+    case Node::Union:
+      Locals.insert(N.Text);
+      return {S};
     case Node::Init:
       return {S};
     case Node::Alias:

@@ -154,8 +154,7 @@ Value Frame::closurePointer(const Value &Source, const std::string &T,
     for (auto &Arg : R.ClosureEntry->args())
       Args.push_back(&Arg);
     Args.insert(Args.begin() + Receiver, Entry.CreateAlloca(R.IR));
-    if (carriesPointerBounds(Op.Result) ||
-        llvm::any_of(Op.Params, carriesPointerBounds))
+    if (carriesBorrow(Op.Result) || llvm::any_of(Op.Params, carriesBorrow))
       forwardPointerCall(Entry, R.ClosureEntry, Op.IR);
     auto *Result = Entry.CreateCall(Op.IR, Args);
     if (FT->getReturnType()->isVoidTy())

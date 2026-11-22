@@ -7,6 +7,40 @@ bool cpn::carriesPointerBounds(const std::string &Type) {
   return StringRef(unconst(T)).ends_with("*") || T == "storage";
 }
 
+bool cpn::carriesBorrow(const std::string &Type) {
+  return carriesPointerBounds(Type) || StringRef(Type).ends_with("&");
+}
+static Value metadataFor(const std::string &Type, Value V) {
+  if (!carriesPointerBounds(Type) && StringRef(Type).ends_with("&")) {
+    V.Lower = V.ElementLower;
+    V.Upper = V.ElementUpper;
+  }
+  return V;
+}
+
+// The pointer stored in a variable and the extent designated by a reference
+// to an array element have distinct bounds. Preserve the original generation
+// even if another argument reconstructs the same physical address.
+void Frame::readReferent(Value &V, llvm::Value *Cell) {
+  Value Metadata;
+  readBounds(Metadata, Cell);
+  V.ElementLower = Metadata.Lower;
+  V.ElementUpper = Metadata.Upper;
+  V.ArraySlot = Metadata.ArraySlot;
+  V.ArrayGeneration = Metadata.ArrayGeneration;
+  if (TracksStorage) {
+    if (V.Slot) {
+      auto *Provided = B.CreateIsNotNull(Metadata.Slot);
+      V.Slot = B.CreateSelect(Provided, Metadata.Slot, V.Slot);
+      V.Generation =
+          B.CreateSelect(Provided, Metadata.Generation, V.Generation);
+    } else {
+      V.Slot = Metadata.Slot;
+      V.Generation = Metadata.Generation;
+    }
+  }
+}
+
 // The native function signature stays callable from C. The caller publishes
 // the extra CPN metadata only for the dynamic target of this particular call.
 // A callee consumes it on entry, so native callbacks and recursion cannot
@@ -30,19 +64,18 @@ PointerCall Frame::openPointerCall(llvm::Value *Target,
                                    const std::string &Result,
                                    llvm::ArrayRef<std::string> Params,
                                    llvm::ArrayRef<Value> Arguments) {
-  if (!carriesPointerBounds(Result) &&
-      !llvm::any_of(Params, carriesPointerBounds))
+  if (!carriesBorrow(Result) && !llvm::any_of(Params, carriesBorrow))
     return {};
   llvm::IRBuilder<> Allocate(IR->getEntryBlock().begin());
   auto *Rows = Allocate.CreateAlloca(
       B.getPtrTy(), B.getInt32(Params.size() + 1), "call.pointer.rows");
   auto bind = [&](size_t Index, const std::string &Type, const Value &V) {
-    if (!carriesPointerBounds(Type))
+    if (!carriesBorrow(Type))
       return;
-    llvm::Value *Cell = V.BoundsCell;
+    llvm::Value *Cell = carriesPointerBounds(Type) ? V.BoundsCell : nullptr;
     if (!StringRef(Type).ends_with("&") || !Cell) {
       Cell = Allocate.CreateAlloca(pointerMetadataType());
-      saveBounds(Cell, V);
+      saveBounds(Cell, metadataFor(Type, V));
     }
     B.CreateStore(Cell, row(B, Rows, Index));
   };
@@ -58,8 +91,7 @@ PointerCall Frame::openPointerCall(llvm::Value *Target,
 }
 
 void Frame::receivePointerCall() {
-  if (!carriesPointerBounds(F->Result) &&
-      !llvm::any_of(F->Params, carriesPointerBounds))
+  if (!carriesBorrow(F->Result) && !llvm::any_of(F->Params, carriesBorrow))
     return;
   auto *Current = currentCall(U.M);
   auto *Header = B.CreateLoad(Current->getValueType(), Current);
@@ -81,14 +113,15 @@ llvm::Value *Frame::incomingPointerCell(size_t Index) {
 }
 
 void Frame::publishPointerResult(const Value &V) {
-  if (!IncomingPointerRows || !carriesPointerBounds(F->Result))
+  if (!IncomingPointerRows || !carriesBorrow(F->Result))
     return;
   // A reference to a pointer shares the caller's metadata cell on assignment.
-  if (StringRef(F->Result).ends_with("&") && V.BoundsCell) {
+  if (StringRef(F->Result).ends_with("&") && carriesPointerBounds(F->Result) &&
+      V.BoundsCell) {
     B.CreateStore(V.BoundsCell, row(B, IncomingPointerRows, 0));
     return;
   }
-  saveBounds(incomingPointerCell(0), V);
+  saveBounds(incomingPointerCell(0), metadataFor(F->Result, V));
 }
 
 void Frame::closePointerCall(const PointerCall &C) {
@@ -98,9 +131,14 @@ void Frame::closePointerCall(const PointerCall &C) {
 
 Value Frame::pointerCallResult(Value V, const PointerCall &C,
                                const std::string &Type) {
-  if (!C.Rows || !carriesPointerBounds(Type))
+  if (!C.Rows || !carriesBorrow(Type))
     return V;
-  V.BoundsCell = B.CreateLoad(B.getPtrTy(), row(B, C.Rows, 0));
+  auto *Cell = B.CreateLoad(B.getPtrTy(), row(B, C.Rows, 0));
+  if (!carriesPointerBounds(Type)) {
+    readReferent(V, Cell);
+    return load(V);
+  }
+  V.BoundsCell = Cell;
   V = load(V);
   if (!StringRef(Type).ends_with("&"))
     V.BoundsCell = nullptr;
