@@ -39,6 +39,10 @@ struct Options {
 std::vector<Token> lex(llvm::StringRef, const Options &);
 std::string unquote(const Token &);
 bool identifier(llvm::StringRef);
+inline bool operatorSpelling(llvm::StringRef Name) {
+  return Name.consume_front("operator") && !Name.empty() &&
+         llvm::StringRef(" ([+-*/%~!&|^<=>").contains(Name.front());
+}
 bool builtin(llvm::StringRef);
 bool builtinPredicate(llvm::StringRef);
 bool realToken(llvm::StringRef);

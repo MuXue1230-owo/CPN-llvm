@@ -149,9 +149,33 @@ class Parser {
       fail(T, "expected identifier");
     return T;
   }
+  Token operatorName() {
+    Token T = expect("operator");
+    if (eat("(")) {
+      expect(")");
+      T.Text = "operator()";
+    } else if (eat("[")) {
+      expect("]");
+      T.Text = "operator[]";
+    } else if (is("prefix") || is("postfix")) {
+      auto Form = take();
+      if (!is("++") && !is("--"))
+        fail(peek(), "expected increment or decrement operator");
+      T.Text += " " + Form.Text + " " + take().Text;
+    } else {
+      auto Op = take();
+      if ((!precedence(Op.Text) && Op.Text != "!" && Op.Text != "~") ||
+          Op.Text == "&&" || Op.Text == "||" || Op.Text == "?")
+        fail(Op, "invalid overloadable operator");
+      T.Text += Op.Text;
+    }
+    return T;
+  }
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr) {
     bool Root = eat("::");
-    auto T = AllowBuiltin && builtin(peek().Text) ? take() : name();
+    auto T = Application && is("operator")          ? operatorName()
+             : AllowBuiltin && builtin(peek().Text) ? take()
+                                                    : name();
     while (true) {
       if (is("<") && (Families.count(T.Text) ||
                       (Application &&
@@ -169,7 +193,9 @@ class Parser {
       }
       if (!eat("::"))
         break;
-      if (is("forward") && T.Text == "std")
+      if (Application && is("operator"))
+        T.Text += "::" + operatorName().Text;
+      else if (is("forward") && T.Text == "std")
         T.Text += "::" + take().Text;
       else
         T.Text += "::" + name().Text;
@@ -343,8 +369,11 @@ class Parser {
         Node Ty(Node::TypeArg, peek());
         Ty.Type = type();
         N.Children.push_back(Ty);
-      } else
+      } else {
+        if (N.Text == "alignof")
+          fail(T, "alignof requires a type");
         N.Children.push_back(expr());
+      }
       expect(")");
     } else if (!T.Text.empty() && llvm::isDigit(T.Text[0]))
       N = Node(realToken(T.Text) ? Node::Real : Node::Number, take());
@@ -353,7 +382,7 @@ class Parser {
     else if (is("true") || is("false") || is("nullptr") || is("this"))
       N = Node(Node::Name, take());
     else if (identifier(T.Text) || is("::")) {
-      if (Reserved.count(T.Text))
+      if (Reserved.count(T.Text) && T.Text != "operator")
         fail(T, "expected expression");
       N.K = Node::Name;
       N.At = qualified(true, &N);
@@ -374,7 +403,7 @@ class Parser {
         N = std::move(M);
       } else if (is(".") || is("->")) {
         bool Ptr = take().Text == "->";
-        auto Id = name();
+        auto Id = is("operator") ? operatorName() : name();
         if (eat("::")) {
           expect("~");
           expect(Id.Text);
@@ -768,11 +797,11 @@ class Parser {
   }
   Token declarationName(std::string &Qualifier, bool &Dtor) {
     bool Root = eat("::");
-    auto Id = name();
+    auto Id = is("operator") ? operatorName() : name();
     while (eat("::")) {
       Qualifier += Id.Text + "::";
       Dtor = eat("~");
-      Id = name();
+      Id = !Dtor && is("operator") ? operatorName() : name();
       if (Dtor)
         break;
     }
@@ -1012,7 +1041,7 @@ class Parser {
              (peek(1).Text == "virtual" && peek(2).Text == "~"));
         if (SpecialProto)
           take();
-        bool Virt = eat("virtual");
+        bool Virt = is("virtual") && peek(1).Text == "~" && eat("virtual");
         Node D;
         if (is("Complete")) {
           take();
@@ -1086,44 +1115,43 @@ class Parser {
     if (!Foreign && is("define"))
       fail(peek(), "define requires an external object definition");
     bool Proto = eat("declare"), Def = eat("define");
-    eat("static");
+    bool StorageStatic = eat("static"),
+         ThreadLocal = !StorageStatic && eat("thread_local");
     bool RO = is("const") && peek(1).Text != "<";
     if (RO)
       take();
     bool CE = !RO && eat("constexpr"), Eval = !RO && !CE && eat("consteval");
+    bool Static = StorageStatic || (!ThreadLocal && !RO && eat("static"));
+    bool Virtual = !Static && !ThreadLocal && !RO && eat("virtual");
     auto Ty = eat("auto") ? std::string("auto") : type();
-    if (Member && eat("operator")) {
-      auto Id = expect("=");
-      Node F(Node::Function, Id);
-      F.Text = "operator=";
-      F.Type = Ty;
-      F.Params = params();
-      F.Noexcept = eat("noexcept");
-      if (Proto) {
-        expect(";");
-        F.Prototype = true;
-      } else if (eat("="))
-        F.Settings["control"] = definitionControl();
-      else
-        F.Children.push_back(block());
-      return F;
-    }
     std::string Q;
     bool Dtor = false;
     auto Id = declarationName(Q, Dtor);
     if (Dtor || (!Q.empty() && (Member || Foreign || Proto || Def)))
       fail(Id, "invalid qualified declaration");
-    bool Fn = !Def && (!Q.empty() || Proto || (Foreign && is("(")) ||
-                       !G.empty() || functionBody());
+    bool Fn = !Def && (!Q.empty() || operatorSpelling(Id.Text) || Proto ||
+                       (Foreign && is("(")) || !G.empty() || functionBody());
     if (!Fn) {
       if (Foreign && !Def && !is(";"))
         fail(Id, "an external object initializer requires define");
+      if (Virtual || Eval || (Static && !StorageStatic) || (Foreign && Static))
+        fail(Id, "invalid object declaration modifier");
       auto O = object(Id, Ty, RO, CE);
+      if (Static || ThreadLocal)
+        O.Settings["storage"] = Static ? "static" : "thread_local";
       O.Foreign = Foreign;
       O.Definition = Def;
       return O;
     }
+    if (RO || ThreadLocal ||
+        ((Static || Virtual) && (!Member || Foreign || !Q.empty())) ||
+        (StorageStatic && (CE || Eval)))
+      fail(Id, "invalid function declaration modifier");
     Node F(Node::Function, Id);
+    if (Static)
+      F.Settings["static"] = "1";
+    if (Virtual)
+      F.Settings["virtual"] = "1";
     F.Type = Ty;
     F.Generics = G;
     if (!Q.empty())
@@ -1137,7 +1165,7 @@ class Parser {
     if (Requires.K != Node::Empty)
       F.TemplateArgs.push_back(std::move(Requires));
     F.Params = params();
-    if (Member || !Q.empty()) {
+    if ((Member && !Static) || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))
         F.Settings["category"] = take().Text;
@@ -1152,7 +1180,7 @@ class Parser {
       F.Prototype = true;
     } else if (eat("=")) {
       F.Settings["control"] = definitionControl();
-      if (F.Settings["control"] == "default")
+      if (F.Settings["control"] == "default" && F.Text != "operator=")
         fail(F.At, "this function has no generated default definition");
     } else
       F.Children.push_back(block());

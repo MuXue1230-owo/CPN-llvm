@@ -40,6 +40,7 @@ struct Function {
   llvm::Function *IR = nullptr, *BaseIR = nullptr;
   bool Emitting = false, Emitted = false;
   int Slot = -1;
+  bool isStatic() const { return Decl.Settings.count("static"); }
 };
 struct Field {
   Node Decl;
@@ -102,6 +103,7 @@ struct Context {
   Options Opt;
   std::map<std::string, std::string> Aliases, Enums;
   std::map<std::string, Record> Records;
+  std::map<std::string, std::pair<std::string, Node>> StaticMembers;
   std::map<std::string, Value> Globals, ExternalObjects;
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
@@ -239,6 +241,7 @@ public:
   Value floatingBinary(const Node &, Value, Value,
                        const std::string &Expected = "");
   Value place(const Node &);
+  Value subscript(const Node &);
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
@@ -251,8 +254,9 @@ public:
                                          const Token &);
   std::vector<Function *> visibleOverloads(const std::string &) const;
   std::string callKey(const std::string &, const std::string &Owner = "") const;
+  Value applyOperator(const std::string &, const Token &, CallArguments);
   Function *select(std::string, const Node &, const std::vector<Value> &,
-                   Value Receiver = {});
+                   Value Receiver = {}, bool Operator = false);
   Function *prepareCandidate(const Family &, const std::string &, const Node &,
                              const std::vector<Value> &);
   Substitution bind(const Family &, const std::vector<Node> &,

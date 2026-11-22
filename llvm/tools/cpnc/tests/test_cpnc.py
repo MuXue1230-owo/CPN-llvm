@@ -1496,6 +1496,91 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_static_members_and_modifier_order(self):
+        self.assertEqual(
+            self.program("""
+            struct Counter {
+                static i32 value(39);
+                declare static void step();
+                static i32 read(){return value;}
+                i32 next(){step();return read();}
+            };
+            void Counter::step(){++value;}
+            i32 main(){
+                Counter x; Counter::step(); x.next();
+                function<i32()>* p(&Counter::read);
+                if(sizeof(Counter)!=1 || p()!=41){return 0;}
+                return ++Counter::value;
+            }"""),
+            42,
+        )
+        for source in [
+            "struct S{static i32 f() const{return 0;}};",
+            "struct S{static constexpr i32 f(){return 0;}};",
+            "struct S{static i32 operator+(i32 n){return n;}};",
+            "struct S{virtual i32 x;};",
+            "struct S{i32 n; static i32 f(){return n;}};",
+            "struct S{static i32 f(){return this->n;}i32 n;};",
+            "struct S{declare i32 f();};i32 main(){return S::f();}",
+            "i32 f(){i32 x;return i32(alignof(x));}",
+            "const constexpr i32 x(1);",
+        ]:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_operator_names_categories_and_native_execution(self):
+        self.assertEqual(
+            self.program("""
+            struct Number {
+                i32 n;
+                Number(i32 v){init n(v);}
+                i32 operator+(i32 r) const {return n+r;}
+                bool operator!() const {return n==0;}
+                Number& operator+=(i32 r) {n+=r;return *this;}
+                Number& operator prefix ++(){++n;return *this;}
+                Number operator postfix ++(){Number old(n);++n;return Number(old.n);}
+                i32& operator[](i32 index){return n;}
+                i32 operator()(i32 scale) const {return scale*n;}
+            };
+            i32 operator-(i32 l, const<Number>& r){return l-r.n;}
+            i32 main(){
+                Number n(4);
+                i32 old(n++.n);
+                ++n; n+=1; n[0]=10;
+                if(old!=4 || !n || n.operator+(2)!=12 || (12-n)!=2){return 1;}
+                return n(4)+(n+2)-10;
+            }"""),
+            42,
+        )
+
+    def test_operator_selection_competes_across_receiver_and_free_candidates(self):
+        self.assertEqual(
+            self.program("""
+            struct N{ i32 n(1); i32 operator+(i64 x) const{return 0;} };
+            i32 operator+(const<N>& n,i32 x){return x+n.n;}
+            N& operator prefix --(N& n){--n.n; return n;}
+            i32 main(){N n;--n;return n+i32(42);}
+            """),
+            42,
+        )
+        for source, diagnostic in [
+            ("i32 operator+(i32 x,i32 y){return x;}", "nominal operand"),
+            ("struct T {void operator++(){} };", "overloadable operator"),
+            ("struct T {void operator&&(T& r){} };", "overloadable operator"),
+            ("struct T {i32 operator prefix ++(){return 0;} };", "writable nominal"),
+            ("struct T {i32 operator[](i32 x,i32 y){return 0;} };", "operand count"),
+            ("struct T {}; i32 operator[](T& o,i32 n){return n;}", "nonstatic member"),
+            (
+                "struct T {i32 operator+(i32 n) const{return n;}};"
+                "i32 operator+(const<T>& t,i32 n){return n;}i32 f(T& t){return t+i32(1);}",
+                "ambiguous overload",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
     def test_qualified_definitions_and_root_lookup(self):
         self.assertEqual(
             self.program("""

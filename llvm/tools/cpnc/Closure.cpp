@@ -83,13 +83,18 @@ void Frame::bindCaptures() {
 }
 Value Frame::callClosure(Value Receiver, const std::vector<Node> &Args,
                          const Token &At) {
-  if (!U.Records.count(Receiver.Type) ||
-      U.Records.at(Receiver.Type).Decl.K != Node::Lambda)
+  auto It = U.Records.find(Receiver.Type);
+  if (It == U.Records.end())
     fail(At, "callable expression required");
   Node Designator(Node::Name, At);
-  Designator.Text = "$call";
+  Designator.At.Text = Designator.Text =
+      It->second.Decl.K == Node::Lambda ? "$call" : "operator()";
+  auto Owner = methodOwner(Receiver.Type, Designator.At);
+  if (Owner.empty())
+    fail(At, "callable expression required");
+  adjust(Receiver, Owner, At);
   auto Actual = evaluateArguments(Args);
-  auto *Op = select("$call", Designator, Actual.Values, Receiver);
+  auto *Op = select(Designator.Text, Designator, Actual.Values, Receiver);
   admitArguments(Actual, Op, At);
   return invoke(*Op, std::move(Actual.Values), At, Receiver, true);
 }

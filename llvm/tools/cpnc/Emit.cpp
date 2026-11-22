@@ -49,10 +49,26 @@ Value Frame::lookup(const Token &T) {
         throw;
     }
   }
+  if (F && F->isStatic()) {
+    auto Path = U.lookupPath(F->Owner, T, false);
+    if (Path) {
+      auto Owner = U.Records.at(F->Owner).Views.at(*Path);
+      auto Key = Owner + "::" + T.Text;
+      if (!U.StaticMembers.count(Key))
+        fail(T, "instance field requires a receiver");
+      checkAccess(U.StaticMembers.at(Key).second, Owner, T);
+      if (!U.Globals.count(Key))
+        fail(T, "static member used before initialization");
+      return U.Globals.at(Key);
+    }
+  }
   auto Key = scopeKey(Prefix, T.Text,
                       [&](const std::string &K) { return U.Globals.count(K); });
-  if (!Key.empty())
+  if (!Key.empty()) {
+    if (auto I = U.StaticMembers.find(Key); I != U.StaticMembers.end())
+      checkAccess(I->second.second, I->second.first, T);
     return U.Globals.at(Key);
+  }
   fail(T, "unknown name '" + T.Text + "'");
 }
 void Frame::checkAccess(const Node &Decl, const std::string &Owner,
@@ -82,6 +98,14 @@ Value Frame::member(Value Obj, const Token &T) {
   auto Path = U.lookupPath(Obj.Type, T, false);
   if (!Path)
     fail(T, "unknown member '" + T.Text + "'");
+  auto Owner = Path->empty() ? Obj.Type : It->second.Views.at(*Path);
+  if (auto I = U.StaticMembers.find(Owner + "::" + T.Text);
+      I != U.StaticMembers.end()) {
+    checkAccess(I->second.second, Owner, T);
+    if (!U.Globals.count(I->first))
+      fail(T, "static member used before initialization");
+    return U.Globals.at(I->first);
+  }
   Obj = baseView(Obj, *Path);
   auto &R = U.Records.at(Obj.Type);
   for (size_t I = 0; I < R.Fields.size(); ++I)
@@ -100,9 +124,11 @@ Value Frame::member(Value Obj, const Token &T) {
 }
 void Frame::bindParams() {
   size_t I = 0;
-  if (!F->Owner.empty()) {
+  if (!F->Owner.empty() && !F->isStatic()) {
     Self = {F->Owner, nullptr, IR->getArg(I++), F->Decl.Const};
-    Scopes[0].Names["this"] = {F->Owner + "*", Self.Address};
+    Scopes[0].Names["this"] = {
+        (F->Decl.Const ? "const<" + F->Owner + ">" : F->Owner) + "*",
+        Self.Address};
   }
   for (size_t J = 0; J < F->Params.size(); ++J) {
     auto T = F->Params[J];
@@ -154,28 +180,33 @@ Value Frame::place(const Node &N) {
       Base = {unconst(T), nullptr, Base.IR, unconst(T) != T};
     }
     V = member(Base, N.At);
-  } else if (N.K == Node::Index) {
-    auto Base = eval(N.Children[0]);
-    auto Index = eval(N.Children[1]);
-    if (!ends(Base.Type, "]") || !integer(Index.Type) || !Base.Address)
-      fail(N.At, "array object and integer index required");
-    auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Base.Type));
-    if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(Index.IR)) {
-      if (K->getValue().uge(Array->getNumElements()))
-        fail(N.At, "array index outside extent");
-    }
-    auto *I = B.CreateIntCast(Index.IR, B.getInt64Ty(), signedType(Index.Type));
-    guard(B.CreateICmpUGE(I, B.getInt64(Array->getNumElements())));
-    auto E = element(Base.Type);
-    V = {unconst(E), nullptr,
-         B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
-         Base.Readonly || E != unconst(E)};
-  } else
+  } else if (N.K == Node::Index)
+    V = subscript(N);
+  else
     V = eval(N);
   if (!V.Address)
     fail(N.At, "object lvalue required");
   ensureLive(V, N.At);
   return V;
+}
+Value Frame::subscript(const Node &N) {
+  auto Base = eval(N.Children[0]);
+  auto Index = eval(N.Children[1]);
+  if (U.Records.count(Base.Type))
+    return applyOperator("operator[]", N.At, {{Base, Index}, {}, {}});
+  if (!ends(Base.Type, "]") || !integer(Index.Type) || !Base.Address)
+    fail(N.At, "array object and integer index required");
+  auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Base.Type));
+  if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(Index.IR)) {
+    if (K->getValue().uge(Array->getNumElements()))
+      fail(N.At, "array index outside extent");
+  }
+  auto *I = B.CreateIntCast(Index.IR, B.getInt64Ty(), signedType(Index.Type));
+  guard(B.CreateICmpUGE(I, B.getInt64(Array->getNumElements())));
+  auto E = element(Base.Type);
+  return {unconst(E), nullptr,
+          B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
+          Base.Readonly || E != unconst(E)};
 }
 Value Frame::constantEval(const Node &N) {
   if (IR) {
@@ -280,6 +311,7 @@ Value Frame::eval(const Node &N, std::string Expected) {
     else
       return load(lookup(N.At));
   case Node::Index:
+    return load(subscript(N));
   case Node::Member:
     return load(place(N));
   case Node::Call:
@@ -328,7 +360,8 @@ Value Frame::eval(const Node &N, std::string Expected) {
         auto &Sig = U.Signatures.at(element(Expected));
         Function *Match = nullptr;
         for (auto *Candidate : Group) {
-          if (Candidate->Result != Sig.front() ||
+          if ((!Candidate->Owner.empty() && !Candidate->isStatic()) ||
+              Candidate->Result != Sig.front() ||
               Candidate->Params !=
                   std::vector<std::string>(Sig.begin() + 1, Sig.end()) ||
               (ends(element(Expected), " noexcept>") &&
@@ -358,12 +391,22 @@ Value Frame::eval(const Node &N, std::string Expected) {
       if (D.Readonly)
         fail(N.At, "writable lvalue required");
       auto V = load(D);
+      if (U.Records.count(D.Type)) {
+        if (D.Expiring)
+          fail(N.At, "increment or decrement requires a writable lvalue");
+        return applyOperator(std::string(N.Definition ? "operator postfix "
+                                                      : "operator prefix ") +
+                                 Op,
+                             N.At, {{V}, {}, {}});
+      }
       auto Next = binary(Bop, V, literal(1));
       B.CreateStore(Next.IR, D.Address);
       return N.Definition ? Value(V.Type, V.IR)
                           : Value(Next.Type, Next.IR, D.Address);
     }
     auto V = eval(A[0], Op == "-" && A[0].K == Node::Real ? "" : Expected);
+    if (U.Records.count(V.Type))
+      return applyOperator("operator" + Op, N.At, {{V}, {}, {}});
     if (Op == "!") {
       if (V.Type != "bool")
         fail(N.At, "logical negation requires bool");
@@ -456,6 +499,19 @@ Value Frame::eval(const Node &N, std::string Expected) {
         fail(N.At, "writable lvalue required");
       auto Old = Op == "=" ? Value() : load(D);
       auto R = eval(A[1], D.Type);
+      if (U.Records.count(D.Type)) {
+        auto Special = R.Expiring || !R.Address ? SpecialOperation::MoveAssign
+                                                : SpecialOperation::CopyAssign;
+        if (Op != "=" || D.Type != R.Type ||
+            !U.Records.at(D.Type).Special.count(Special)) {
+          if (Op == "=" && D.Type == R.Type &&
+              methodOwner(D.Type, Token{"operator=", N.At.Line, N.At.Column})
+                  .empty())
+            fail(N.At, R.Expiring ? "no available move assignment"
+                                  : "no available copy assignment");
+          return applyOperator("operator" + Op, N.At, {{D, R}, {}, {}});
+        }
+      }
       if (Op != "=") {
         Node Math = N;
         Math.Text.pop_back();
@@ -482,8 +538,19 @@ Value Frame::eval(const Node &N, std::string Expected) {
       return llvm::all_of(E.Children, [&](auto &C) { return Visit(C, Visit); });
     };
     bool Propagate = floating(Expected) && LiteralTree(N, LiteralTree);
-    auto L = eval(A[0], Propagate ? Expected : "");
-    auto R = eval(A[1], Propagate ? Expected : "");
+    Value L, R;
+    if (Propagate) {
+      L = eval(A[0], Expected);
+      R = eval(A[1], Expected);
+    } else {
+      auto Operands = evaluateArguments(A);
+      if (llvm::any_of(Operands.Values,
+                       [&](const Value &V) { return U.Records.count(V.Type); }))
+        return applyOperator("operator" + Op, N.At, std::move(Operands));
+      admitArguments(Operands, nullptr, N.At);
+      L = Operands.Values[0];
+      R = Operands.Values[1];
+    }
     if (L.Type == "integer" && R.Type == "integer" &&
         (Op == "&" || Op == "|" || Op == "^" || Op == "<<" || Op == ">>")) {
       auto T = integer(Expected) && Expected != "integer" ? Expected
@@ -631,7 +698,8 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
 }
 
 Function *Frame::select(std::string Name, const Node &N,
-                        const std::vector<Value> &Args, Value Receiver) {
+                        const std::vector<Value> &Args, Value Receiver,
+                        bool Operator) {
   auto Key = callKey(Name, Receiver.Type);
   struct Candidate {
     Function *Decl;
@@ -651,6 +719,13 @@ Function *Frame::select(std::string Name, const Node &N,
   std::vector<Candidate> Best;
   auto Group =
       N.ExplicitApplication ? std::vector<Function *>{} : visibleOverloads(Key);
+  if (Operator) {
+    auto Owner = methodOwner(Args.front().Type, N.At);
+    if (!Owner.empty()) {
+      auto Members = visibleOverloads(Owner + "::" + Name);
+      Group.insert(Group.end(), Members.begin(), Members.end());
+    }
+  }
   std::optional<Diagnostic> Rejection;
   if (auto It = U.FunctionFamilies.find(Key); It != U.FunctionFamilies.end())
     for (auto &Fam : It->second) {
@@ -668,26 +743,35 @@ Function *Frame::select(std::string Name, const Node &N,
     fail(N.At, "unknown name '" + Name + "'");
   }
   for (auto *D : Group) {
-    if (!Receiver.Type.empty()) {
+    bool MemberOperand = Operator && !D->Owner.empty();
+    auto Actual = llvm::ArrayRef(Args).drop_front(MemberOperand ? 1 : 0);
+    const auto &Object = MemberOperand ? Args.front() : Receiver;
+    if (Object.Type.empty() && !D->Owner.empty() && !D->isStatic())
+      continue;
+    if (!Object.Type.empty() && !D->isStatic()) {
       auto Q = D->Decl.Settings.find("category");
       if (Q != D->Decl.Settings.end() && !Q->second.empty() &&
-          Q->second != (Receiver.Expiring ? "&&" : "&"))
+          Q->second != (Object.Expiring ? "&&" : "&"))
         continue;
-      if (Receiver.Readonly && !D->Decl.Const && D->Decl.K == Node::Function)
+      if (Object.Readonly && !D->Decl.Const && D->Decl.K == Node::Function)
         continue;
     }
-    if (Args.size() > D->Params.size() ||
-        (Args.size() < D->Params.size() &&
-         D->Decl.Params[Args.size()].Children.empty()))
+    if (Actual.size() > D->Params.size() ||
+        (Actual.size() < D->Params.size() &&
+         D->Decl.Params[Actual.size()].Children.empty()))
       continue;
-    Candidate Current{D, {unsigned(D->Decl.Const && !Receiver.Readonly)}};
-    for (size_t I = 0; I < Args.size(); ++I) {
-      auto Rank = conversionRank(Args[I], D->Params[I], N.At);
+    Candidate Current{D, {}};
+    if (!Operator || MemberOperand)
+      Current.Ranks.push_back(
+          unsigned(D->Decl.Const && !Object.Readonly) +
+          unsigned(MemberOperand && Object.Type != D->Owner));
+    for (size_t I = 0; I < Actual.size(); ++I) {
+      auto Rank = conversionRank(Actual[I], D->Params[I], N.At);
       if (!Rank)
         break;
       Current.Ranks.push_back(*Rank);
     }
-    if (Current.Ranks.size() != Args.size() + 1 ||
+    if (Current.Ranks.size() != Args.size() + (Operator ? 0 : 1) ||
         llvm::any_of(Best,
                      [&](const Candidate &C) { return Better(C, Current); }))
       continue;
@@ -708,6 +792,29 @@ Function *Frame::select(std::string Name, const Node &N,
     U.emit(*Selected);
   }
   return Selected;
+}
+Value Frame::applyOperator(const std::string &Name, const Token &At,
+                           CallArguments A) {
+  Node Callee(Node::Name, At);
+  Callee.At.Text = Callee.Text = Name;
+  auto *D = select(Name, Callee, A.Values, {}, true);
+  Value Receiver;
+  bool Staged = !A.Exits.empty();
+  if (!D->Owner.empty()) {
+    Receiver = A.Values.front();
+    A.Values.erase(A.Values.begin());
+    if (Staged) {
+      B.SetInsertPoint(A.Exits.front());
+      A.Entries.erase(A.Entries.begin());
+      A.Exits.erase(A.Exits.begin());
+    }
+    adjust(Receiver, D->Owner, At);
+    if (Staged && !A.Entries.empty())
+      branch(A.Entries.front());
+  }
+  if (Staged)
+    admitArguments(A, D, At);
+  return invoke(*D, std::move(A.Values), At, Receiver, Staged);
 }
 Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
   if (!conversionRank(V, Ty, At))
@@ -761,7 +868,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
   std::vector<llvm::Value *> Values;
-  if (!D.Owner.empty())
+  if (!D.Owner.empty() && !D.isStatic())
     Values.push_back(Receiver.Address);
   auto Original = std::move(Scopes);
   auto OldPrefix = Prefix;
@@ -861,8 +968,7 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   if (C.K == Node::Name) {
     for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
       auto V = I->Names.find(C.Text);
-      if (V != I->Names.end() && U.Records.count(V->second.Type) &&
-          U.Records.at(V->second.Type).Decl.K == Node::Lambda)
+      if (V != I->Names.end() && U.Records.count(V->second.Type))
         return callClosure(V->second, Args, C.At);
       if (V != I->Names.end() && ends(V->second.Type, "*") &&
           U.Signatures.count(element(V->second.Type)))
@@ -974,6 +1080,9 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     if (!Owner.empty() && Owner != Receiver.Type)
       adjust(Receiver, Owner, C.At);
   }
+  if (Receiver.Type.empty() && F && F->isStatic())
+    if (auto Owner = methodOwner(F->Owner, C.At); !Owner.empty())
+      Name = Owner + "::" + Name;
   auto Key = callKey(Name, Receiver.Type);
   auto Group = visibleOverloads(Key);
   auto A = evaluateArguments(
@@ -1347,6 +1456,9 @@ void Frame::object(const Node &N, bool Global) {
   if (!Existing)
     names()[Name] = {};
   if (Global) {
+    if (N.Settings.count("storage") &&
+        N.Settings.at("storage") == "thread_local")
+      fail(N.At, "thread-local storage is unavailable on this configuration");
     llvm::GlobalVariable *G = nullptr;
     if (Ty == "auto") {
       Ty = constantEval(Args.at(0)).Type;

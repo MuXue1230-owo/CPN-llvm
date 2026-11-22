@@ -47,8 +47,10 @@ std::optional<BasePath> Context::lookupPath(const std::string &Type,
   auto collect = [&](auto &&Visit, const BasePath &Path, const Record &R,
                      const std::string &Name) -> void {
     if (Method ? Overloads.count(Name + "::" + T.Text) != 0
-               : llvm::any_of(R.Fields,
-                              [&](auto &F) { return F.Decl.Text == T.Text; })) {
+               : StaticMembers.count(Name + "::" + T.Text) ||
+                     llvm::any_of(R.Fields, [&](auto &F) {
+                       return F.Decl.Text == T.Text;
+                     })) {
       Matches.insert(Path);
       return;
     }

@@ -305,6 +305,44 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
   }
   return S;
 }
+static void checkOperator(const Function &F, const Context &U) {
+  auto Op = StringRef(F.Decl.Text).drop_front(8);
+  bool Member = !F.Owner.empty();
+  bool Assignment =
+      Op.ends_with("=") && Op != "==" && Op != "!=" && Op != "<=" && Op != ">=";
+  if (F.Decl.Settings.count("static") || F.Decl.Foreign)
+    fail(F.Decl.At, "operators require native nominal operands");
+  if ((Assignment || Op == "()" || Op == "[]") && !Member)
+    fail(F.Decl.At,
+         "assignment, call and index operators require a nonstatic member");
+  bool Nominal = Member;
+  for (auto P : F.Params) {
+    while (StringRef(P).ends_with("&"))
+      P.pop_back();
+    if (StringRef(P).starts_with("const<") && P.back() == '>')
+      P = P.substr(6, P.size() - 7);
+    Nominal |= U.Records.count(P) != 0;
+  }
+  if (!Nominal)
+    fail(F.Decl.At, "operator requires a nominal operand");
+  unsigned Arity = F.Params.size() + unsigned(Member);
+  if (Op.starts_with(" ")) {
+    std::string T = F.Owner;
+    if (!Member && Arity == 1 && StringRef(F.Params[0]).ends_with("&"))
+      T = F.Params[0].substr(0, F.Params[0].size() - 1);
+    if (Arity != 1 || !U.Records.count(T) || F.Decl.Const ||
+        (F.Decl.Settings.count("category") &&
+         F.Decl.Settings.at("category") == "&&") ||
+        F.Result != (Op.starts_with(" prefix") ? T + "&" : T))
+      fail(F.Decl.At, "increment or decrement requires a writable nominal "
+                      "lvalue and the matching result type");
+  } else if (Op != "()") {
+    bool Unary = Op == "!" || Op == "~";
+    bool Either = Op == "+" || Op == "-";
+    if (Arity != (Unary ? 1u : 2u) && !(Either && Arity == 1))
+      fail(F.Decl.At, "invalid operator operand count");
+  }
+}
 Function *Context::declare(const Node &N, const std::string &Name,
                            const std::string &P, const Substitution &E,
                            const std::string &Owner) {
@@ -324,7 +362,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
                  ? "void"
                  : Resolver.resolve(N.Type, N.At);
   std::vector<llvm::Type *> Types;
-  if (!Owner.empty())
+  if (!Owner.empty() && !D.isStatic())
     Types.push_back(llvm::PointerType::getUnqual(C));
   bool HasDefault = false;
   std::set<std::string> Names;
@@ -342,6 +380,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
     D.Params.push_back(Resolver.resolve(Arg.Type, Arg.At));
     Types.push_back(ir(D.Params.back(), Arg.At));
   }
+  if (operatorSpelling(N.Text))
+    checkOperator(D, *this);
   auto &Group = Overloads[Name];
   if (N.Foreign) {
     auto Scalar = [&](const std::string &T) {
@@ -374,6 +414,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
             (N.Settings.count("category") ? N.Settings.at("category") : "")) {
       if (Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
+          (!N.Settings.count("qualifier") &&
+           Prev->isStatic() != D.isStatic()) ||
           Prev->Decl.Required != N.Required ||
           Prev->Decl.Settings.count("mode") != N.Settings.count("mode"))
         fail(N.At, "incompatible redeclaration");
@@ -491,11 +533,19 @@ void Context::record(const Node &N, const std::string &Name,
   }
   for (auto &D : N.Children)
     if (D.K == Node::Field) {
+      if (D.Settings.count("storage")) {
+        if (!StaticMembers
+                 .emplace(Name + "::" + D.Text, std::make_pair(Name, D))
+                 .second)
+          fail(D.At, "duplicate static member");
+        continue;
+      }
       auto T = Check.resolve(D.Type, D.At);
       auto *Ty = ir(T, D.At);
       if (!Ty->isSized())
         fail(D.At, "field requires a complete object type");
-      if (llvm::any_of(R.Fields,
+      if (StaticMembers.count(Name + "::" + D.Text) ||
+          llvm::any_of(R.Fields,
                        [&](auto &F) { return F.Decl.Text == D.Text; }))
         fail(D.At, "duplicate member");
       R.Fields.push_back({D, T});
@@ -582,6 +632,17 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
         F->BaseIR = llvm::Function::Create(F->IR->getFunctionType(),
                                            llvm::GlobalValue::InternalLinkage,
                                            F->IR->getName() + ".base", M);
+  for (auto D : N.Children) {
+    if (D.K != Node::Field || !D.Settings.count("storage"))
+      continue;
+    auto ID = Name + "::" + D.Text;
+    if (llvm::any_of(R.Fields,
+                     [&](const Field &F) { return F.Decl.Text == D.Text; }))
+      fail(D.At, "duplicate member");
+    D.Settings["identity"] = ID;
+    Statics.emplace_back(ID, D);
+    Check.object(D, true);
+  }
   buildTables(Name, Members);
   for (auto *F : Members)
     emit(*F);
@@ -611,7 +672,7 @@ void Context::defineQualified(const Node &D, const std::string &P) {
       if (!F->IR->use_empty() || (F->BaseIR && !F->BaseIR->use_empty()))
         fail(D.At, "selected function is deleted");
     } else {
-      if (!Ctor && !Dtor)
+      if (!Ctor && !Dtor && D.Text != "operator=")
         fail(D.At, "no generated default definition for this signature");
       F->Decl.Children.emplace_back(Node::Block, D.At);
       F->Decl.Settings.erase("control");
@@ -631,7 +692,10 @@ void Context::defineQualified(const Node &D, const std::string &P) {
           Generated.transfer({Owner, nullptr, Entry->getArg(1)},
                              Entry->getArg(0), Special->first, D.At,
                              Entry == F->BaseIR);
-          Generated.B.CreateRetVoid();
+          if (D.Text == "operator=")
+            Generated.B.CreateRet(Entry->getArg(0));
+          else
+            Generated.B.CreateRetVoid();
         }
         F->Emitted = true;
       }
