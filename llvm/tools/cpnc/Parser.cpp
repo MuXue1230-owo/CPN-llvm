@@ -340,19 +340,12 @@ class Parser {
         }
         if (Key != "noescape" && Key != "returns_borrowed_from")
           fail(T, "invalid callable type attribute");
-        if (Key == "returns_borrowed_from" &&
-            !StringRef(Return).ends_with("&") &&
-            !StringRef(Return).ends_with("*"))
-          fail(T, "borrowed return requires a pointer or reference result");
         llvm::SmallVector<StringRef> List;
         StringRef(Value).split(List, ',');
         for (auto Name : List) {
           auto It = Named.find(Name.str());
-          if (It == Named.end() ||
-              (!StringRef(Parameters[It->second].Type).ends_with("&") &&
-               !StringRef(Parameters[It->second].Type).ends_with("*")))
-            fail(T,
-                 "borrow contract must name a pointer or reference parameter");
+          if (It == Named.end())
+            fail(T, "unknown borrow-contract parameter");
           (Key == "noescape" ? NoEscape : Borrowed).insert(It->second);
         }
       }
@@ -1015,20 +1008,6 @@ class Parser {
       if (Key == "noescape" || Key == "returns_borrowed_from") {
         if (D.K != Node::Function)
           fail(D.At, "borrow contract requires a function");
-        if (Key == "returns_borrowed_from" &&
-            !StringRef(D.Type).ends_with("&") &&
-            !StringRef(D.Type).ends_with("*"))
-          fail(D.At, "borrowed return requires a pointer or reference result");
-        llvm::SmallVector<llvm::StringRef> Names;
-        StringRef(Value).split(Names, ',');
-        for (auto Name : Names) {
-          auto It = llvm::find_if(
-              D.Params, [&](const Node &P) { return P.Text == Name; });
-          if (It == D.Params.end() || (!StringRef(It->Type).ends_with("&") &&
-                                       !StringRef(It->Type).ends_with("*")))
-            fail(D.At,
-                 "borrow contract must name a pointer or reference parameter");
-        }
       } else if (Key == "lifecycle_effect") {
         if (D.K != Node::Function && D.K != Node::Destructor &&
             D.K != Node::Constructor)
@@ -1493,13 +1472,20 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       O.DefaultReal = V;
       continue;
     }
-    if (K == "numeric.literal.real_rounding") {
+    if (K == "numeric.literal.real_rounding" || K == "numeric.fp.rounding") {
       static const std::set<std::string> Modes = {
           "nearest_ties_even", "nearest_ties_away", "toward_zero",
           "toward_positive_infinity", "toward_negative_infinity"};
-      if (!Modes.count(V))
-        fail(N.At, "unsupported literal rounding");
-      O.LiteralRounding = V;
+      bool Operation = K == "numeric.fp.rounding";
+      if (!Modes.count(V) && !(Operation && V == "current"))
+        fail(N.At, "CFG001: invalid rounding mode");
+      if (Operation && V == "nearest_ties_away")
+        fail(N.At, "CFG002: native x86-64 arithmetic does not supply "
+                   "nearest_ties_away");
+      if (Operation)
+        O.FPRounding = V;
+      else
+        O.LiteralRounding = V;
       continue;
     }
     if (K == "numeric.fp.profile") {

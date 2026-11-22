@@ -66,6 +66,11 @@ bool cpn::implicitInteger(cpn::Value V, const std::string &T) {
          width(V.Type) + (signedType(T) && !signedType(V.Type)) <= width(T);
 }
 cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
+  if (auto Mutable = unconst(T); Mutable != T) {
+    auto View = convert(V, Mutable, At);
+    View.Readonly = true;
+    return View;
+  }
   if (V.Type == T)
     return V;
   if (floating(T))

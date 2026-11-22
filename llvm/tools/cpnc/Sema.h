@@ -9,6 +9,8 @@
 namespace cpn {
 using SourcePosition = std::pair<unsigned, unsigned>;
 using JumpCleanups = std::map<SourcePosition, std::set<SourcePosition>>;
+std::string unconst(const std::string &T);
+std::string qualifyConst(const std::string &T);
 struct Value {
   SourcePosition DeclaredAt;
   std::string Type;
@@ -142,7 +144,7 @@ struct Context {
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
   bool aggregate(const std::string &T) const {
-    return Records.count(T) || llvm::StringRef(T).ends_with("]");
+    return Records.count(unconst(T)) || llvm::StringRef(T).ends_with("]");
   }
   llvm::StructType *SlotType = nullptr;
   std::map<std::string, llvm::Constant *> TypeIDs;

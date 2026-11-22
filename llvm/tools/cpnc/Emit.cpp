@@ -15,11 +15,6 @@ std::string baseRef(std::string T) {
     T.pop_back();
   return T;
 }
-std::string unconst(std::string T) {
-  return StringRef(T).starts_with("const<") && ends(T, ">")
-             ? T.substr(6, T.size() - 7)
-             : T;
-}
 bool assignment(StringRef Op) {
   return Op == "=" || Op == "+=" || Op == "-=" || Op == "*=" || Op == "/=" ||
          Op == "%=" || Op == "&=" || Op == "|=" || Op == "^=" || Op == "<<=" ||
@@ -335,7 +330,7 @@ std::string Frame::unevaluatedType(const Node &N, bool IncludeCategory) {
            : V.Type == "real"  ? Opt.DefaultReal
                                : V.Type;
   if (IncludeCategory && V.Readonly)
-    T = "const<" + T + ">";
+    T = qualifyConst(T);
   if (IncludeCategory && V.Address && !V.Prvalue)
     T += V.Expiring ? "&&" : "&";
   return T;
@@ -495,7 +490,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         return {Expected, Match->IR};
       }
       auto V = place(A[0]);
-      Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
+      Value P{(V.Readonly ? qualifyConst(V.Type) : V.Type) + "*", V.Address};
       P.borrow(V);
       if (!V.ElementLower) {
         P.ArraySlot = nullptr;
@@ -1138,7 +1133,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
         fail(T, "constant argument required");
       auto Base = baseRef(D.Params[I]);
       CF.Scopes[0].Names[D.Decl.Params[I].Text] = {unconst(Base), C, nullptr,
-                                                   Base != unconst(Base)};
+                                                   D.Decl.Params[I].Const ||
+                                                       Base != unconst(Base)};
     }
     try {
       CF.stmt(D.Decl.Children[0]);
@@ -1369,6 +1365,11 @@ Value Frame::runInitializer(Initializer &Init, Value Target, const Token &At) {
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
+  if (auto Mutable = unconst(T); Mutable != T) {
+    auto V = construct(Mutable, Args, At, Dest, Tail, AsBase);
+    V.Readonly = true;
+    return V;
+  }
   if (T == "void")
     fail(At, "object cannot have void type");
   if (floating(T)) {
@@ -1673,7 +1674,7 @@ void Frame::drop(Value V, bool AsBase) {
 }
 void Frame::dropLayer(Value V, bool AsBase) {
   if (ends(V.Type, "]")) {
-    auto E = element(V.Type);
+    auto E = unconst(element(V.Type));
     if (ends(V.Type, "[0]") ||
         (!TracksStorage && !U.Records.count(E) && !ends(E, "]")))
       return;
@@ -1781,7 +1782,11 @@ void Frame::object(const Node &N, bool Global) {
   bool Existing = Found != names().end();
   if (Existing && !(Global && N.Foreign))
     fail(N.At, "duplicate declaration '" + Name + "'");
-  auto Ty = resolve(N.Type, N.At);
+  auto Declared = resolve(N.Type, N.At);
+  if (N.Const && (ends(Declared, "&") || ends(Declared, "]")))
+    Declared = qualifyConst(Declared);
+  auto Ty = unconst(Declared);
+  bool Readonly = N.Const || Declared != Ty;
   std::vector<Node> Args = N.Children;
   const Node *Tail = nullptr;
   if (!Args.empty() && Args.back().K == Node::Tail) {
@@ -1809,7 +1814,7 @@ void Frame::object(const Node &N, bool Global) {
       auto Prev = U.ExternalObjects.find(N.Text);
       if (Prev != U.ExternalObjects.end()) {
         G = llvm::cast<llvm::GlobalVariable>(Prev->second.Address);
-        if (Prev->second.Type != Ty || Prev->second.Readonly != N.Const ||
+        if (Prev->second.Type != Ty || Prev->second.Readonly != Readonly ||
             (N.Definition && G->hasInitializer()))
           fail(N.At, "conflicting external object declaration");
       } else if (Existing || U.M.getNamedValue(N.Text))
@@ -1822,9 +1827,9 @@ void Frame::object(const Node &N, bool Global) {
                     : llvm::GlobalValue::InternalLinkage,
           nullptr, N.Foreign ? N.Text : "cpn.g." + Name);
     if (N.Foreign)
-      U.ExternalObjects[N.Text] = {Ty, nullptr, G, N.Const};
+      U.ExternalObjects[N.Text] = {Ty, nullptr, G, Readonly};
     if (N.Foreign && !N.Definition) {
-      names()[Name] = {Ty, nullptr, G, N.Const};
+      names()[Name] = {Ty, nullptr, G, Readonly};
       return;
     }
     G->setInitializer(llvm::Constant::getNullValue(LT));
@@ -1842,10 +1847,10 @@ void Frame::object(const Node &N, bool Global) {
     if (Simple) {
       auto V = construct(Ty, Args, N.At);
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
-      G->setConstant(N.Const);
+      G->setConstant(Readonly);
       StaticConstant = N.Required ? V.IR : nullptr;
-      names()[Name] = {Ty, StaticConstant, G, N.Const};
-      if (!U.SlotType || N.Const)
+      names()[Name] = {Ty, StaticConstant, G, Readonly};
+      if (!U.SlotType || Readonly)
         return;
     }
     auto FT = llvm::FunctionType::get(B.getVoidTy(), false);
@@ -1864,7 +1869,7 @@ void Frame::object(const Node &N, bool Global) {
       U.Ready[G] = Ready;
       Init.B.CreateStore(B.getTrue(), Ready);
     }
-    Value Cell{Ty, StaticConstant, G, N.Const};
+    Value Cell{Ty, StaticConstant, G, Readonly};
     if (U.SlotType) {
       auto *GlobalSlot = new llvm::GlobalVariable(
           U.M, U.SlotType, false, llvm::GlobalValue::InternalLinkage,
@@ -1893,8 +1898,6 @@ void Frame::object(const Node &N, bool Global) {
     if (Args.size() != 1)
       fail(N.At, "reference requires one initializer");
     auto V = place(Args[0]);
-    if (N.Const && baseRef(Ty) == unconst(baseRef(Ty)))
-      Ty = "const<" + baseRef(Ty) + ">" + (ends(Ty, "&&") ? "&&" : "&");
     V = bindReference(V, Ty, N.At);
     names()[Name] = V;
     return;
@@ -1906,7 +1909,7 @@ void Frame::object(const Node &N, bool Global) {
       V = floatingConvert(V, Opt.DefaultReal, N.At);
     if (V.Type == "integer")
       V = convert(V, Opt.DefaultInt, N.At);
-    V.Readonly = N.Const;
+    V.Readonly = Readonly;
     names()[Name] = V;
     return;
   }
@@ -1946,7 +1949,7 @@ void Frame::object(const Node &N, bool Global) {
   }
   if (N.Required && !llvm::isa_and_nonnull<llvm::Constant>(V.IR))
     fail(N.At, "constexpr initializer requires a constant");
-  Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, N.Const};
+  Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, Readonly};
   if (Ty == "storage" || ends(Ty, "*"))
     Cell.borrow(V);
   if (ends(Ty, "*")) {
@@ -2034,7 +2037,7 @@ void Frame::stmt(const Node &N) {
     Value V{"void"};
     auto *Result = IR && F && U.aggregate(F->Result) ? IR->getArg(0) : nullptr;
     if (!A.empty())
-      V = eval(A[0], F ? F->Result : "", Result);
+      V = eval(A[0], F ? unconst(F->Result) : "", Result);
     if (!F)
       fail(N.At, "return requires a function");
     if (ends(F->Result, "*") || ends(F->Result, "&"))

@@ -26,6 +26,8 @@ const char *operationName(SpecialOperation Op) {
 
 bool Frame::constructible(const std::string &T, SpecialOperation Op,
                           const Token &At) {
+  if (auto Mutable = unconst(T); Mutable != T)
+    return !assignment(Op) && constructible(Mutable, Op, At);
   if (llvm::StringRef(T).ends_with("]"))
     return llvm::StringRef(T).ends_with("[0]") ||
            constructible(element(T), Op, At);
@@ -56,11 +58,19 @@ bool Frame::constructible(const std::string &T, SpecialOperation Op,
       for (const auto &Field : U.Cases.at(Key).Types)
         if (!constructible(Field, Op, At))
           return false;
-  return llvm::all_of(
-      R.Fields, [&](auto &Field) { return constructible(Field.Type, Op, At); });
+  return llvm::all_of(R.Fields, [&](auto &Field) {
+    return !(assignment(Op) && Field.Decl.Const) &&
+           constructible(Field.Type, Op, At);
+  });
 }
 void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
                      const Token &At, bool AsBase) {
+  if (auto Mutable = unconst(Source.Type); Mutable != Source.Type) {
+    if (assignment(Op))
+      fail(At, "assignment to a const subobject");
+    Source.Type = Mutable;
+    Source.Readonly = true;
+  }
   auto *Ty = U.ir(Source.Type, At);
   if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
     if (llvm::StringRef(Source.Type).ends_with("[0]"))
@@ -68,7 +78,7 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     // Evaluate aggregate designators once. Each element's own declared
     // operation executes before continuing to the next element.
     auto Elem = element(Source.Type);
-    if (U.Records.count(Elem) ||
+    if (U.Records.count(unconst(Elem)) ||
         llvm::isa<llvm::ArrayType>(Array->getElementType())) {
       auto *Preheader = B.GetInsertBlock(), *Loop = block("array.transfer"),
            *Done = block("array.done");
@@ -190,9 +200,10 @@ Value Frame::callResult(const std::string &T, llvm::Value *IRValue,
     Ref.Expiring = llvm::StringRef(T).ends_with("&&");
     return load(Ref);
   }
+  auto Mutable = unconst(T);
   if (!Storage)
-    return {T, IRValue};
-  auto V = load({T, nullptr, Storage});
+    return {Mutable, IRValue, nullptr, Mutable != T};
+  auto V = load({Mutable, nullptr, Storage, Mutable != T});
   V.Expiring = V.Prvalue = true;
   if (Storage != ExpressionDestination.Address)
     Temps.push_back(V);

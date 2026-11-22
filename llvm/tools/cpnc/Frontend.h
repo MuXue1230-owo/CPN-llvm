@@ -31,7 +31,7 @@ struct Options {
   uint64_t MaxNormalNodes = 100000, MaxSolverSteps = 1000000,
            MaxInstantiations = 1000000;
   std::string Input, Output, Config, RootID;
-  std::string FPProfile = "strict", DefaultReal = "f64",
+  std::string FPProfile = "strict", FPRounding, DefaultReal = "f64",
               LiteralRounding = "nearest_ties_even";
   std::set<unsigned> IntegerWidths{8, 16, 32, 64};
   std::set<std::string> FloatFormats{"f32", "f64"};

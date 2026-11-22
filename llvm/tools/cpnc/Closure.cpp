@@ -18,7 +18,7 @@ Value Frame::closure(const Node &N) {
     if (C.Type == "borrow") {
       if (!V.Address)
         fail(C.At, "borrow capture requires an object lvalue");
-      V.Type = (V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*";
+      V.Type = (V.Readonly ? qualifyConst(V.Type) : V.Type) + "*";
       V.IR = V.Address;
       V.Address = nullptr;
     } else if (C.Type == "this") {

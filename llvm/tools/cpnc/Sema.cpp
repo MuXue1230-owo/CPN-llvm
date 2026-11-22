@@ -48,7 +48,25 @@ std::string cpn::element(const std::string &T) {
     return T.substr(0, T.rfind('['));
   return T.empty() ? T : T.substr(0, T.size() - 1);
 }
+std::string cpn::unconst(const std::string &T) {
+  return StringRef(T).starts_with("const<") && StringRef(T).ends_with(">")
+             ? T.substr(6, T.size() - 7)
+             : T;
+}
+std::string cpn::qualifyConst(const std::string &T) {
+  if (StringRef(T).ends_with("]")) {
+    auto Extent = T.rfind('[');
+    return qualifyConst(T.substr(0, Extent)) + T.substr(Extent);
+  }
+  if (StringRef(T).ends_with("&")) {
+    auto Ref = T.find_last_not_of('&') + 1;
+    return qualifyConst(T.substr(0, Ref)) + T.substr(Ref);
+  }
+  return unconst(T) == T ? "const<" + T + ">" : T;
+}
 llvm::Type *Context::ir(const std::string &T, const Token &At) {
+  if (auto Mutable = unconst(T); Mutable != T)
+    return ir(Mutable, At);
   if (T == "f32")
     return llvm::Type::getFloatTy(C);
   if (T == "f64")
@@ -177,6 +195,14 @@ cpn::scopeKey(StringRef Prefix, StringRef Name,
     Prefix = Sep == StringRef::npos ? StringRef() : Prefix.take_front(Sep + 2);
   }
 }
+static void requireBorrowable(const std::string &T, const Token &At,
+                              bool Result) {
+  auto Type = unconst(T);
+  if (!StringRef(Type).ends_with("&") && !StringRef(Type).ends_with("*"))
+    fail(At,
+         Result ? "borrowed return requires a pointer or reference result"
+                : "borrow contract must name a pointer or reference parameter");
+}
 std::string cpn::borrowEffects(const std::set<unsigned> &NoEscape,
                                const std::set<unsigned> &Borrowed) {
   std::string Effects;
@@ -257,7 +283,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
       fail(At, "invalid function type");
     std::vector<std::string> Sig = {resolve(S.substr(9, Open - 9), At)};
     for (auto &P : splitArguments(StringRef(S).slice(Open + 1, Close)))
-      Sig.push_back(resolve(P, At));
+      Sig.push_back(unconst(resolve(P, At)));
     auto Canonical = "function<" + Sig.front() + "(";
     for (size_t I = 1; I < Sig.size(); ++I) {
       if (I > 1)
@@ -265,6 +291,17 @@ std::string Frame::resolve(std::string S, const Token &At) {
       Canonical += Sig[I];
     }
     Canonical += S.substr(Close);
+    for (auto Flag : callableFlags(Canonical)) {
+      bool Result = Flag.consume_front("borrow#");
+      if (!Result && !Flag.consume_front("noescape#"))
+        continue;
+      unsigned Position;
+      if (Flag.getAsInteger(10, Position) || Position >= Sig.size() - 1)
+        fail(At, "unknown borrow-contract parameter");
+      if (Result)
+        requireBorrowable(Sig.front(), At, true);
+      requireBorrowable(Sig[Position + 1], At, false);
+    }
     U.Signatures.try_emplace(Canonical, std::move(Sig));
     return Canonical;
   }
@@ -301,7 +338,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (StringRef(S).ends_with("&") || StringRef(S).ends_with("*"))
     return resolve(element(S), At) + S.back();
   if (StringRef(S).starts_with("const<") && StringRef(S).ends_with(">"))
-    return "const<" + resolve(S.substr(6, S.size() - 7), At) + ">";
+    return qualifyConst(resolve(S.substr(6, S.size() - 7), At));
   if (StringRef(S).starts_with("forward ")) {
     auto T = resolve(S.substr(8), At);
     return StringRef(T).ends_with("&") ? T : T + "&&";
@@ -513,7 +550,12 @@ Function *Context::declare(const Node &N, const std::string &Name,
       HasDefault = true;
     else if (HasDefault)
       fail(Arg.At, "default arguments must form a trailing suffix");
-    D.Params.push_back(Resolver.resolve(Arg.Type, Arg.At));
+    auto Type = Resolver.resolve(Arg.Type, Arg.At);
+    if (Arg.Const && StringRef(Type).ends_with("&"))
+      Type = qualifyConst(Type);
+    auto ValueType = unconst(Type);
+    D.Decl.Params[D.Params.size()].Const |= Type != ValueType;
+    D.Params.push_back(ValueType);
     Types.push_back(aggregate(D.Params.back()) ? llvm::PointerType::getUnqual(C)
                                                : ir(D.Params.back(), Arg.At));
   }
@@ -523,14 +565,18 @@ Function *Context::declare(const Node &N, const std::string &Name,
     auto It = N.Settings.find(Attr);
     if (It == N.Settings.end())
       continue;
-    std::set<unsigned> &Positions =
-        llvm::StringRef(Attr) == "noescape" ? D.NoEscape : D.BorrowedResult;
+    bool Result = llvm::StringRef(Attr) == "returns_borrowed_from";
+    if (Result)
+      requireBorrowable(D.Result, N.At, true);
+    auto &Positions = Result ? D.BorrowedResult : D.NoEscape;
     for (const auto &Param : splitArguments(It->second)) {
       auto I = llvm::find_if(N.Params,
                              [&](const Node &P) { return P.Text == Param; });
       if (I == N.Params.end())
         fail(N.At, "unknown borrow-contract parameter");
-      Positions.insert(I - N.Params.begin());
+      unsigned Position = I - N.Params.begin();
+      requireBorrowable(D.Params[Position], I->At, false);
+      Positions.insert(Position);
     }
   }
   auto &Group = Overloads[Name];
@@ -583,7 +629,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
           fail(Arg.At, "defaults belong to the canonical declaration");
       auto Defaults = Prev->Decl.Params;
       auto Canonical = Prev->Decl.Settings;
-      Prev->Decl = N;
+      Prev->Decl = D.Decl;
       Prev->ExitedLifetimes = std::move(D.ExitedLifetimes);
       for (const auto *Key :
            {"access", "virtual", "static", "override", "final"})
@@ -715,7 +761,10 @@ void Context::record(const Node &N, const std::string &Name,
           llvm::any_of(R.Fields,
                        [&](auto &F) { return F.Decl.Text == D.Text; }))
         fail(D.At, "duplicate member");
-      R.Fields.push_back({D, T, DefinitionSite{Check.Opt, Check.LookupLimit}});
+      auto Member = D;
+      Member.Const |= unconst(T) != T;
+      R.Fields.push_back(
+          {Member, unconst(T), DefinitionSite{Check.Opt, Check.LookupLimit}});
       Layout.push_back(Ty);
     }
   R.Polymorphic =

@@ -45,7 +45,8 @@ void Context::tagged(const Node &D, const std::string &Name,
       auto *Ty = ir(T, A.At);
       if (!Ty->isSized() || llvm::StringRef(T).ends_with("&"))
         fail(A.At, "union payload requires a complete object type");
-      V.Types.push_back(T);
+      V.Decl.Params[V.Types.size()].Const |= unconst(T) != T;
+      V.Types.push_back(unconst(T));
       Fields.push_back(Ty);
     }
     V.Payload = llvm::StructType::get(C, Fields);

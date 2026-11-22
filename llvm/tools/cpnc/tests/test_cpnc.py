@@ -42,6 +42,55 @@ class CompilerTests(unittest.TestCase):
         subprocess.run([*cmd, "-o", exe], check=True)
         return subprocess.run([exe], cwd=self.dir).returncode
 
+    def test_canonical_const_type_construction_and_parameters(self):
+        self.assertEqual(
+            self.program("""
+            alias Immutable=const<const<i32>>;alias Ref=i32&;
+            declare i32 twice(i32 n);
+            i32 twice(Immutable n){return n+n;}
+            i32 drops;struct R {const<i32> v(20); ~R(){++drops;}};
+            const<R> make(){return R();}
+            const<i32> id(i32 n){return n;}
+            i32 main(){R r;const<i32[2]> a(1,2); Immutable v(20);
+              const<Ref> frozen(v); const<i32*> ptr(nullptr);
+              {const<R[2]> arr; if(arr[0].v!=id(20)){return 1;}}
+              if(make().v!=20){return 2;}
+              if(drops!=3){return 3;}
+              if(SameType<const<i32[2]>,const<i32>[2]> &&
+                 SameType<const<Ref>,const<i32>&> &&
+                 SameType<function<i32(Immutable)>,function<i32(i32)>> &&
+                 sizeof(Immutable)==4 && ptr==nullptr && r.v==frozen){
+                return twice(v)+a[1];}return 0;}
+        """),
+            42,
+        )
+        for source in [
+            "void f(const<i32> n){++n;}",
+            "alias I=const<i32>;void f(){I x;x=1;}",
+            "void f(){const<i32[2]> a;a[0]=1;}",
+            "struct R{const<i32> x;};void f(){R r;r.x=1;}",
+            "void f(){i32 x;const<i32*> p(&x);p=nullptr;}",
+        ]:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_aliases_in_borrow_contract_signatures(self):
+        self.assertEqual(
+            self.program("""
+          alias Ref=i32&;
+          [[returns_borrowed_from(x),noescape(x)]] Ref forward_ref(Ref x){return x;}
+          alias F=function<Ref(Ref p) [[noescape(p),returns_borrowed_from(p)]]>*;
+          i32 main(){i32 x(41);F f(&forward_ref);++f(x);return x;}
+        """),
+            42,
+        )
+        for source in [
+            "alias I=i32; [[noescape(x)]] void f(I x){}",
+            "alias I=i32;alias P=function<I(i32& x)[[returns_borrowed_from(x)]]>*;",
+            "alias I=i32;alias P=function<void(I x)[[noescape(x)]]>*;",
+        ]:
+            self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
     def test_ordinary_names_and_lexical_type_aliases(self):
         self.assertEqual(
             self.program("""
@@ -966,6 +1015,40 @@ class CompilerTests(unittest.TestCase):
                 result = self.compile(source, "--check")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stderr)
+
+    def test_fp_rounding_and_ambient_status(self):
+        result = self.program(
+            """
+          extern "C" f32 up(f32 a,f32 b) {
+            return configured(numeric.fp.rounding=toward_positive_infinity)(a+b);
+          }
+          extern "C" f32 down(f32 a,f32 b) {
+            return configured(numeric.fp.rounding=toward_negative_infinity)(a+b);
+          }
+          extern "C" f32 cpn_truncate(f32 a,f32 b) {
+            return configured(numeric.fp.rounding=toward_zero)(a/b);
+          }
+          extern "C" f32 ambient(f32 a,f32 b) {return a+b;}
+          constexpr f32 folded(configured(numeric.fp.rounding=toward_positive_infinity)(f32(1.0)+f32(0x1.0p-24)));
+          extern "C" f32 constant_value(){return folded;}
+        """,
+            host="""
+          #include <xmmintrin.h>
+          extern float up(float,float), down(float,float), cpn_truncate(float,float);
+          extern float ambient(float,float), constant_value(void);
+          int main(void) {
+            unsigned saved = _mm_getcsr();
+            _mm_setcsr((saved & ~(0x6000u|0x3fu)) | 0x2000u | 1u);
+            float a = 1.0f, half = 0x1p-24f, next = 0x1.000002p0f;
+            int ok = up(a,half)==next && down(a,half)==a &&
+                     ambient(a,half)==a && cpn_truncate(1.0f,3.0f)==0x1.555554p-2f &&
+                     constant_value()==next;
+            unsigned after = _mm_getcsr();
+            _mm_setcsr(saved);
+            return ok && (after & 0x6000u)==0x2000u && (after & 0x21u)==0x21u ? 42 : 1;
+          }""",
+        )
+        self.assertEqual(result, 42)
 
     def test_binary_floating_literals_operations_and_native_abi(self):
         self.assertEqual(
