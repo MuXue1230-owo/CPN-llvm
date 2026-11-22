@@ -97,6 +97,7 @@ struct Record {
   bool Complete = false, Polymorphic = false, VirtualDestructor = false;
   std::vector<Function *> Virtuals;
   std::vector<DispatchTable> Tables;
+  llvm::Function *ClosureEntry = nullptr;
 };
 struct Case {
   std::string Owner;
@@ -333,6 +334,7 @@ public:
   void consume(Value);
   bool adjust(Value &, const std::string &, const Token &, bool Emit = true);
   Value closure(const Node &);
+  Value closurePointer(const Value &, const std::string &, const Token &);
   Value callClosure(Value, const std::vector<Node> &, const Token &);
   void bindCaptures();
   Value indirect(Value, const std::vector<Node> &, const Token &);

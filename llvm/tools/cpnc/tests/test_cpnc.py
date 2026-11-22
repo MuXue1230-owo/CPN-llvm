@@ -702,6 +702,42 @@ class CompilerTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn(message, r.stderr)
 
+    def test_captureless_closure_explicit_function_pointer(self):
+        self.assertEqual(
+            self.program("""
+            struct Box{Box* self;i32 n;Box(i32 v){init self(this);init n(v);}};
+            function<i32(i32) noexcept>* factory(){
+                function<i32(i32) noexcept>* p([] i32(i32 n) noexcept {return n+1;});
+                return p;
+            }
+            i32 main(){
+                auto make([] Box(i32 n){return Box(n);});
+                function<Box(i32)>* p(make);
+                Box v(p(40));
+                function<i32(Box)>* f([] i32(Box b){if(b.self!=&b){return 0;}return b.n;});
+                if(v.self==&v && f(p(40))==40){return factory()(41);}return 0;
+            }"""),
+            42,
+        )
+        for body, diagnostic in [
+            ("i32 x;function<void()>* p([x] void(){});", "captureless"),
+            ("function<i32(i32)>* p([] i64(i32 n){return n;});", "signature"),
+            ("function<void() noexcept>* p([] void(){});", "signature"),
+            (
+                "function<void(D&)>* p([] void(D& d){abandon_base<B>(d);});",
+                "lifecycle_effect",
+            ),
+            ("take([] void(){});", "no viable overload"),
+        ]:
+            with self.subTest(body=body):
+                r = self.compile(
+                    "struct B{};struct D:B{Complete base<B>;};"
+                    "void take(function<void()>* p){}void f(){" + body + "}",
+                    "--check",
+                )
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(diagnostic, r.stderr)
+
     def test_static_local_initializes_at_startup(self):
         self.assertEqual(
             self.program("""

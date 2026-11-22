@@ -53,6 +53,7 @@ Value Frame::closure(const Node &N) {
     Op.Text = Op.At.Text = "$call";
     Op.Settings["closure"] = "true";
     Op.TemplateArgs.clear();
+    EnterDefinition Site(U, {Opt, LookupLimit});
     auto *D = U.declare(Op, Type + "::$call", Prefix, Env, Type);
     U.emit(*D);
   }
@@ -112,4 +113,44 @@ Value Frame::callClosure(Value Receiver, const std::vector<Node> &Args,
   auto *Op = select(Designator.Text, Designator, Actual.Values, Receiver);
   admitArguments(Actual, Op, At);
   return invoke(*Op, std::move(Actual.Values), At, Receiver, true);
+}
+
+Value Frame::closurePointer(const Value &Source, const std::string &T,
+                            const Token &At) {
+  auto &R = U.Records.at(Source.Type);
+  if (!R.Fields.empty())
+    fail(At, "function pointer requires a captureless closure");
+  auto &Op = *U.Overloads.at(Source.Type + "::$call").front();
+  auto Contract = T.substr(0, T.size() - 1);
+  const auto &Sig = U.Signatures.at(Contract);
+  if (Sig.front() != Op.Result ||
+      !llvm::equal(llvm::ArrayRef(Sig).drop_front(), Op.Params) ||
+      (callableFlag(Contract, " noexcept") && !Op.Decl.Noexcept))
+    fail(At, "closure signature is incompatible with function pointer");
+  if (!callableFlag(Contract, " whole"))
+    U.RestrictedPointers.emplace_back(&Op, At);
+  if (!R.ClosureEntry) {
+    // The native entry omits the receiver. Preserve the result slot and
+    // parameter objects supplied by the indirect caller.
+    auto *Method = Op.IR->getFunctionType();
+    unsigned Receiver = U.aggregate(Op.Result) ? 1 : 0;
+    std::vector<llvm::Type *> Params(Method->param_begin(),
+                                     Method->param_end());
+    Params.erase(Params.begin() + Receiver);
+    auto *FT = llvm::FunctionType::get(Method->getReturnType(), Params, false);
+    R.ClosureEntry = llvm::Function::Create(
+        FT, llvm::GlobalValue::InternalLinkage, Op.Name + ".entry", U.M);
+    llvm::IRBuilder<> Entry(
+        llvm::BasicBlock::Create(U.C, "entry", R.ClosureEntry));
+    std::vector<llvm::Value *> Args;
+    for (auto &Arg : R.ClosureEntry->args())
+      Args.push_back(&Arg);
+    Args.insert(Args.begin() + Receiver, Entry.CreateAlloca(R.IR));
+    auto *Result = Entry.CreateCall(Op.IR, Args);
+    if (FT->getReturnType()->isVoidTy())
+      Entry.CreateRetVoid();
+    else
+      Entry.CreateRet(Result);
+  }
+  return {T, R.ClosureEntry};
 }

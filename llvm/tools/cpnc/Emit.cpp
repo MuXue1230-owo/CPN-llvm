@@ -1047,8 +1047,13 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
-  if (C.K != Node::Unary && C.K != Node::Name && C.K != Node::Member)
-    return callClosure(eval(C), Args, C.At);
+  if (C.K != Node::Name && C.K != Node::Member &&
+      !(C.K == Node::Unary && C.Text == "*")) {
+    auto Callee = eval(C);
+    if (ends(Callee.Type, "*") && U.Signatures.count(element(Callee.Type)))
+      return indirect(Callee, Args, C.At);
+    return callClosure(Callee, Args, C.At);
+  }
   if (C.K == Node::Unary && C.Text == "*" && C.Children.size() == 1)
     return indirect(eval(C.Children[0]), Args, C.At);
   if (C.K == Node::Name) {
@@ -1387,8 +1392,16 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     fail(At, "enum has no zero-valued default");
   if (Args.size() > 1)
     fail(At, "invalid scalar construction");
-  Value V = Args.empty() ? Value{T, llvm::Constant::getNullValue(Ty)}
-                         : convert(eval(Args[0], T), T, At);
+  Value V{T, llvm::Constant::getNullValue(Ty)};
+  if (!Args.empty()) {
+    auto Source = eval(Args[0], T);
+    if (ends(T, "*") && U.Signatures.count(element(T)) &&
+        U.Records.count(Source.Type) &&
+        U.Records.at(Source.Type).Decl.K == Node::Lambda)
+      V = closurePointer(Source, T, At);
+    else
+      V = convert(Source, T, At);
+  }
   if (Dest)
     B.CreateStore(V.IR, Dest);
   if (Tail) {
