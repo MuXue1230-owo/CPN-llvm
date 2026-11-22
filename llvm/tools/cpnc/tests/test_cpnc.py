@@ -42,6 +42,47 @@ class CompilerTests(unittest.TestCase):
         subprocess.run([*cmd, "-o", exe], check=True)
         return subprocess.run([exe], cwd=self.dir).returncode
 
+    def test_ordinary_names_and_lexical_type_aliases(self):
+        self.assertEqual(
+            self.program("""
+          alias Number=i32;
+          generic<type T> T copy(T x){alias Local=T;return Local(x);}
+          i32 main(){Number n(39);alias Ptr=Number*;Ptr p(&n);
+            {alias Number=i8;Number v(2);n+=v;}
+            {alias Count=i32;auto get([] Count(){return Count(1);});n+=get();}
+            return copy(*p);}
+        """),
+            42,
+        )
+        rejected = [
+            "alias A=i32; alias A=i32;",
+            "alias A=i32; i32 A;",
+            "i32 f(){return 1;} struct f{};",
+            "enum E:i32{case A(0),case A(1)};",
+            "enum E:i32{case A(0)};enum E:i32{case B(1)};",
+            "void f(){alias T=i32;i32 T;}",
+            "void f(){i32 T;alias T=i32;}",
+            "void f(){{alias T=i32;}T x;}",
+            "i32 g(){return 42;} i32 f(){i32 g;return g();}",
+        ]
+        for source in rejected:
+            with self.subTest(source=source):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_parenthesized_type_and_expression_disambiguation(self):
+        self.assertEqual(
+            self.program("""
+          alias T=i64; i32 calls;
+          struct Small{i8 v;Small(i32 n){calls+=n;}};
+          i32 size_value(i8 T){return sizeof(T)==1 && sizeof(::T)==8 ? 42 : 0;}
+          i32 main(){((i32)) n(42);(i32)* p(&n);
+            if(sizeof((i32(1)+1))!=4 || sizeof(Small(1))!=1 ||
+               alignof(((i32)))!=4 || calls!=0 || (*p)!=42){return 1;}
+            return size_value(1);}
+        """),
+            42,
+        )
+
     def test_configured_widths_and_scope(self):
         self.assertEqual(
             self.program("""

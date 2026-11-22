@@ -279,6 +279,12 @@ std::string Frame::resolve(std::string S, const Token &At) {
     fail(At, "CFG002: integer type " + S + " is disabled");
   if (builtin(S) || S == "auto")
     return S;
+  for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+    if (auto Alias = I->Aliases.find(S); Alias != I->Aliases.end())
+      return Alias->second;
+    if (I->Names.count(S))
+      fail(At, "object name '" + S + "' does not name a type");
+  }
   if (auto I = Env.Types.find(S); I != Env.Types.end())
     return I->second;
   if (StringRef(S).ends_with("]")) {
@@ -889,6 +895,13 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
     llvm::SaveAndRestore Policy(Opt);
     for (const auto &PrefixPolicy : D.Policies)
       configure(Opt, PrefixPolicy, ConfigScope::Declaration);
+    if (D.K != Node::Linkage && !D.Settings.count("qualifier") &&
+        !D.Settings.count("specialize")) {
+      auto [Bound, Inserted] = Declarations.emplace(Name, D.K);
+      if (!Inserted && Bound->second != D.K)
+        fail(D.At,
+             "conflicting nominal or ordinary declaration of '" + Name + "'");
+    }
     if (D.K == Node::Linkage || D.K == Node::Namespace) {
       unit(D.Children, D.K == Node::Linkage ? P : Name + "::");
       continue;
@@ -952,7 +965,8 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
     }
     Frame F(*this, nullptr, nullptr, P);
     if (D.K == Node::Alias) {
-      Aliases[Name] = F.resolve(D.Type, D.At);
+      if (!Aliases.emplace(Name, F.resolve(D.Type, D.At)).second)
+        fail(D.At, "duplicate alias '" + Name + "'");
       continue;
     }
     if (D.K == Node::Enumeration) {
@@ -961,6 +975,8 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
         fail(D.At, "integer enum underlying type required");
       if (Enums.count(Name) && Enums.at(Name) != Ty)
         fail(D.At, "incompatible enum declaration");
+      if (!D.Prototype && !DefinedEnums.insert(Name).second)
+        fail(D.At, "duplicate enum definition '" + Name + "'");
       Enums[Name] = Ty;
       std::set<uint64_t> Values;
       for (auto &Case : D.Children) {
@@ -971,7 +987,8 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
         if (!Values.insert(K).second)
           fail(Case.At, "duplicate enum value");
         V.Type = Name;
-        Globals[Name + "::" + Case.Text] = V;
+        if (!Globals.emplace(Name + "::" + Case.Text, V).second)
+          fail(Case.At, "duplicate enumerator '" + Case.Text + "'");
       }
       continue;
     }

@@ -71,6 +71,8 @@ struct Check {
     }
     if (N.K == Node::Name && !known(N.Text))
       fail(N.At, "unknown name '" + N.Text + "'");
+    if (N.K == Node::Alias)
+      Names.insert(N.Text);
     if (N.K == Node::Object) {
       Names.insert(N.Text);
       Active.push_back(&N);
@@ -155,7 +157,7 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
   // Ordinary expressions bind as they are emitted. Check discarded arms and
   // dependent definitions here since neither necessarily has a runtime entry.
   std::function<void(const Node &)> collect = [&](const Node &S) {
-    if (S.K == Node::Object)
+    if (S.K == Node::Object || S.K == Node::Alias)
       Ch.Names.insert(S.Text);
     if (S.K == Node::If && S.Required) {
       Ch.visit(S, Scope);

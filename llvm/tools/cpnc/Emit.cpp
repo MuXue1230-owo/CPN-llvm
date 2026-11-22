@@ -32,6 +32,8 @@ struct Transfer {
 } // namespace
 Value Frame::lookup(const Token &T) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+    if (I->Aliases.count(T.Text))
+      fail(T, "type alias requires a type or construction context");
     auto V = I->Names.find(T.Text);
     if (V != I->Names.end()) {
       if (V->second.Type.empty())
@@ -1203,12 +1205,16 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     return indirect(eval(C.Children[0]), Args, C.At);
   if (C.K == Node::Name) {
     for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+      if (I->Aliases.count(C.Text))
+        break;
       auto V = I->Names.find(C.Text);
       if (V != I->Names.end() && U.Records.count(V->second.Type))
         return callClosure(V->second, Args, C.At);
       if (V != I->Names.end() && ends(V->second.Type, "*") &&
           U.Signatures.count(element(V->second.Type)))
         return indirect(load(V->second), Args, C.At);
+      if (V != I->Names.end())
+        fail(C.At, "object is not callable");
     }
   }
   if (C.K == Node::Member) {
@@ -1294,6 +1300,12 @@ std::string Frame::initSlot(const Node &N) {
   return N.Text;
 }
 bool Frame::typeCallee(const std::string &Name) const {
+  for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+    if (I->Aliases.count(Name))
+      return true;
+    if (I->Names.count(Name))
+      return false;
+  }
   if (builtin(Name) || Env.Types.count(Name))
     return true;
   auto Base = Name.substr(0, Name.find('<'));
@@ -1736,6 +1748,8 @@ void Frame::object(const Node &N, bool Global) {
   std::string Name = Global ? Prefix + N.Text : N.Text;
   if (Global && N.Settings.count("identity"))
     Name = N.Settings.at("identity");
+  if (!Global && Scopes.back().Aliases.count(N.Text))
+    fail(N.At, "duplicate declaration '" + N.Text + "'");
   if (!Global && N.Settings.count("storage")) {
     if (N.Settings.at("storage") != "static")
       fail(N.At, "thread-local storage is unavailable on this configuration");
@@ -1750,6 +1764,10 @@ void Frame::object(const Node &N, bool Global) {
       D.Settings["identity"] = ID;
       Frame Init(U, nullptr, nullptr, Prefix);
       Init.Env = Env;
+      Init.Opt = Opt;
+      for (const auto &Scope : Scopes)
+        for (const auto &[Alias, Type] : Scope.Aliases)
+          Init.Env.Types[Alias] = Type;
       Init.object(D, true);
       U.Statics.emplace_back(ID, D);
     }
@@ -1835,6 +1853,7 @@ void Frame::object(const Node &N, bool Global) {
                                       "cpn.static.init", U.M);
     Frame Init(U, nullptr, Fn, Prefix);
     Init.Env = Env;
+    Init.Opt = Opt;
     Init.B.SetInsertPoint(Init.block("entry"));
     if (!Simple) {
       Init.construct(Ty, Args, N.At, G, Tail);
@@ -1966,6 +1985,14 @@ void Frame::stmt(const Node &N) {
   }
   if (N.K == Node::Init || N.K == Node::Empty)
     return;
+  if (N.K == Node::Alias) {
+    auto &Scope = Scopes.back();
+    auto Type = resolve(N.Type, N.At);
+    if (Scope.Names.count(N.Text) ||
+        !Scope.Aliases.emplace(N.Text, Type).second)
+      fail(N.At, "duplicate declaration '" + N.Text + "'");
+    return;
+  }
   if (N.K == Node::Object) {
     object(N);
     return;

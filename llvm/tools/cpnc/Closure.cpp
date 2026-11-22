@@ -54,7 +54,11 @@ Value Frame::closure(const Node &N) {
     Op.Settings["closure"] = "true";
     Op.TemplateArgs.clear();
     EnterDefinition Site(U, {Opt, LookupLimit});
-    auto *D = U.declare(Op, Type + "::$call", Prefix, Env, Type);
+    auto Lexical = Env;
+    for (const auto &Scope : Scopes)
+      for (const auto &[Alias, Type] : Scope.Aliases)
+        Lexical.Types[Alias] = Type;
+    auto *D = U.declare(Op, Type + "::$call", Prefix, Lexical, Type);
     U.emit(*D);
   }
   auto &R = U.Records.at(Type);

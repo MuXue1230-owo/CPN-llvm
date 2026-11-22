@@ -134,6 +134,8 @@ struct Context {
   llvm::LLVMContext &C;
   Options Opt;
   std::map<std::string, std::string> Aliases, Enums;
+  std::map<std::string, Node::Kind> Declarations;
+  std::set<std::string> DefinedEnums;
   std::map<std::string, Record> Records;
   std::map<std::string, std::pair<std::string, Node>> StaticMembers;
   std::map<std::string, Value> Globals, ExternalObjects;
@@ -227,6 +229,7 @@ bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);
 unsigned width(const std::string &T);
 struct Local {
+  std::map<std::string, std::string> Aliases;
   std::map<std::string, Value> Names;
   std::vector<Value> Drops;
 };

@@ -109,7 +109,7 @@ int precedence(const std::string &S) {
 class Parser {
   std::vector<Token> Tokens;
   size_t Pos = 0;
-  std::set<std::string> Types;
+  std::set<std::string> Types, HiddenTypes;
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
   unsigned Depth = 0;
@@ -230,7 +230,9 @@ class Parser {
     return T;
   }
   bool known(StringRef S) const {
-    S.consume_front("::");
+    bool Root = S.consume_front("::");
+    if (!Root && HiddenTypes.count(S.str()))
+      return false;
     return builtin(S) || Types.count(S.split('<').first.str()) ||
            S == "const" || S == "function" || S == "decltype";
   }
@@ -442,7 +444,7 @@ class Parser {
     } else if (is("sizeof") || is("alignof")) {
       N = Node(Node::Unary, take());
       expect("(");
-      if (startsType()) {
+      if (typeBefore(false)) {
         Node Ty(Node::TypeArg, peek());
         Ty.Type = type();
         N.Children.push_back(Ty);
@@ -575,6 +577,8 @@ class Parser {
   }
   Node block(bool Construction = false) {
     Nest Guard(Depth, peek());
+    auto OuterTypes = Types;
+    auto OuterHidden = HiddenTypes;
     Node B(Node::Block, expect("{"));
     while (!eat("}")) {
       if (Construction && eat("init")) {
@@ -589,6 +593,8 @@ class Parser {
       } else
         B.Children.push_back(statement());
     }
+    Types = std::move(OuterTypes);
+    HiddenTypes = std::move(OuterHidden);
     return B;
   }
   Node object(Token T, std::string Ty, bool RO, bool CX) {
@@ -611,21 +617,32 @@ class Parser {
     expect(";");
     return O;
   }
-  bool startsType() const {
-    size_t Start = is("::") ? 1 : 0;
-    auto S = peek(Start).Text;
+  // A parenthesized type and a grouped expression share a prefix. Commit to
+  // the type production only when its complete declarator or delimiter follows.
+  bool typeBefore(bool Declarator) {
+    size_t Start = 0;
+    while (peek(Start).Text == "(")
+      ++Start;
+    bool Root = peek(Start).Text == "::";
+    if (Root)
+      ++Start;
+    std::string S = Root ? "::" + peek(Start).Text : peek(Start).Text;
     for (size_t I = Start + 1; peek(I).Text == "::"; I += 2)
       S += "::" + peek(I + 1).Text;
-    return known(S);
-  }
-  bool startsObject() {
-    if (!startsType())
+    if (!known(S))
       return false;
-    auto Start = Pos;
-    type();
-    bool Object = identifier(peek().Text) && !Reserved.count(peek().Text);
-    Pos = Start;
-    return Object;
+    auto Saved = Pos;
+    bool Match = false;
+    try {
+      type();
+      Match = Declarator
+                  ? identifier(peek().Text) && !Reserved.count(peek().Text)
+                  : is(")");
+    } catch (const Diagnostic &) {
+      // The expression production supplies the diagnostic if neither fits.
+    }
+    Pos = Saved;
+    return Match;
   }
   Node simple() {
     if (is("static") || is("thread_local")) {
@@ -642,9 +659,11 @@ class Parser {
     if (RO)
       take();
     bool CX = !RO && eat("constexpr");
-    if (RO || CX || is("auto") || startsObject()) {
+    if (RO || CX || is("auto") || typeBefore(true)) {
       auto Ty = eat("auto") ? std::string("auto") : type();
       auto Id = name();
+      if (Types.count(Id.Text))
+        HiddenTypes.insert(Id.Text);
       return object(Id, Ty, RO, CX);
     }
     Node S(Node::Expression, peek());
@@ -663,6 +682,8 @@ class Parser {
     auto T = peek();
     if (is("{"))
       return block();
+    if (is("alias"))
+      return declaration();
     if (eat("if")) {
       Node N(Node::If, T);
       N.Required = eat("constexpr");
@@ -685,6 +706,8 @@ class Parser {
       return N;
     }
     if (eat("for")) {
+      auto OuterTypes = Types;
+      auto OuterHidden = HiddenTypes;
       Node N(Node::For, T);
       expect("(");
       N.Children = {simple(), is(";") ? Node() : expr()};
@@ -692,6 +715,8 @@ class Parser {
       N.Children.push_back(is(")") ? Node() : expr());
       expect(")");
       N.Children.push_back(block());
+      Types = std::move(OuterTypes);
+      HiddenTypes = std::move(OuterHidden);
       return N;
     }
     if (eat("match")) {
@@ -768,8 +793,8 @@ class Parser {
       if (is("{"))
         N.Children = {block()};
       else {
-        auto D = simple();
-        if (D.K != Node::Object)
+        auto D = is("alias") ? declaration() : simple();
+        if (D.K != Node::Object && D.K != Node::Alias)
           fail(D.At, "expected configured declaration, block or parenthesized "
                      "expression");
         N.Children = {std::move(D)};
@@ -787,7 +812,7 @@ class Parser {
       expect(":");
       Node N(Node::Label, L);
       N.Children = {statement()};
-      if (N.Children[0].K == Node::Object)
+      if (N.Children[0].K == Node::Object || N.Children[0].K == Node::Alias)
         fail(L, "a label requires a statement");
       return N;
     }
@@ -1116,6 +1141,7 @@ class Parser {
       N.Type = type();
       expect(";");
       Types.insert(N.Text);
+      HiddenTypes.erase(N.Text);
       return N;
     }
     auto Saved = Types;
@@ -1372,8 +1398,14 @@ class Parser {
       F.Settings["control"] = definitionControl();
       if (F.Settings["control"] == "default" && F.Text != "operator=")
         fail(F.At, "this function has no generated default definition");
-    } else
+    } else {
+      auto OuterHidden = HiddenTypes;
+      for (const auto &P : F.Params)
+        if (Types.count(P.Text))
+          HiddenTypes.insert(P.Text);
       F.Children.push_back(block());
+      HiddenTypes = std::move(OuterHidden);
+    }
     Types = std::move(Saved);
     return F;
   }
