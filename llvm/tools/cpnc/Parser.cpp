@@ -396,6 +396,7 @@ class Parser {
     if (eat("(")) {
       N = expr();
       expect(")");
+      N.Grouped = true;
     } else if (is("+") || is("-") || is("!") || is("~") || is("&") || is("*") ||
                is("++") || is("--")) {
       N = Node(Node::Unary, take());
@@ -527,35 +528,49 @@ class Parser {
     }
     return N;
   }
+  std::string metadataValue() {
+    Nest Guard(Depth, peek());
+    auto T = take();
+    if (T.Text == "[") {
+      std::string List = "[";
+      if (!eat("]")) {
+        do {
+          if (List.size() > 1)
+            List += ",";
+          List += metadataValue();
+        } while (eat(","));
+        expect("]");
+      }
+      return List + "]";
+    }
+    if (identifier(T.Text) || T.Text.front() == '"')
+      return T.Text;
+    if (llvm::isDigit(T.Text.front()) && !realToken(T.Text))
+      return llvm::toString(integerLiteral(T), 10, false);
+    fail(T, "CFG001: expected configuration value");
+  }
   std::map<std::string, std::string> settings(bool File) {
     expect(File ? "{" : "(");
     std::map<std::string, std::string> M;
-    while (!eat(File ? "}" : ")")) {
+    if (File && eat("}"))
+      return M;
+    do {
       auto K = take();
-      while (eat("."))
-        K.Text += "." + take().Text;
+      if (!identifier(K.Text))
+        fail(K, "CFG001: expected configuration key");
+      while (eat(".")) {
+        auto Part = take();
+        if (!identifier(Part.Text))
+          fail(Part, "CFG001: expected a configuration key component");
+        K.Text += "." + Part.Text;
+      }
       expect("=");
-      if (M.count(K.Text))
-        fail(K, "duplicate configuration key");
-      std::string V;
-      if (eat("[")) {
-        V = "[";
-        while (!eat("]")) {
-          if (is("["))
-            fail(peek(), "CFG001: invalid nested configuration list");
-          V += take().Text;
-        }
-        V += "]";
-      } else
-        V = take().Text;
-      M[K.Text] = V;
+      if (!M.emplace(K.Text, metadataValue()).second)
+        fail(K, "CFG001: duplicate configuration key");
       if (File)
         expect(";");
-      else if (!eat(",")) {
-        expect(")");
-        break;
-      }
-    }
+    } while (File ? !is("}") : eat(","));
+    expect(File ? "}" : ")");
     return M;
   }
   Node block(bool Construction = false) {
@@ -735,17 +750,29 @@ class Parser {
              : T.Text == "goto"     ? Node::Goto
                                     : Node::Fallthrough,
              T);
-      N.Text = is(";") ? "" : name().Text;
+      N.Text.clear();
+      if (N.K == Node::Goto || (N.K != Node::Fallthrough && !is(";")))
+        N.Text = name().Text;
       expect(";");
       return N;
     }
-    if (eat("configured")) {
+    if (is("configured")) {
+      auto Start = Pos;
+      take();
       Node N(Node::Configured, T);
       N.Settings = settings(false);
+      if (is("(")) {
+        Pos = Start;
+        return simple();
+      }
       if (is("{"))
         N.Children = {block()};
       else {
-        N.Children = {simple()};
+        auto D = simple();
+        if (D.K != Node::Object)
+          fail(D.At, "expected configured declaration, block or parenthesized "
+                     "expression");
+        N.Children = {std::move(D)};
       }
       return N;
     }
@@ -1375,7 +1402,7 @@ std::vector<Node> cpn::parse(StringRef S, const Options &O) {
 Node cpn::parseExpression(StringRef S, const Options &O) {
   return Parser(lex(S, O)).expression();
 }
-void cpn::configure(Options &O, const Node &N) {
+void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
   auto P = N.Settings.find("preset");
   if (P != N.Settings.end()) {
     auto V = P->second;
@@ -1390,6 +1417,31 @@ void cpn::configure(Options &O, const Node &N) {
     auto &V = KV.second;
     if (K == "preset")
       continue;
+    if (K == "compilation.modules" || K == "compilation.separate" ||
+        K == "tooling.contract_export") {
+      if (V == "true")
+        fail(N.At, "CFG002: " + K + " is unavailable");
+      if (V != "false")
+        fail(N.At, "CFG001: expected Boolean value for " + K);
+    }
+    if ((K == "target" || K == "source.identifiers" ||
+         K == "source.unicode_version" || K == "compilation.modules" ||
+         K == "compilation.separate" || K == "tooling.contract_export") &&
+        Scope != ConfigScope::Project)
+      fail(N.At, "CFG001: " + K +
+                     " must be bound before source tokenization or binding");
+    if ((K == "numeric.float.formats" || K == "numeric.integer.widths") &&
+        Scope > ConfigScope::Declaration)
+      fail(N.At,
+           "CFG001: " + K + " cannot be overridden below declaration scope");
+    if (K == "compilation.modules" || K == "compilation.separate" ||
+        K == "tooling.contract_export")
+      continue;
+    if (K == "source.unicode_version") {
+      if (V != "\"17.0.0\"")
+        fail(N.At, "CFG002: unavailable Unicode data version");
+      continue;
+    }
     if (K == "generic.max_normalization_nodes" ||
         K == "generic.max_solver_steps" || K == "generic.max_instantiations") {
       uint64_t Limit;
@@ -1453,40 +1505,65 @@ void cpn::configure(Options &O, const Node &N) {
         fail(N.At, "unknown identifier profile");
       O.ASCII = V == "ascii";
     } else if (K == "numeric.literal.integer_default") {
-      if (!builtin(V) || V.empty() || V[0] != 'i')
-        fail(N.At, "invalid default integer");
+      if (!builtin(V) || V.empty() || V[0] != 'i' || V == "isize")
+        fail(N.At, "CFG001: invalid default integer");
       O.DefaultInt = V;
     } else if (K == "target") {
       if (V != "\"x86_64-linux-gnu\"")
         fail(N.At, "unsupported target");
     } else if (K == "numeric.integer.widths") {
-      if (V != "[8,16,32,64]")
-        fail(N.At, "unsupported integer width catalogue");
+      StringRef List(V);
+      if (!List.consume_front("[") || !List.consume_back("]"))
+        fail(N.At, "CFG001: expected a list of integer widths");
+      llvm::SmallVector<StringRef> Members;
+      List.split(Members, ',');
+      O.IntegerWidths.clear();
+      for (auto Member : Members) {
+        uint64_t W;
+        if (Member.getAsInteger(10, W) || !W)
+          fail(N.At, "CFG001: invalid integer width");
+        if (W != 8 && W != 16 && W != 32 && W != 64)
+          fail(N.At, "CFG002: unavailable integer width " + Member.str());
+        if (!O.IntegerWidths.insert(W).second)
+          fail(N.At, "CFG001: duplicate integer width");
+      }
+    } else if (K == "diagnostics.minimum") {
+      static const std::map<std::string, Severity> Levels{
+          {"INFO", Severity::Info},
+          {"WARNING", Severity::Warning},
+          {"ANOMALY", Severity::Anomaly},
+          {"ERROR", Severity::Error},
+          {"none", Severity::None}};
+      auto It = Levels.find(V);
+      if (It == Levels.end())
+        fail(N.At, "CFG001: invalid minimum diagnostic category");
+      O.Minimum = It->second;
     } else if (K == "diagnostics.promote" || K == "diagnostics.suppress") {
       if (!StringRef(V).starts_with("[") || !StringRef(V).ends_with("]"))
         fail(N.At, "CFG001: diagnostic selection requires a list");
       static const std::set<std::string> NonErrors{
-          "WARNING", "ANOMALY", "LIFE003", "LIFE004", "GEN001",
-          "NUM002",  "NUM003",  "STAT002", "EXC001"};
+          "LIFE003", "LIFE004", "GEN001", "NUM002",
+          "NUM003",  "STAT002", "EXC001"};
+      bool Promoting = K == "diagnostics.promote";
+      auto &Selection = Promoting ? O.Promote : O.Suppress;
+      Selection.clear();
       llvm::SmallVector<StringRef> Codes;
       StringRef(V).drop_front().drop_back().split(Codes, ',', -1, false);
-      for (auto Code : Codes)
-        if (!NonErrors.count(Code.str()))
-          fail(N.At, "CFG001: mandatory error or unknown diagnostic cannot be "
-                     "suppressed or promoted");
-      bool W = llvm::is_contained(Codes, "WARNING");
-      bool A = llvm::is_contained(Codes, "ANOMALY") ||
-               llvm::is_contained(Codes, "LIFE004");
-      if (K == "diagnostics.promote") {
-        O.Promote = W;
-        O.PromoteAbandon = A;
-      } else {
-        O.Silence = W;
-        O.SilenceAbandon = A;
+      for (auto Code : Codes) {
+        bool Category =
+            Code == "INFO" || Code == "WARNING" || Code == "ANOMALY";
+        if (!NonErrors.count(Code.str()) && !(Promoting && Category))
+          fail(N.At, "CFG001: invalid diagnostic selection for " + K);
+        Selection.insert(Code.str());
       }
     } else
-      fail(N.At, K == "compilation.modules"
-                     ? "CFG002: module compilation unavailable"
-                     : "CFG001: unknown configuration key '" + K + "'");
+      fail(N.At, "CFG001: unknown configuration key '" + K + "'");
   }
+  unsigned DefaultWidth = 0;
+  StringRef(O.DefaultInt).drop_front().getAsInteger(10, DefaultWidth);
+  if (!O.IntegerWidths.count(DefaultWidth))
+    fail(N.At, "CFG002: literal default " + O.DefaultInt + " is disabled");
+  if (N.Settings.count("numeric.literal.real_default") &&
+      !O.FloatFormats.count(O.DefaultReal))
+    fail(N.At, "CFG002: literal default " + O.DefaultReal + " is disabled");
 }

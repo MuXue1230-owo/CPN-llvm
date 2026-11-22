@@ -10,7 +10,8 @@
 
 namespace llvm {
 class Module;
-}
+class APInt;
+} // namespace llvm
 namespace cpn {
 struct Token {
   std::string Text;
@@ -24,21 +25,27 @@ struct Diagnostic {
   throw Diagnostic{At, Message};
 }
 struct ResourceExhausted : Diagnostic {};
+enum class ConfigScope { Project, File, Declaration, Block, Expression };
+enum class Severity { Info, Warning, Anomaly, Error, None };
 struct Options {
   uint64_t MaxNormalNodes = 100000, MaxSolverSteps = 1000000,
            MaxInstantiations = 1000000;
   std::string Input, Output, Config, RootID;
   std::string FPProfile = "strict", DefaultReal = "f64",
               LiteralRounding = "nearest_ties_even";
+  std::set<unsigned> IntegerWidths{8, 16, 32, 64};
   std::set<std::string> FloatFormats{"f32", "f64"};
   std::string Overflow = "checked", DefaultInt = "i32";
-  bool ASCII = false, Promote = false, Silence = false, Check = false,
-       IR = false;
-  bool PromoteAbandon = false, SilenceAbandon = false;
+  bool ASCII = false, Check = false, IR = false;
+  Severity Minimum = Severity::Warning;
+  std::set<std::string> Promote, Suppress;
+  void diagnose(const Token &, Severity, llvm::StringRef Code,
+                llvm::StringRef Message) const;
   void warn(const Token &, llvm::StringRef) const;
 };
 std::vector<Token> lex(llvm::StringRef, const Options &);
 std::string unquote(const Token &);
+llvm::APInt integerLiteral(const Token &);
 bool identifier(llvm::StringRef);
 inline bool operatorSpelling(llvm::StringRef Name) {
   return Name.consume_front("operator") && !Name.empty() &&
@@ -110,7 +117,7 @@ struct Node {
   std::string Text, Type;
   std::vector<Node> Children, Params, Generics, TemplateArgs, Policies, Pattern;
   std::map<std::string, std::string> Settings;
-  bool HasInitializer = false, ExplicitApplication = false;
+  bool HasInitializer = false, ExplicitApplication = false, Grouped = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,
        Definition = false, Noexcept = false, Pack = false;
   Node() = default;
@@ -120,7 +127,7 @@ std::string borrowEffects(const std::set<unsigned> &NoEscape,
                           const std::set<unsigned> &Borrowed);
 std::vector<Node> parse(llvm::StringRef, const Options &);
 Node parseExpression(llvm::StringRef, const Options &);
-void configure(Options &, const Node &);
+void configure(Options &, const Node &, ConfigScope);
 void compile(llvm::Module &, const std::vector<Node> &, Options);
 } // namespace cpn
 #endif

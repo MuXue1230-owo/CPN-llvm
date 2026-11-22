@@ -137,6 +137,12 @@ void Construction::advance(Frame &Current) {
     } else {
       Source->Scopes = {std::move(Earlier), Old.front()};
     }
+    llvm::SaveAndRestore Policy(Source->Opt);
+    llvm::SaveAndRestore Limit(Source->LookupLimit);
+    if (It == Explicit.end() && F.DefaultSite) {
+      Source->Opt = F.DefaultSite->Configuration;
+      Source->LookupLimit = F.DefaultSite->Through;
+    }
     Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
                       Frontier < R.Bases.size());
     Source->endExpression();

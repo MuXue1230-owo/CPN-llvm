@@ -73,6 +73,7 @@ struct Function {
 struct Field {
   Node Decl;
   std::string Type;
+  std::optional<DefinitionSite> DefaultSite = std::nullopt;
 };
 enum class SpecialOperation {
   CopyConstruct,

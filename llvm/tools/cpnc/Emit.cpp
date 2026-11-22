@@ -218,7 +218,7 @@ Value Frame::boolean(const Node &N) {
   auto V = eval(N);
   if (V.Type != "bool")
     fail(N.At, "condition requires bool");
-  if (N.K == Node::Binary && N.Text == "=")
+  if (N.K == Node::Binary && N.Text == "=" && !N.Grouped)
     Opt.warn(N.At, "assignment used directly as a Boolean condition");
   return V;
 }
@@ -396,25 +396,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         V.RealText += C;
     return floating(Expected) ? floatingConvert(V, Expected, N.At) : V;
   }
-  case Node::Number: {
-    std::string Digits;
-    for (char C : Op)
-      if (C != '_')
-        Digits += C;
-    StringRef S(Digits);
-    unsigned Radix = 10;
-    if (S.consume_front_insensitive("0x"))
-      Radix = 16;
-    else if (S.consume_front_insensitive("0b"))
-      Radix = 2;
-    else if (S.consume_front_insensitive("0o"))
-      Radix = 8;
-    if (S.size() > 65536)
-      fail(N.At, "integer literal exceeds compiler resource limit");
-    return constant(llvm::APInt(
-        std::max(2u, llvm::APInt::getSufficientBitsNeeded(S, Radix) + 1), S,
-        Radix));
-  }
+  case Node::Number:
+    return constant(integerLiteral(N.At));
   case Node::Character: {
     auto S = unquote(N.At);
     uint32_t C = (unsigned char)S[0];
@@ -454,7 +437,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
   }
   case Node::Configured: {
     auto Old = Opt;
-    configure(Opt, N);
+    configure(Opt, N, ConfigScope::Expression);
     auto V = eval(A[0], Expected, Dest);
     Opt = Old;
     return V;
@@ -1584,6 +1567,12 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                                     {Field.Type, nullptr, P}, At);
             materialize(convert(V, Field.Type, At), At, P);
           } else {
+            llvm::SaveAndRestore Policy(Opt);
+            llvm::SaveAndRestore Limit(LookupLimit);
+            if (Found == Producers.end() && Field.DefaultSite) {
+              Opt = Field.DefaultSite->Configuration;
+              LookupLimit = Field.DefaultSite->Through;
+            }
             construct(Field.Type,
                       Found == Producers.end() ? Field.Decl.Children
                                                : Found->second->Children,
@@ -1988,7 +1977,9 @@ void Frame::stmt(const Node &N) {
   }
   if (N.K == Node::Configured) {
     auto Old = Opt;
-    configure(Opt, N);
+    configure(Opt, N,
+              A[0].K == Node::Block ? ConfigScope::Block
+                                    : ConfigScope::Declaration);
     stmt(A[0]);
     Opt = Old;
     return;

@@ -268,12 +268,15 @@ std::string Frame::resolve(std::string S, const Token &At) {
     U.Signatures.try_emplace(Canonical, std::move(Sig));
     return Canonical;
   }
-  if (floating(S) && !Opt.FloatFormats.count(S))
-    fail(At, "floating format is disabled");
   if (StringRef(S).starts_with("::") && builtin(StringRef(S).drop_front(2)))
     S.erase(0, 2);
   if (S == "byte")
-    return "u8";
+    S = "u8";
+  if (floating(S) && !Opt.FloatFormats.count(S))
+    fail(At, "CFG002: floating format " + S + " is disabled");
+  if (integer(S) && S != "integer" && !StringRef(S).ends_with("size") &&
+      !Opt.IntegerWidths.count(width(S)))
+    fail(At, "CFG002: integer type " + S + " is disabled");
   if (builtin(S) || S == "auto")
     return S;
   if (auto I = Env.Types.find(S); I != Env.Types.end())
@@ -695,6 +698,9 @@ void Context::record(const Node &N, const std::string &Name,
           fail(D.At, "duplicate static member");
         continue;
       }
+      llvm::SaveAndRestore Policy(Check.Opt);
+      for (const auto &Config : D.Policies)
+        configure(Check.Opt, Config, ConfigScope::Declaration);
       auto T = Check.resolve(D.Type, D.At);
       auto *Ty = ir(T, D.At);
       if (!Ty->isSized())
@@ -703,7 +709,7 @@ void Context::record(const Node &N, const std::string &Name,
           llvm::any_of(R.Fields,
                        [&](auto &F) { return F.Decl.Text == D.Text; }))
         fail(D.At, "duplicate member");
-      R.Fields.push_back({D, T});
+      R.Fields.push_back({D, T, DefinitionSite{Check.Opt, Check.LookupLimit}});
       Layout.push_back(Ty);
     }
   R.Polymorphic =
@@ -753,7 +759,8 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
         D.K == Node::Function) {
       llvm::SaveAndRestore Policy(Opt);
       for (const auto &PrefixPolicy : D.Policies)
-        configure(Opt, PrefixPolicy);
+        configure(Opt, PrefixPolicy, ConfigScope::Declaration);
+      llvm::SaveAndRestore MemberPolicy(Check.Opt, Opt);
       bool Assign = D.Text == "operator=";
       bool Defaulted =
           D.Settings.count("control") && D.Settings.at("control") == "default";
@@ -804,6 +811,9 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
       fail(D.At, "duplicate member");
     D.Settings["identity"] = ID;
     Statics.emplace_back(ID, D);
+    llvm::SaveAndRestore MemberPolicy(Check.Opt);
+    for (const auto &Config : D.Policies)
+      configure(Check.Opt, Config, ConfigScope::Declaration);
     Check.object(D, true);
   }
   buildTables(Name, Members);
@@ -873,12 +883,12 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
     ++Sequence;
     auto Name = P + D.Text;
     if (D.K == Node::Config) {
-      configure(Opt, D);
+      configure(Opt, D, ConfigScope::File);
       continue;
     }
     llvm::SaveAndRestore Policy(Opt);
     for (const auto &PrefixPolicy : D.Policies)
-      configure(Opt, PrefixPolicy);
+      configure(Opt, PrefixPolicy, ConfigScope::Declaration);
     if (D.K == Node::Linkage || D.K == Node::Namespace) {
       unit(D.Children, D.K == Node::Linkage ? P : Name + "::");
       continue;

@@ -22,6 +22,24 @@ unsigned cpn::width(const std::string &T) {
   StringRef(T).drop_front().getAsInteger(10, N);
   return N;
 }
+APInt cpn::integerLiteral(const Token &T) {
+  std::string Digits;
+  for (char C : T.Text)
+    if (C != '_')
+      Digits += C;
+  StringRef S(Digits);
+  unsigned Radix = 10;
+  if (S.consume_front_insensitive("0x"))
+    Radix = 16;
+  else if (S.consume_front_insensitive("0b"))
+    Radix = 2;
+  else if (S.consume_front_insensitive("0o"))
+    Radix = 8;
+  if (S.size() > 65536)
+    fail(T, "integer literal exceeds compiler resource limit");
+  return APInt(std::max(2u, APInt::getSufficientBitsNeeded(S, Radix) + 1), S,
+               Radix);
+}
 cpn::Value Frame::constant(APInt N, std::string T) {
   return {T, ConstantInt::get(U.C, N)};
 }
@@ -183,6 +201,8 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
     if (W > 64)
       fail(At, "i128 is unavailable as a common integer type");
     T = (Signed ? "i" : "u") + std::to_string(W);
+    if (!Opt.IntegerWidths.count(W))
+      fail(At, "CFG002: " + T + " is unavailable as a common integer type");
   }
   unsigned W = Exact ? std::max(WA, WB) + 2 : width(T);
   unsigned Distance = 0;

@@ -56,11 +56,11 @@ int main(int argc, char **argv) {
       else if (A == "--identifiers" || A.starts_with("--identifiers=")) {
         Node N;
         N.Settings["source.identifiers"] = arg("--identifiers");
-        configure(O, N);
+        configure(O, N, ConfigScope::Project);
       } else if (A == "--preset" || A.starts_with("--preset=")) {
         Node N;
         N.Settings["preset"] = arg("--preset");
-        configure(O, N);
+        configure(O, N, ConfigScope::Project);
       } else if (A == "--check" || A == "-c" || A == "-S" ||
                  A == "--emit-llvm") {
         if (Mode)
@@ -89,19 +89,12 @@ int main(int argc, char **argv) {
       for (auto &N : Config) {
         if (N.K != Node::Config)
           fail(N.At, "expected configuration declaration");
-        configure(O, N);
+        configure(O, N, ConfigScope::Project);
       }
     }
     Path = O.Input;
     auto Source = read(Path);
     auto AST = parse(Source, O);
-    if (!AST.empty() && AST.front().K == Node::Config &&
-        AST.front().Settings.count("source.identifiers")) {
-      auto File = O;
-      configure(File, AST.front());
-      if (File.ASCII != O.ASCII)
-        AST = parse(Source, File);
-    }
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
     LLVMInitializeX86TargetMC();

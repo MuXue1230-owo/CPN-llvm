@@ -53,13 +53,8 @@ void Frame::checkAbandon(const std::string &Type, const Token &At) {
   };
   if (!Nontrivial(Nontrivial, Type))
     return;
-  std::string Message =
-      "LIFE004: abandon bypasses nontrivial cleanup of " + Type;
-  if (Opt.PromoteAbandon)
-    fail(At, Message);
-  if (!Opt.SilenceAbandon)
-    llvm::errs() << Opt.Input << ":" << At.Line << ":" << At.Column
-                 << ": ANOMALY: " << Message << "\n";
+  Opt.diagnose(At, Severity::Anomaly, "LIFE004",
+               "abandon bypasses nontrivial cleanup of " + Type);
 }
 void Frame::retirement() {
   auto &R = U.Records.at(Self.Type);

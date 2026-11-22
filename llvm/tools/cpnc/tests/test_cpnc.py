@@ -42,6 +42,123 @@ class CompilerTests(unittest.TestCase):
         subprocess.run([*cmd, "-o", exe], check=True)
         return subprocess.run([exe], cwd=self.dir).returncode
 
+    def test_configured_widths_and_scope(self):
+        self.assertEqual(
+            self.program("""
+          configuration { numeric.integer.widths=[0x20,0b1000,6_4]; };
+          configured(numeric.integer.widths=[16,32]) i16 pair(i16 x){return x+x;}
+          i32 main(){i8 n(39);usize pos(1);
+            configured(numeric.integer.widths=[16,32]) i16 v(pair(1));
+            if(pos==1 && v==2){return n+3;}return 0;}
+        """),
+            42,
+        )
+        cases = [
+            (
+                "configuration {numeric.integer.widths=[8,32,64];};"
+                "i32 f(i8 a,u8 b){return a+b;}",
+                "i16 is unavailable",
+            ),
+            (
+                "configuration {numeric.integer.widths=[32];};void f(){::u8 a;}",
+                "u8 is disabled",
+            ),
+            (
+                "configuration {numeric.integer.widths=[32];};void f(){byte a;}",
+                "u8 is disabled",
+            ),
+            (
+                "configuration {numeric.float.formats=[f64];};void f(){::f32 a;}",
+                "f32 is disabled",
+            ),
+            ("void f(){configured(numeric.integer.widths=[32]) {}}", "CFG001"),
+            ("i32 f(){return configured(numeric.float.formats=[f32])(1);}", "CFG001"),
+            ("configuration {source.identifiers=ascii;};", "CFG001"),
+            ('configured(target="x86_64-linux-gnu") void f(){}', "CFG001"),
+            (
+                "configured(numeric.literal.integer_default=isize) i32 f(){return 0;}",
+                "CFG001",
+            ),
+            (
+                "configuration {numeric.integer.widths=[8,32];numeric.literal.integer_default=i16;};",
+                "CFG002",
+            ),
+            ("configuration {numeric.integer.widths=[3 2];};", "expected"),
+            ("configured() void f(){}", "CFG001"),
+            (
+                "void f(){i32 n;configured(numeric.integer.overflow=wrapping)n+=1;}",
+                "parenthesized",
+            ),
+        ]
+        for source, message in cases:
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(message, r.stderr)
+
+    def test_member_defaults_retain_bound_numeric_policy(self):
+        self.assertEqual(
+            self.program("""
+            i8 maximum(){return 127;}
+            struct Generated {
+              configured(numeric.integer.overflow=wrapping) i8 delta(maximum()+1);
+            };
+            configured(numeric.integer.overflow=saturating) struct Authored {
+              i8 delta(maximum()+1);
+              Authored(i32 unused) {}
+            };
+            i32 main(){Generated a; Authored b(42);
+              if(a.delta == -128 && b.delta == 127){return 42;}return 0;}
+        """),
+            42,
+        )
+        r = self.compile(
+            "configured(diagnostics.promote=[WARNING]) void f(){"
+            "bool flag; if((flag=true)){} }",
+            "--check",
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for source in (
+            "void f(){switch(1){case 1:{fallthrough xyz;}default:{}}}",
+            "void f(){goto;}",
+        ):
+            self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_configured_diagnostic_threshold_and_artifact(self):
+        config = self.dir / "cpn.config"
+        config.write_text(
+            "configuration {compilation.modules=false;compilation.separate=false;"
+            'tooling.contract_export=false;source.unicode_version="17.0.0";};',
+            encoding="utf-8",
+        )
+        body = "bool x; if(x=true){}"
+        for level, emitted in [
+            ("INFO", True),
+            ("WARNING", True),
+            ("ANOMALY", False),
+            ("ERROR", False),
+            ("none", False),
+        ]:
+            r = self.compile(
+                "void f(){configured(diagnostics.minimum=" + level + "){" + body + "}}",
+                "--config",
+                str(config),
+                "--check",
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual("WARNING" in r.stderr, emitted)
+        r = self.compile(
+            "configured(diagnostics.minimum=none,diagnostics.promote=[WARNING])"
+            "void f(){" + body + "}",
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ERROR", r.stderr)
+        r = self.compile(
+            "configured(diagnostics.minimum=none) i32 f(){return unknown;}", "--check"
+        )
+        self.assertNotEqual(r.returncode, 0)
+
     def test_decltype_uses_lexical_binding_and_preserves_category(self):
         self.assertEqual(
             self.program("""

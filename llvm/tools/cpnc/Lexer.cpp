@@ -116,12 +116,18 @@ bool xid(uint32_t C, bool First) {
 }
 } // namespace
 
+void Options::diagnose(const Token &T, Severity Level, StringRef Code,
+                       StringRef Message) const {
+  std::string Category = Level == Severity::Warning ? "WARNING" : "ANOMALY";
+  auto Text = Code.empty() ? Message.str() : (Code + ": " + Message).str();
+  if (Promote.count(Category) || Promote.count(Code.str()))
+    fail(T, Text);
+  if (Level >= Minimum && !Suppress.count(Code.str()))
+    llvm::errs() << Input << ":" << T.Line << ":" << T.Column << ": "
+                 << Category << ": " << Text << "\n";
+}
 void Options::warn(const Token &T, StringRef Message) const {
-  if (Promote)
-    fail(T, Message.str());
-  if (!Silence)
-    llvm::errs() << Input << ":" << T.Line << ":" << T.Column
-                 << ": WARNING: " << Message << "\n";
+  diagnose(T, Severity::Warning, "", Message);
 }
 bool cpn::identifier(StringRef S) {
   if (S.empty())
