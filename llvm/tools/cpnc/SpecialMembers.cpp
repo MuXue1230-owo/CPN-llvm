@@ -27,7 +27,8 @@ const char *operationName(SpecialOperation Op) {
 bool Frame::constructible(const std::string &T, SpecialOperation Op,
                           const Token &At) {
   if (llvm::StringRef(T).ends_with("]"))
-    return constructible(element(T), Op, At);
+    return llvm::StringRef(T).ends_with("[0]") ||
+           constructible(element(T), Op, At);
   auto I = U.Records.find(T);
   if (I == U.Records.end())
     return U.ir(T, At)->isSized();
@@ -85,6 +86,11 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
       B.SetInsertPoint(Done);
       return;
     }
+    const auto &Layout = U.M.getDataLayout();
+    B.CreateMemMove(Dest, Layout.getABITypeAlign(Ty), Source.Address,
+                    Layout.getABITypeAlign(Ty),
+                    Layout.getTypeAllocSize(Ty).getFixedValue());
+    return;
   }
   auto It = U.Records.find(Source.Type);
   if (It == U.Records.end()) {
@@ -144,8 +150,17 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
   if (!Aggregate || !Source.Address || Source.Prvalue) {
     if (Source.Prvalue)
       consume(Source);
-    if (Dest)
-      B.CreateStore(load(Source).IR, Dest);
+    if (Dest) {
+      if (llvm::StringRef(Source.Type).ends_with("]") && Source.Address) {
+        const auto &Layout = U.M.getDataLayout();
+        auto *Ty = U.ir(Source.Type);
+        B.CreateMemMove(Dest, Layout.getABITypeAlign(Ty), Source.Address,
+                        Layout.getABITypeAlign(Ty),
+                        Layout.getTypeAllocSize(Ty).getFixedValue());
+        Source.Address = Dest;
+      } else
+        B.CreateStore(load(Source).IR, Dest);
+    }
     return Source;
   }
   if (!Dest)
@@ -154,7 +169,7 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
            Source.Expiring ? SpecialOperation::MoveConstruct
                            : SpecialOperation::CopyConstruct,
            At);
-  return {Source.Type, B.CreateLoad(U.ir(Source.Type, At), Dest), Dest};
+  return load({Source.Type, nullptr, Dest});
 }
 
 llvm::Value *Frame::resultAddress(const std::string &T, const Token &At) {
@@ -177,7 +192,7 @@ Value Frame::callResult(const std::string &T, llvm::Value *IRValue,
   }
   if (!Storage)
     return {T, IRValue};
-  Value V{T, B.CreateLoad(U.ir(T, At), Storage), Storage};
+  auto V = load({T, nullptr, Storage});
   V.Expiring = V.Prvalue = true;
   if (Storage != ExpressionDestination.Address)
     Temps.push_back(V);

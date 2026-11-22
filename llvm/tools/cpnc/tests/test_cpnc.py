@@ -2184,6 +2184,56 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_aggregate_frontier_identity_and_candidate_selection(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace; i32 drops;
+            struct Base{Base(){trace=1;}};
+            struct Self{Self* addr; i32 n; Self(i32 v){init addr(this);init n(v);trace=trace*10+v;}
+              Self(const<Self>& s){init addr(this);init n(s.n);} ~Self(){++drops;}
+            };
+            Self make(i32 n){return Self(n);}
+            struct Row:Base{Self a;Self b;};
+            struct One{Self x;};
+            struct Choice{i32 value;Choice(bool flag){init value(flag?7:9);}};
+            i32 main(){
+              i32 a(2);Row row(make(a),make(3));
+              if(trace!=123 || row.a.addr!=&row.a || row.b.addr!=&row.b || drops!=0){return 1;}
+              One o(make(4));if(o.x.addr!=&o.x){return 2;}
+              Choice exact(20);Choice authored(true);return exact.value+authored.value+15;
+            }"""),
+            42,
+        )
+
+    def test_array_value_results_and_generated_default_loop(self):
+        self.assertEqual(
+            self.program("""
+            struct Self{Self* addr;Self(){init addr(this);}Self(const<Self>& s){init addr(this);}};
+            Self[2] make(){Self[2] original;return original;}
+            i32 last(i32[70000]& values){return values[69999];}
+            i32 main(){Self[2] values(make());
+              if(values[0].addr!=&values[0] || values[1].addr!=&values[1]){return 1;}
+              i32[70000] many(7);i32[0] e;i32[0] f(e);return 42+last(many);
+            }"""),
+            42,
+        )
+
+    def test_delegated_value_parameters_use_final_address(self):
+        self.assertEqual(
+            self.program("""
+            i32 good; i32 drops;
+            struct Self{Self* addr;Self(){init addr(this);}
+              Self(const<Self>& s){init addr(this);} ~Self(){++drops;}};
+            struct Holder{i32 n;
+              Holder(){delegate(Self());}
+              Holder(Self s){if(s.addr==&s){++good;}}
+            };
+            i32 main(){Holder a; Holder b(Self())-> {init n(40);};
+              if(drops!=2){return 1;}return good+b.n;}
+            """),
+            42,
+        )
+
     def test_final_storage_through_calls_and_indirect_aggregate_abi(self):
         self.assertEqual(
             self.program("""

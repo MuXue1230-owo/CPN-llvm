@@ -167,6 +167,53 @@ void Frame::bindParams() {
       Scopes[0].Names[P.Text] = V;
   }
 }
+void Frame::bindInlineParams(const std::vector<Value> &Actual) {
+  Local Defaults;
+  for (size_t I = 0; I < F->Params.size(); ++I) {
+    const auto &Type = F->Params[I];
+    const auto &Param = F->Decl.Params[I];
+    const auto &Default = F->DefaultParams[I];
+    Value V;
+    if (I < Actual.size())
+      V = Actual[I];
+    else {
+      llvm::SaveAndRestore Policy(Opt, F->Defaults.Configuration);
+      llvm::SaveAndRestore Limit(LookupLimit, F->Defaults.Through);
+      llvm::SaveAndRestore Namespace(Prefix, F->DefaultPrefix);
+      Scopes.push_back(Defaults);
+      if (ends(Type, "&") && Default.Children.size() == 1)
+        V = bindReference(eval(Default.Children.front()), Type, Default.At);
+      else
+        V = materialize(
+            construct(unconst(baseRef(Type)), Default.Children, Default.At),
+            Default.At);
+      Scopes.pop_back();
+    }
+    if (ends(Type, "&"))
+      V = bindReference(V, Type, Param.At);
+    else {
+      if (!U.aggregate(Type)) {
+        auto *Cell = allocate(Type, Param.At);
+        B.CreateStore(load(convert(V, Type, Param.At)).IR, Cell);
+        V.Address = Cell;
+      }
+      V.Readonly = Param.Const;
+      V.Prvalue = V.Expiring = false;
+      if (TracksStorage && !ends(Type, "*")) {
+        V.Storage = "parameter." + std::to_string(U.Serial++);
+        track(V);
+        Extents[V.Storage] = V;
+        Active[V.Storage] = 1;
+      }
+      Scopes.front().Drops.push_back(V);
+    }
+    V.IR = nullptr;
+    if (!Param.Text.empty())
+      Scopes.front().Names[Param.Text] = V;
+    if (!Default.Text.empty())
+      Defaults.Names[Default.Text] = V;
+  }
+}
 Value Frame::boolean(const Node &N) {
   auto V = eval(N);
   if (V.Type != "bool")
@@ -787,13 +834,13 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
 
 Function *Frame::select(std::string Name, const Node &N,
                         const std::vector<Value> &Args, Value Receiver,
-                        bool Operator) {
+                        bool Operator, Function *Generated) {
   auto Key = callKey(Name, Receiver.Type);
   struct Candidate {
     Function *Decl;
     std::vector<unsigned> Ranks;
   };
-  auto Better = [](const Candidate &A, const Candidate &B) {
+  auto Better = [Generated](const Candidate &A, const Candidate &B) {
     bool Strict = false;
     for (size_t I = 0; I < A.Ranks.size(); ++I) {
       if (A.Ranks[I] > B.Ranks[I])
@@ -801,12 +848,17 @@ Function *Frame::select(std::string Name, const Node &N,
       Strict |= A.Ranks[I] < B.Ranks[I];
     }
     return Strict ||
+           (Generated && B.Decl == Generated && A.Decl != Generated) ||
            betterPattern(A.Decl->Origin ? A.Decl->Origin->Decl : A.Decl->Decl,
                          B.Decl->Origin ? B.Decl->Origin->Decl : B.Decl->Decl);
   };
   std::vector<Candidate> Best;
   auto Group =
       N.ExplicitApplication ? std::vector<Function *>{} : visibleOverloads(Key);
+  if (Generated && llvm::none_of(Group, [&](Function *D) {
+        return D->Params == Generated->Params;
+      }))
+    Group.push_back(Generated);
   if (Operator) {
     auto Owner = methodOwner(Args.front().Type, N.At);
     if (!Owner.empty()) {
@@ -1216,6 +1268,36 @@ std::optional<Value> Frame::directConstruction(const Node &Arg,
                      Dest);
   return {};
 }
+// Bind in the caller's lexical environment. The plan connects the producer
+// at its canonical frontier after resolving whole-object versus member input.
+Initializer Frame::deferInitializer(const Node &Arg,
+                                    const std::string &Expected) {
+  llvm::IRBuilderBase::InsertPointGuard Save(B);
+  auto *Entry = block("initializer");
+  B.SetInsertPoint(Entry);
+  auto *Storage = B.CreateAlloca(B.getInt8Ty());
+  auto Result = eval(Arg, Expected, Storage);
+  return {Result, Entry, B.GetInsertBlock(), Storage};
+}
+
+Value Frame::runInitializer(Initializer &Init, Value Target, const Token &At) {
+  auto V = Init.Result;
+  if (!Init.Storage->use_empty() || V.Address == Init.Storage) {
+    auto *Address =
+        V.Type == Target.Type ? Target.Address : allocate(V.Type, At);
+    Init.Storage->replaceAllUsesWith(Address);
+    if (V.Address == Init.Storage) {
+      V.Address = Address;
+      if (V.Prvalue && U.aggregate(V.Type) && Address != Target.Address)
+        Temps.push_back(V);
+    }
+  }
+  Init.Storage->eraseFromParent();
+  branch(Init.Entry);
+  B.SetInsertPoint(Init.Exit);
+  return V;
+}
+
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
@@ -1245,24 +1327,63 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     auto *Ptr = Dest ? Dest : allocate(T, At);
     auto *Array = llvm::cast<llvm::ArrayType>(Ty);
     auto Count = ends(T, "[0]") ? 0 : Array->getNumElements();
+    auto E = element(T);
+    std::optional<Initializer> First;
+    if (Args.size() == 1) {
+      First = deferInitializer(
+          Args.front(),
+          Args.front().K == Node::Unary && Args.front().Text == "&" ? E : "");
+      if (First->Result.Type == T) {
+        materialize(runInitializer(*First, {T, nullptr, Ptr}, At), At, Ptr);
+        Value V{T, nullptr, Ptr};
+        V.Prvalue = V.Expiring = !Dest;
+        if (!Dest)
+          Temps.push_back(V);
+        return V;
+      }
+    }
     if (Args.size() > Count)
       fail(At, "too many array initializers");
-    if (Args.size() == 1 && Args[0].K == Node::Name &&
-        lookup(Args[0].At).Type == T) {
-      auto V = eval(Args[0]);
-      materialize(V, At, Ptr);
-      return {T, B.CreateLoad(Ty, Ptr), Ptr};
-    }
-    if (Count > 65536)
-      fail(At, "array construction exceeds compiler resource limit");
-    for (size_t I = 0; I < Count; ++I) {
+    for (size_t I = 0; I < Args.size(); ++I) {
       auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), B.getInt64(I)});
-      construct(element(T),
-                I < Args.size() ? std::vector<Node>{Args[I]}
-                                : std::vector<Node>{},
-                At, P);
+      if (!First) {
+        construct(E, {Args[I]}, At, P);
+        continue;
+      }
+      auto V = runInitializer(*First, {E, nullptr, P}, At);
+      if (V.Type == E)
+        materialize(V, At, P);
+      else {
+        Node Ref(Node::Name, At);
+        Ref.At.Text = Ref.Text = "$array.initializer";
+        Scopes.emplace_back();
+        Scopes.back().Names[Ref.Text] = V;
+        construct(E, {Ref}, At, P);
+        Scopes.pop_back();
+      }
     }
-    return {T, B.CreateLoad(Ty, Ptr), Ptr};
+    if (Args.size() < Count) {
+      // Generate the recursive default producer once, even for large extents.
+      auto *Entry = B.GetInsertBlock(), *Loop = block("array.init"),
+           *End = block("array.ready");
+      branch(Loop);
+      B.SetInsertPoint(Loop);
+      auto *Index = B.CreatePHI(B.getInt64Ty(), 2);
+      Index->addIncoming(B.getInt64(Args.size()), Entry);
+      auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), Index});
+      size_t Mark = Temps.size();
+      construct(E, {}, At, P);
+      endExpression(Mark);
+      auto *Next = B.CreateAdd(Index, B.getInt64(1));
+      Index->addIncoming(Next, B.GetInsertBlock());
+      B.CreateCondBr(B.CreateICmpULT(Next, B.getInt64(Count)), Loop, End);
+      B.SetInsertPoint(End);
+    }
+    Value V{T, nullptr, Ptr};
+    V.Prvalue = V.Expiring = !Dest;
+    if (!Dest)
+      Temps.push_back(V);
+    return V;
   }
   if (Args.size() == 1 && !Tail && !AsBase)
     if (auto Direct = directConstruction(Args[0], T, Dest))
@@ -1294,15 +1415,30 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     Obj.BaseView = AsBase;
     if (!AsBase)
       bindVirtualLayout(Obj);
-    auto Arguments = evaluateArguments(Args, nullptr, AsBase ? Value{} : Obj);
-    auto &Actual = Arguments.Values;
+    auto It = U.Overloads.find(T + "::$ctor");
+    std::vector<Initializer> Inputs;
+    std::vector<Value> Actual;
+    for (size_t I = 0; I < Args.size(); ++I) {
+      std::string Expected;
+      if (Args[I].K == Node::Unary && Args[I].Text == "&") {
+        if (It != U.Overloads.end() && It->second.size() == 1 &&
+            I < It->second.front()->Params.size())
+          Expected = It->second.front()->Params[I];
+        else if (I + R.Bases.size() < R.Fields.size())
+          Expected = R.Fields[I + R.Bases.size()].Type;
+      }
+      Inputs.push_back(deferInitializer(Args[I], Expected));
+      Actual.push_back(Inputs.back().Result);
+    }
     std::map<std::string, const Node *> Producers;
     if (Tail)
       for (auto &S : Tail->Children)
         if (S.K == Node::Init && !Producers.emplace(initSlot(S), &S).second)
           fail(S.At, "duplicate initialization producer");
     if (Actual.size() == 1 && Actual[0].Type == T) {
-      admitArguments(Arguments, nullptr, At);
+      // An embedded layer shares virtual bases with its complete object.
+      auto Target = AsBase && R.VirtualCount ? Value{} : Obj;
+      Actual[0] = runInitializer(Inputs.front(), Target, At);
       if (AsBase && R.VirtualCount)
         transfer(Actual[0], Ptr,
                  Actual[0].Expiring ? SpecialOperation::MoveConstruct
@@ -1311,17 +1447,26 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       else
         materialize(Actual[0], At, Ptr);
     } else {
-      auto It = U.Overloads.find(T + "::$ctor");
-      bool Authored =
-          It != U.Overloads.end() && llvm::any_of(It->second, [&](auto *D) {
-            return Actual.size() <= D->Params.size() &&
-                   (Actual.size() == D->Params.size() ||
-                    !D->Decl.Params[Actual.size()].Children.empty());
-          });
-      if (Authored) {
+      Function Aggregate;
+      Aggregate.Owner = T;
+      Aggregate.Decl = Node(Node::Constructor, At);
+      bool Fits = Args.size() <= R.Fields.size() - R.Bases.size();
+      if (Fits)
+        for (size_t I = 0; I < Args.size(); ++I)
+          Aggregate.Params.push_back(R.Fields[R.Bases.size() + I].Type);
+      auto *D = &Aggregate;
+      if (It != U.Overloads.end()) {
         Node C(Node::Name, At);
-        auto *D = select("$ctor", C, Actual, Obj);
-        admitArguments(Arguments, D, At);
+        D = select("$ctor", C, Actual, Obj, false, Fits ? &Aggregate : nullptr);
+      }
+      if (D != &Aggregate) {
+        for (size_t I = 0; I < Inputs.size(); ++I) {
+          auto Source = runInitializer(Inputs[I], {}, At);
+          const auto &Type = D->Params[I];
+          Actual[I] = ends(Type, "&")
+                          ? bindReference(Source, Type, At)
+                          : materialize(convert(Source, Type, At), At);
+        }
         if (Producers.empty())
           invoke(*D, Actual, At, Obj, true);
         else {
@@ -1330,34 +1475,17 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Root.BaseLayer = AsBase;
           Root.Self = Obj;
           Root.Scopes[0].Names["this"] = {T + "*", Ptr};
-          for (size_t I = 0; I < D->Params.size(); ++I) {
-            auto &P = D->Decl.Params[I];
-            auto Ty = D->Params[I];
-            auto V = I < Actual.size() ? Actual[I]
-                                       : Root.construct(unconst(baseRef(Ty)),
-                                                        P.Children, P.At);
-            if (!ends(Ty, "&")) {
-              V = convert(V, Ty, At);
-              auto *Addr = allocate(Ty, At);
-              if (I < Actual.size())
-                Root.B.CreateStore(V.IR, Addr);
-              else
-                Root.materialize(V, At, Addr);
-              V = {Ty, nullptr, Addr, P.Const};
-              Root.Scopes[0].Drops.push_back(V);
-            } else
-              V.IR = nullptr;
-            Root.Scopes[0].Names[P.Text] = V;
-          }
+          Root.bindInlineParams(Actual);
           Root.InlineReturn = block("ctor.done");
           Construction Plan(Root, *D, Obj, Tail, this);
           Plan.run(Root);
+          if (Root.Live)
+            Root.cleanup(0);
           Root.branch(Root.InlineReturn);
           B.SetInsertPoint(Root.InlineReturn);
           Producers.clear();
         }
       } else {
-        admitArguments(Arguments, nullptr, At);
         if (Actual.size() + R.Bases.size() > R.Fields.size())
           fail(At, "too many aggregate initializers");
         if (R.Bases.size() == (AsBase ? R.VirtualCount : 0))
@@ -1379,8 +1507,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           if (I >= R.Bases.size() && I - R.Bases.size() < Actual.size()) {
             if (Found != Producers.end())
               fail(At, "duplicate aggregate initialization producer");
-            auto V = convert(Actual[I - R.Bases.size()], Field.Type, At);
-            materialize(V, At, P);
+            auto V = runInitializer(Inputs[I - R.Bases.size()],
+                                    {Field.Type, nullptr, P}, At);
+            materialize(convert(V, Field.Type, At), At, P);
           } else {
             construct(Field.Type,
                       Found == Producers.end() ? Field.Decl.Children

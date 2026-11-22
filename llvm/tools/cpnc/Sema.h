@@ -228,6 +228,11 @@ struct Loop {
   std::string Name;
   bool BreakUsed = false;
 };
+struct Initializer {
+  Value Result;
+  llvm::BasicBlock *Entry, *Exit;
+  llvm::AllocaInst *Storage;
+};
 struct CallArguments {
   std::vector<Value> Values;
   std::vector<llvm::BasicBlock *> Entries, Exits;
@@ -312,7 +317,8 @@ public:
   std::string callKey(const std::string &, const std::string &Owner = "") const;
   Value applyOperator(const std::string &, const Token &, CallArguments);
   Function *select(std::string, const Node &, const std::vector<Value> &,
-                   Value Receiver = {}, bool Operator = false);
+                   Value Receiver = {}, bool Operator = false,
+                   Function *Generated = nullptr);
   Function *prepareCandidate(const Family &, const std::string &, const Node &,
                              const std::vector<Value> &);
   void selectTypeSpecialization(const std::string &, Family &, Substitution &,
@@ -320,6 +326,8 @@ public:
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
   std::string initSlot(const Node &);
+  Initializer deferInitializer(const Node &, const std::string &Expected);
+  Value runInitializer(Initializer &, Value Target, const Token &);
   std::optional<Value> directConstruction(const Node &, const std::string &,
                                           llvm::Value *);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
@@ -379,6 +387,7 @@ public:
   void installTables(Value);
   std::string methodOwner(const std::string &, const Token &);
   void bindParams();
+  void bindInlineParams(const std::vector<Value> &);
 };
 class Construction {
   Value Object;

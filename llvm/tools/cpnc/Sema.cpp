@@ -115,7 +115,7 @@ cpn::Value Frame::load(cpn::Value V) {
       fail({}, "dynamic static read is unavailable in a constant expression");
     guard(B.CreateNot(B.CreateLoad(B.getInt1Ty(), U.Ready.at(V.Address))));
   }
-  if (!V.IR && V.Address) {
+  if (!V.IR && V.Address && !StringRef(V.Type).ends_with("]")) {
     if (!IR)
       fail({}, "constant expression required");
     V.IR = U.Records.count(V.Type) && U.Records.at(V.Type).VirtualCount

@@ -180,27 +180,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
   Next.BaseLayer = Em.BaseLayer;
   Next.Self = Object;
   Next.Scopes[0].Names["this"] = {Object.Type + "*", Object.Address};
-  for (size_t J = 0; J < D->Params.size(); ++J) {
-    auto T = D->Params[J];
-    auto &Param = D->Decl.Params[J];
-    auto V =
-        J < Args.size() ? Args[J] : Next.construct(T, Param.Children, Param.At);
-    if (llvm::StringRef(T).ends_with("&")) {
-      if (!V.Address)
-        fail(Param.At, "reference requires an lvalue");
-      V.IR = nullptr;
-    } else {
-      V = Next.convert(V, T, Param.At);
-      auto *P = Next.allocate(T, Param.At);
-      if (J < Args.size())
-        Next.B.CreateStore(V.IR, P);
-      else
-        Next.materialize(V, Param.At, P);
-      V = {T, nullptr, P, Param.Const};
-      Next.Scopes[0].Drops.push_back(V);
-    }
-    Next.Scopes[0].Names[Param.Text] = V;
-  }
+  Next.bindInlineParams(Args);
   Next.InlineReturn = Em.block("delegate.done");
   enter(Next, I + 1);
   if (Next.Live)
