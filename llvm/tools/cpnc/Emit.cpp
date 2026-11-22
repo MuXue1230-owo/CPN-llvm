@@ -240,6 +240,8 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
 }
 Value Frame::boolean(const Node &N) {
   auto V = eval(N);
+  if (V.Type == "never")
+    return convert(V, "bool", N.At);
   if (V.Type != "bool")
     fail(N.At, "condition requires bool");
   if (N.K == Node::Binary && N.Text == "=" && !N.Grouped)
@@ -414,30 +416,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     fail(N.At, "constant evaluation step budget exhausted");
   if (!IR && ((N.K == Node::Unary && (Op == "++" || Op == "--")) ||
               (N.K == Node::Binary && assignment(Op)))) {
-    if (A[0].K != Node::Name)
-      fail(N.At, "constant assignment requires a local variable");
-    for (auto It = Scopes.rbegin(); It != Scopes.rend(); ++It) {
-      auto Pos = It->Names.find(A[0].Text);
-      if (Pos == It->Names.end())
-        continue;
-      auto Old = Pos->second;
-      if (Old.Readonly)
-        fail(N.At, "writable lvalue required");
-      Value V;
-      if (Op == "=")
-        V = eval(A[1]);
-      else {
-        Node Math = N;
-        Math.Text = Op == "++"   ? "+"
-                    : Op == "--" ? "-"
-                                 : Op.substr(0, Op.size() - 1);
-        V = binary(Math, Old, N.K == Node::Unary ? literal(1) : eval(A[1]));
-      }
-      V = convert(V, Old.Type, N.At);
-      Pos->second = V;
-      return N.Definition ? Old : V;
-    }
-    fail(N.At, "constant assignment requires a local variable");
+    return constantAssignment(N);
   }
   switch (N.K) {
   case Node::Lambda:
@@ -474,14 +453,35 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     if (Op == "true" || Op == "false")
       return literal(Op == "true", "bool");
     else if (Op == "nullptr")
-      return {"nullptr_t", llvm::ConstantPointerNull::get(B.getPtrTy())};
+      return {"nullptr_t", B.getInt8(0)};
     else if (builtinPredicate(Op) || constraint(Op))
       return literal(predicate(N), "bool");
     else
       return load(lookup(N.At));
   case Node::Index:
+    if (!IR) {
+      auto Base = eval(A[0]);
+      auto *Array = llvm::dyn_cast_or_null<llvm::Constant>(Base.IR);
+      auto Index = eval(A[1]);
+      auto *I = llvm::dyn_cast_or_null<llvm::ConstantInt>(Index.IR);
+      if (!ends(Base.Type, "]") || !Array || !integer(Index.Type) || !I ||
+          ends(Base.Type, "[0]") ||
+          I->getValue().uge(
+              llvm::cast<llvm::ArrayType>(Array->getType())->getNumElements()))
+        fail(N.At, "constant array element requires a valid constant index");
+      return {unconst(element(Base.Type)),
+              Array->getAggregateElement(unsigned(I->getZExtValue()))};
+    }
     return load(subscript(N));
   case Node::Member:
+    if (!IR && !N.Definition) {
+      auto Base = eval(A[0]);
+      if (U.Records.count(Base.Type) &&
+          llvm::isa_and_nonnull<llvm::Constant>(Base.IR)) {
+        Base.Address = nullptr;
+        return member(Base, N.At);
+      }
+    }
     return load(place(N));
   case Node::Call: {
     auto V = call(A[0], std::vector<Node>(A.begin() + 1, A.end()));
@@ -658,15 +658,17 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       auto *Yes = block("then"), *No = block("else"), *Done = block("end");
       B.CreateCondBr(C.IR, Yes, No);
       size_t Mark = Temps.size();
+      bool EntryLive = Live;
       auto arm = [&](unsigned I, llvm::BasicBlock *Entry,
                      std::vector<Value> &Owned) {
         B.SetInsertPoint(Entry);
+        Live = EntryLive;
         auto V = N.K == Node::Conditional   ? eval(A[I], Expected, Dest)
                  : (I == 1) == (Op == "&&") ? boolean(A[1])
                                             : literal(I == 1, "bool");
         Owned.assign(Temps.begin() + Mark, Temps.end());
         Temps.resize(Mark);
-        return V;
+        return EntryLive && !Live ? Value{"never"} : V;
       };
       std::vector<Value> YesTemps, NoTemps;
       auto EntryState = Active;
@@ -682,6 +684,36 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         Transaction->restore(EntryPositions);
       auto Y = arm(2, No, NoTemps);
       auto *EndNo = B.GetInsertBlock();
+      if (X.Type == "never" || Y.Type == "never") {
+        // The diverging arm has no edge into the join, including for
+        // aggregates and references whose address comes from the other arm.
+        bool Left = X.Type != "never";
+        if (X.Type == "never") {
+          B.SetInsertPoint(EndYes);
+          B.CreateUnreachable();
+        }
+        if (Y.Type == "never") {
+          B.SetInsertPoint(EndNo);
+          B.CreateUnreachable();
+        }
+        if (X.Type == Y.Type) {
+          B.SetInsertPoint(Done);
+          Live = false;
+          return {"never"};
+        }
+        B.SetInsertPoint(Left ? EndYes : EndNo);
+        branch(Done);
+        B.SetInsertPoint(Done);
+        auto &Owned = Left ? YesTemps : NoTemps;
+        Temps.insert(Temps.end(), Owned.begin(), Owned.end());
+        if (Left) {
+          Active = std::move(YesState);
+          if (Transaction)
+            Transaction->restore(YesPositions);
+        }
+        Live = EntryLive;
+        return Left ? X : Y;
+      }
       if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(C.IR)) {
         if (!Known->isZero()) {
           Active = std::move(YesState);
@@ -696,7 +728,10 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           Transaction->restore(Joined);
         }
       }
-      auto T = X.Type == "integer" ? Y.Type : X.Type;
+      auto T =
+          X.Type == "integer" || (X.Type == "nullptr_t" && ends(Y.Type, "*"))
+              ? Y.Type
+              : X.Type;
       if (T == "integer")
         T = Expected.empty() ? Opt.DefaultInt : Expected;
       bool OwnedResult = U.aggregate(T) && (X.Prvalue || Y.Prvalue);
@@ -881,6 +916,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
 // numeric conversions. Each argument retains its own rank during selection.
 std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
                                               const Token &At) {
+  if (V.Type == "never")
+    return 0;
   auto Base = baseRef(Param), T = unconst(Base);
   bool Ref = Base != Param, RO = T != Base, Lvalue = V.Address && !V.Expiring;
   if (Ref && ((ends(Param, "&&") && Lvalue) ||
@@ -1131,6 +1168,9 @@ Value Frame::applyOperator(const std::string &Name, const Token &At,
   return invoke(*D, std::move(A.Values), At, Receiver, Staged);
 }
 Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
+  if (V.Type == "never")
+    return {unconst(baseRef(Ty)), nullptr,
+            llvm::PoisonValue::get(B.getPtrTy())};
   if (!conversionRank(V, Ty, At))
     fail(At, "incompatible reference binding");
   auto T = unconst(baseRef(Ty));
@@ -1302,6 +1342,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
   auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values);
   Call->setAttributes(D.IR->getAttributes());
+  if (D.Result == "never")
+    return endDivergentCall();
   closePointerCall(Metadata);
   propagateWhole(Before);
   // A helper can end or replace an extent reached through its receiver or
@@ -1538,8 +1580,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     V.Readonly = true;
     return V;
   }
-  if (T == "void")
-    fail(At, "object cannot have void type");
+  if (T == "void" || T == "never")
+    fail(At, "object cannot have " + T + " type");
   if (floating(T)) {
     if (Args.size() > 1)
       fail(At, "invalid scalar construction");
@@ -1553,9 +1595,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   auto *Ty = U.ir(T, At);
   if (!Ty->isSized())
     fail(At, "construction requires a complete object type");
+  if (!IR && U.aggregate(T))
+    return constantAggregate(T, Args, At, Tail);
   if (ends(T, "]")) {
-    if (!IR)
-      fail(At, "array construction requires object storage");
     auto *Ptr = Dest ? Dest : allocate(T, At);
     auto *Array = llvm::cast<llvm::ArrayType>(Ty);
     auto Count = ends(T, "[0]") ? 0 : Array->getNumElements();
@@ -1656,8 +1698,6 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     return Result;
   }
   if (U.Records.count(T)) {
-    if (!IR)
-      fail(At, "constant record construction is unavailable");
     auto *Ptr = Dest ? Dest : allocate(T, At);
     Value Obj{T, nullptr, Ptr};
     auto &R = U.Records.at(T);
@@ -2033,7 +2073,7 @@ void Frame::object(const Node &N, bool Global) {
         Bound.borrow(V);
       names()[Name] = Bound;
       if ((!U.SlotType || Readonly) &&
-          !(N.Required && carriesPointerBounds(Ty)))
+          !(N.Required && (carriesPointerBounds(Ty) || U.aggregate(Ty))))
         return;
     }
     auto FT = llvm::FunctionType::get(B.getVoidTy(), false);
@@ -2053,6 +2093,14 @@ void Frame::object(const Node &N, bool Global) {
       Init.B.CreateStore(B.getTrue(), Ready);
     }
     Value Cell{Ty, StaticConstant, G, Readonly};
+    if (N.Required && Simple && containsPointerField(Ty)) {
+      // The initializer supplies symbolic bytes at translation. Capture the
+      // designated storage generations at startup without writing those bytes.
+      auto *Temp = Init.allocate(Ty, N.At);
+      Init.construct(Ty, Args, N.At, Temp);
+      Init.copyStoredBounds({Ty, nullptr, Temp}, G);
+      Init.endExpression();
+    }
     if (N.Required && Simple && carriesPointerBounds(Ty)) {
       auto Bound = names().at(Name);
       Cell.borrow(Bound);
@@ -2108,6 +2156,7 @@ void Frame::object(const Node &N, bool Global) {
     if (V.Type == "integer")
       V = convert(V, Opt.DefaultInt, N.At);
     V.Readonly = Readonly;
+    V.Address = nullptr;
     names()[Name] = V;
     return;
   }
@@ -2131,6 +2180,8 @@ void Frame::object(const Node &N, bool Global) {
       V.borrow(Runtime);
     }
     Ptr = allocate(Ty, N.At);
+    if (containsPointerField(Ty))
+      construct(Ty, Args, N.At, Ptr);
     B.CreateStore(V.IR, Ptr);
   } else if (Ty == "auto") {
     V = eval(Args.at(0));
@@ -2245,6 +2296,10 @@ void Frame::stmt(const Node &N) {
       V = eval(A[0], F ? unconst(F->Result) : "", Result);
     if (!F)
       fail(N.At, "return requires a function");
+    if (V.Type == "never")
+      return;
+    if (F->Result == "never")
+      fail(N.At, "never function cannot return normally");
     if (ends(F->Result, "*") || ends(F->Result, "&"))
       for (auto Origin : V.Origins)
         if ((F->NoEscape.count(Origin) || !F->BorrowedResult.empty()) &&

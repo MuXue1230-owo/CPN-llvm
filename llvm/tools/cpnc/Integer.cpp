@@ -73,6 +73,20 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
   }
   if (V.Type == T)
     return V;
+  if (StringRef(T).ends_with("]") &&
+      (qualifyConst(T) == V.Type || qualifyConst(V.Type) == T)) {
+    // Array value conversion constructs fresh elements. Keep the source
+    // read-only for selecting their copy versus move operations.
+    V.Readonly |= qualifyConst(T) == V.Type;
+    V.Type = T;
+    return V;
+  }
+  if (V.Type == "never") {
+    if (T == "void")
+      return {"void"};
+    return {T, llvm::PoisonValue::get(U.ir(T, At)),
+            U.aggregate(T) ? llvm::PoisonValue::get(B.getPtrTy()) : nullptr};
+  }
   if (floating(T))
     return floatingConvert(V, T, At);
   if (StringRef(V.Type).ends_with("*") && StringRef(T).ends_with("*")) {
@@ -160,8 +174,13 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
       else if (conversionRank(D, A.Type, At))
         D = convert(D, A.Type, At);
     }
-    if (Cmp && (Op == "==" || Op == "!=") &&
-        (A.Type == D.Type || A.Type == "nullptr_t" || D.Type == "nullptr_t") &&
+    if (Op == "==" || Op == "!=") {
+      if (A.Type == "nullptr_t" && StringRef(D.Type).ends_with("*"))
+        A = convert(A, D.Type, At);
+      if (D.Type == "nullptr_t" && StringRef(A.Type).ends_with("*"))
+        D = convert(D, A.Type, At);
+    }
+    if (Cmp && (Op == "==" || Op == "!=") && A.Type == D.Type &&
         A.IR->getType() == D.IR->getType())
       return {"bool", Op == "==" ? B.CreateICmpEQ(A.IR, D.IR)
                                  : B.CreateICmpNE(A.IR, D.IR)};

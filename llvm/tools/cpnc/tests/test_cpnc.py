@@ -583,6 +583,68 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
 
+    def test_never_paths_and_nullptr_object_representation(self):
+        program = """
+          never diverge(){for(;;){}}
+          never stop_now(){return diverge();}
+          alias F=function<never() >*;
+          i32 choose(bool ok,F stop){return ok ? 40 : stop();}
+          i32& choose_ref(bool ok,i32& n){return ok ? n : diverge();}
+          struct Layout{nullptr_t n;u8 tag;};
+          i32 main(){F f(&stop_now);i32 n(2);nullptr_t empty;auto value(nullptr);
+            Layout v(empty,9);i32* p(value);nullptr_t[3] array;
+            if(sizeof(v)!=2 || sizeof(nullptr)!=1 || sizeof(array)!=3 ||
+               p!=nullptr || empty!=value || v.tag!=9){return 0;}
+            return choose(true,f)+choose_ref(true,n);}
+        """
+        self.assertEqual(self.program(program), 42)
+        for source in (
+            "never f(){}",
+            "never f(bool x){if(x){while(true){}}}",
+            "never f(){return;}",
+            "never f(){return 7;}",
+            "never value;",
+            "void f(void p){}",
+            "bool f(){return nullptr==u8(0);}",
+            "bool f(){return nullptr==false;}",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
+    def test_constant_aggregate_values_fields_and_array_extents(self):
+        self.assertLess(
+            self.program("""
+          struct Holder{i32* p;};struct Data{i32[2] a;i32 after;};
+          Data d;constexpr Holder saved(&d.a[0]);
+          i32 main(){d.after=12;return *(saved.p+2);}
+        """),
+            0,
+        )
+        self.assertEqual(
+            self.program("""
+          constexpr i32[3] a(4,5,6);
+          struct Pair{i32 x;i32 y(x+2);};
+          struct Box{Pair p;i32[2] v;};
+          constexpr Pair pair(a[1]);
+          constexpr i32[2] a2(3,9);constexpr Box box(Pair(8),a2);
+          constexpr i32 score(){Box b(Pair(8),a2);i32 ix(0);
+            b.v[ix++]+=b.p.y;b.v[0]=b.v[0]+(b.v[1]=2);
+            return ix+b.v[0]+b.v[1];}
+          constexpr i32 altered(score());
+          constexpr i32 n(pair.y+box.p.y+box.v[1]+a[0]);
+          i32 main(){constexpr Pair local(10);return altered==18?n+local.y:0;}
+        """),
+            42,
+        )
+        for source in (
+            "struct P{i32 x;};i32 n;constexpr P point(n);",
+            "constexpr i32[1] bad(1,2);",
+            "constexpr i32[1] a(3);constexpr i32 n(a[1]);",
+            "struct P{i32 a(b);i32 b(2);};constexpr P p;",
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.compile(source, "--check").returncode, 1)
+
     def test_static_reference_binding_and_symbolic_pointer_constants(self):
         self.assertEqual(
             self.program("""

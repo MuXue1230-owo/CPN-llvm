@@ -16,6 +16,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
   add_llvm_tool(cpnc
     Binding.cpp
     Closure.cpp
+    ConstantAggregate.cpp
     Construction.cpp
     Dispatch.cpp
     Domain.cpp

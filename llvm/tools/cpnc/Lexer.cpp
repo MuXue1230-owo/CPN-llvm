@@ -142,10 +142,10 @@ bool cpn::realToken(StringRef S) {
                                           : S.contains_insensitive("e"));
 }
 bool cpn::builtin(StringRef S) {
-  return floating(S) || S == "void" || S == "bool" || S == "char" ||
-         S == "byte" || S == "nullptr_t" || S == "isize" || S == "usize" ||
-         S == "i8" || S == "i16" || S == "i32" || S == "i64" || S == "u8" ||
-         S == "u16" || S == "u32" || S == "u64";
+  return floating(S) || S == "void" || S == "never" || S == "bool" ||
+         S == "char" || S == "byte" || S == "nullptr_t" || S == "isize" ||
+         S == "usize" || S == "i8" || S == "i16" || S == "i32" || S == "i64" ||
+         S == "u8" || S == "u16" || S == "u32" || S == "u64";
 }
 std::vector<Token> cpn::lex(StringRef S, const Options &Opt) {
   S.consume_front("\xef\xbb\xbf");

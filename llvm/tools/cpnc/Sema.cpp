@@ -73,9 +73,11 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     return llvm::Type::getFloatTy(C);
   if (T == "f64")
     return llvm::Type::getDoubleTy(C);
-  if (T == "void")
+  if (T == "void" || T == "never")
     return llvm::Type::getVoidTy(C);
-  if (T == "nullptr_t" || T == "storage" || StringRef(T).ends_with("*") ||
+  if (T == "nullptr_t")
+    return llvm::Type::getInt8Ty(C);
+  if (T == "storage" || StringRef(T).ends_with("*") ||
       StringRef(T).ends_with("&"))
     return llvm::PointerType::getUnqual(C);
   if (integer(T) || T == "bool" || T == "char") {
@@ -642,6 +644,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
     if (Arg.Const && StringRef(Type).ends_with("&"))
       Type = qualifyConst(Type);
     auto ValueType = unconst(Type);
+    if (ir(ValueType, Arg.At)->isVoidTy())
+      fail(Arg.At, "ordinary parameter requires an object or reference type");
     D.Decl.Params[D.Params.size()].Const |= Type != ValueType;
     D.Params.push_back(ValueType);
     Types.push_back(aggregate(D.Params.back()) ? llvm::PointerType::getUnqual(C)
@@ -788,6 +792,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
                                   Export ? llvm::GlobalValue::ExternalLinkage
                                          : llvm::GlobalValue::InternalLinkage,
                                   Symbol, M);
+  if (D.Result == "never")
+    D.IR->addFnAttr(llvm::Attribute::NoReturn);
   if (N.Foreign) {
     auto ext = [&](const std::string &Ty) {
       return signedType(Ty) ? llvm::Attribute::SExt : llvm::Attribute::ZExt;

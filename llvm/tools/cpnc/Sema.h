@@ -446,6 +446,7 @@ public:
   Value callClosure(Value, const std::vector<Node> &, const Token &);
   void bindCaptures();
   Value indirect(Value, const std::vector<Node> &, const Token &);
+  Value endDivergentCall();
   void guard(llvm::Value *);
   void branch(llvm::BasicBlock *);
   const Family *constraint(const std::string &) const;
@@ -467,6 +468,10 @@ public:
   Value baseView(Value, const BasePath &);
   llvm::Value *ownerRecord(Value, unsigned);
   void enterOwnerLayer(Value);
+  bool containsPointerField(const std::string &) const;
+  Value constantAssignment(const Node &);
+  Value constantAggregate(const std::string &, const std::vector<Node> &,
+                          const Token &, const Node *);
   void finishVirtualBase(Value, unsigned);
   void bindVirtualLayout(Value);
   llvm::Value *snapshot(Value);

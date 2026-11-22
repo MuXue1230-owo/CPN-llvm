@@ -194,9 +194,13 @@ llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
 }
 Value Frame::baseView(Value Obj, const BasePath &Path) {
   for (auto I : Path) {
-    Obj.Address = fieldAddress(Obj, I);
+    if (!IR && !Obj.Address && llvm::isa_and_nonnull<llvm::Constant>(Obj.IR)) {
+      Obj.IR = llvm::cast<llvm::Constant>(Obj.IR)->getAggregateElement(I);
+    } else {
+      Obj.Address = fieldAddress(Obj, I);
+      Obj.IR = nullptr;
+    }
     Obj.Type = U.Records.at(Obj.Type).Bases[I];
-    Obj.IR = nullptr;
     Obj.BaseView = true;
   }
   return Obj;
@@ -374,6 +378,10 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto Metadata = openPointerCall(Ptr.IR, Sig.front(),
                                   llvm::ArrayRef(Sig).drop_front(), Actual);
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  if (Sig[0] == "never") {
+    Call->setDoesNotReturn();
+    return endDivergentCall();
+  }
   closePointerCall(Metadata);
   propagateWhole(Before);
   for (size_t I = 0; I < Actual.size(); ++I)
@@ -384,4 +392,12 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   if (Sources == 1)
     Result.Storage = std::move(StorageOrigin);
   return pointerCallResult(Result, Metadata, Sig.front());
+}
+
+Value Frame::endDivergentCall() {
+  B.CreateUnreachable();
+  // Keep binding later source in a disconnected block.
+  B.SetInsertPoint(block("after.never"));
+  Live = false;
+  return {"never"};
 }
