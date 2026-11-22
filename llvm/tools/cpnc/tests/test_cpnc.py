@@ -1106,6 +1106,104 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stderr)
 
+    def test_whole_unwinds_direct_and_indirect_helpers(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            void note(i32 n){trace=trace*10+n;}
+            struct Marker {i32 n; Marker(i32 v){init n(v);} ~Marker(){note(n);}};
+            struct Base {~Base(){note(2);}};
+            declare struct Derived;
+            declare void inner(Derived& d);
+            declare void outer(Derived& d);
+            struct Derived:Base {
+                Complete base<Base>; Marker field(6);
+                ~Derived(){note(1);outer(*this);note(9);}
+                cleanup {note(7);}
+            };
+            void inner(Derived& d){ Marker local(3);
+                destroy_base<Base>(d);note(9); }
+            void outer(Derived& d){ Marker local(4);
+                function<void(Derived&) [[lifecycle_effect(whole)]]>* fn(&inner);fn(d);note(9); }
+            i32 main(){{Derived d;}if(trace==123467){return 42;}return 1;}
+            """),
+            42,
+        )
+
+    def test_whole_effect_pointer_contract(self):
+        for qualifier in ("", " noexcept"):
+            source = """
+                struct Base{};struct D:Base{Complete base<Base>;};
+                void end(D& d) QUAL {abandon_base<Base>(d);}
+                void forward_request(D& d) QUAL {end(d);}
+                void f(){function<void(D&) QUAL EFFECT>* p(&forward_request);}
+            """.replace("QUAL", qualifier)
+            valid = self.compile(
+                source.replace("EFFECT", "[[lifecycle_effect(whole)]]"), "--check"
+            )
+            self.assertEqual(valid.returncode, 0, valid.stderr)
+            invalid = self.compile(source.replace("EFFECT", ""), "--check")
+            self.assertNotEqual(invalid.returncode, 0)
+            self.assertIn("preserve lifecycle_effect", invalid.stderr)
+
+    def test_alive_base_path_request_skips_containing_layers(self):
+        for request, expected in [("destroy_base", 232456), ("abandon_base", 32456)]:
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.program(
+                        """
+                    i32 trace; void note(i32 n){trace=trace*10+n;}
+                    struct B {~B(){note(2);}};
+                    struct Left:B {Complete base<B>;~Left(){note(9);}cleanup {note(5);}};
+                    struct Right:B {~Right(){note(3);}cleanup {note(4);}};
+                    struct D:Left,Right {~D(){note(9);}cleanup {note(6);}};
+                    i32 main(){D d;
+                        REQUEST<base_path<Left,B>>(d);
+                        if(trace==EXPECTED){return 42;}return 1;}
+                    """.replace("REQUEST", request).replace("EXPECTED", str(expected))
+                    ),
+                    42,
+                )
+
+    def test_virtual_owner_preserves_one_shared_obligation(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace; void note(i32 n){trace=trace*10+n;}
+            struct V{~V(){note(2);}};
+            struct Left:virtual V {Complete virtual_base<V>;
+                ~Left(){note(1);destroy_base<V>(this);note(9);} cleanup {note(3);}};
+            struct Right:virtual V {~Right(){note(4);}};
+            struct D:Right,Left {destruction_owner<V> = Left;};
+            i32 main(){{D d;}if(trace==123){return 42;}return 1;}
+            """),
+            42,
+        )
+        for source, message in [
+            (
+                "struct V{};struct L:V{};struct D:L{destruction_owner<V> = L;};",
+                "shared virtual base",
+            ),
+            (
+                "struct V{};struct L:virtual V{};struct X{};"
+                "struct D:L,X{destruction_owner<V> = X;};",
+                "must contain",
+            ),
+            (
+                "struct V{};struct L:virtual V{};struct D:L{"
+                "destruction_owner<V> = L;destruction_owner<V> = L;};",
+                "competing",
+            ),
+            (
+                "struct V{};struct L:V{};struct R:V{};struct D:L,R{};"
+                "void f(D& d){destroy_base<V>(d);}",
+                "ambiguous base",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_direct_base_request_exits_the_destructor_body(self):
         for request in ("destroy_base<Parent>(this);", "this->Parent::~Parent();"):
             with self.subTest(request=request):

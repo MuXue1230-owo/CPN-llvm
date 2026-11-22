@@ -50,6 +50,8 @@ struct Function {
   llvm::Function *IR = nullptr, *BaseIR = nullptr;
   bool Emitting = false, Emitted = false;
   int Slot = -1;
+  bool MayWhole = false;
+  std::set<Function *> Calls;
   bool isStatic() const { return Decl.Settings.count("static"); }
 };
 struct Field {
@@ -83,6 +85,8 @@ struct Record {
   std::vector<unsigned> Direct;
   std::map<BasePath, std::string> Views;
   std::map<BasePath, std::vector<BasePath>> Edges;
+  std::map<std::string, BasePath> LocalOwners, Owners;
+  bool contains(const BasePath &, const BasePath &) const;
   unsigned tailSlot(unsigned I) const {
     return Layer->getNumElements() + 1 + I;
   }
@@ -152,6 +156,13 @@ struct Context {
                     const Substitution &, const std::string &Owner = "");
   void defineQualified(const Node &, const std::string &);
   void declareMembers(const std::string &, const std::string &);
+  bool Whole = false;
+  std::vector<std::pair<Function *, Token>> RestrictedPointers;
+  void checkWholeContracts();
+  std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
+  llvm::Function *coordinator(const std::string &);
+  llvm::Function *baseCleanup(const std::string &);
+  void bindOwners(const std::string &, const std::string &);
   void buildViews(const std::string &);
   std::optional<BasePath> lookupPath(const std::string &, const Token &,
                                      bool Method) const;
@@ -174,6 +185,9 @@ struct EnterDefinition {
         LookupScope(U.LookupLimit, Site.Through) {}
 };
 // Find the nearest namespace binding, or begin at the module root for ::names.
+inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
+  return T.take_back(T.size() - (T.rfind(')') + 1)).contains(Flag);
+}
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
@@ -287,6 +301,13 @@ public:
   void stmt(const Node &);
   void object(const Node &, bool Global = false);
   void drop(Value, bool AsBase = false);
+  void dropLayer(Value, bool AsBase);
+  BasePath selectBase(const Record &, const BasePath &, const Node &);
+  Value baseRequest(const Node &, const Node &);
+  llvm::Value *wholeEpoch();
+  void propagateWhole(llvm::Value *);
+  void exitWhole();
+  static bool usesWhole(const Node &);
   llvm::Value *slotFor(Value);
   Value subobject(Value, Value);
   void dropChild(Value, Value, bool AsBase = false);

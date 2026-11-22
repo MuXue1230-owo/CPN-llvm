@@ -6,16 +6,15 @@ bool same(Function *A, Function *B) {
          A->Decl.Const == B->Decl.Const &&
          A->Decl.Settings["category"] == B->Decl.Settings["category"];
 }
-// Two paths through a virtual edge denote the same complete-object slot.
-bool reaches(const Record &R, const BasePath &From, const BasePath &To) {
+} // namespace
+bool Record::contains(const BasePath &From, const BasePath &To) const {
   if (From == To)
     return true;
-  auto It = R.Edges.find(From);
-  return It != R.Edges.end() && llvm::any_of(It->second, [&](auto &Next) {
-           return reaches(R, Next, To);
+  auto I = Edges.find(From);
+  return I != Edges.end() && llvm::any_of(I->second, [&](const auto &Next) {
+           return contains(Next, To);
          });
 }
-} // namespace
 void Context::buildViews(const std::string &Name) {
   auto &Root = Records.at(Name);
   std::function<void(const std::string &, const BasePath &)> visit =
@@ -62,7 +61,7 @@ std::optional<BasePath> Context::lookupPath(const std::string &Type,
   std::optional<BasePath> Found;
   for (auto &P : Matches) {
     if (llvm::any_of(Matches, [&](auto &Other) {
-          return Other != P && reaches(Root, Other, P);
+          return Other != P && Root.contains(Other, P);
         }))
       continue;
     if (Found)
@@ -126,7 +125,7 @@ void Context::buildTables(const std::string &Name,
       // override in an unrelated branch cannot affect a nonshared base.
       std::map<BasePath, Function *> Candidates;
       for (auto &[Path, T] : R.Views) {
-        if (!reaches(R, Path, View))
+        if (!R.contains(Path, View))
           continue;
         auto &Virtuals = Records.at(T).Virtuals;
         auto It = llvm::find_if(
@@ -137,14 +136,14 @@ void Context::buildTables(const std::string &Name,
       // The static view may itself inherit this slot from a deeper base.
       if (Candidates.empty()) {
         for (auto &[Path, T] : R.Views)
-          if (T == Slot->Owner && reaches(R, View, Path))
+          if (T == Slot->Owner && R.contains(View, Path))
             Candidates[Path] = Slot;
       }
       Function *Final = nullptr;
       BasePath Target;
       for (auto &[Path, F] : Candidates) {
         if (llvm::any_of(Candidates, [&](const auto &Other) {
-              return Other.first != Path && reaches(R, Other.first, Path);
+              return Other.first != Path && R.contains(Other.first, Path);
             }))
           continue;
         if (Final)
@@ -249,7 +248,9 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto T = element(Ptr.Type);
   if (!U.Signatures.count(T))
     fail(At, "function-pointer contract required");
-  if (RequireNoexcept && !llvm::StringRef(T).ends_with(" noexcept>"))
+  if (F && callableFlag(T, " whole"))
+    F->MayWhole = true;
+  if (RequireNoexcept && !callableFlag(T, " noexcept"))
     fail(At, "expression requires a nonthrowing call");
   auto &Sig = U.Signatures.at(T);
   if (Sig.size() != Args.size() + 1)
@@ -266,5 +267,8 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
       Vals.push_back(materialize(convert(V, Param, At), At).IR);
   }
   auto *FT = llvm::FunctionType::get(U.ir(Sig.front()), Types, false);
-  return callResult(Sig[0], B.CreateCall(FT, Ptr.IR, Vals), At);
+  auto *Before = wholeEpoch();
+  auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  propagateWhole(Before);
+  return callResult(Sig[0], Call, At);
 }

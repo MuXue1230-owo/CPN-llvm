@@ -7,8 +7,11 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
             "${CMAKE_CURRENT_SOURCE_DIR}/unicode/ucd17.json.gz"
             "${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc"
     DEPENDS utils/native_ucd.py unicode/ucd17.json.gz VERBATIM)
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS StorageRuntime.ll)
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS StorageRuntime.ll LifetimeRuntime.ll)
   file(READ "${CMAKE_CURRENT_SOURCE_DIR}/StorageRuntime.ll" CPN_STORAGE_IR)
+  file(READ "${CMAKE_CURRENT_SOURCE_DIR}/LifetimeRuntime.ll" CPN_LIFETIME_IR)
+  string(APPEND CPN_STORAGE_IR "
+" "${CPN_LIFETIME_IR}")
   configure_file(StorageRuntime.inc.in StorageRuntime.inc @ONLY)
   add_llvm_tool(cpnc
     Binding.cpp
@@ -23,6 +26,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Integer.cpp
     Lexer.cpp
     Lifetime.cpp
+    Whole.cpp
     Parser.cpp
     Reservations.cpp
     Sema.cpp

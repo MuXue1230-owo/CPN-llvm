@@ -90,6 +90,7 @@ struct Node {
     Field,
     Constructor,
     Destructor,
+    DestructionOwner,
     Init,
     Delegate,
     Enumeration,

@@ -381,7 +381,7 @@ Value Frame::eval(const Node &N, std::string Expected) {
               Candidate->Result != Sig.front() ||
               Candidate->Params !=
                   std::vector<std::string>(Sig.begin() + 1, Sig.end()) ||
-              (ends(element(Expected), " noexcept>") &&
+              (callableFlag(element(Expected), " noexcept") &&
                !Candidate->Decl.Noexcept))
             continue;
           if (Match)
@@ -390,6 +390,8 @@ Value Frame::eval(const Node &N, std::string Expected) {
         }
         if (!Match)
           fail(N.At, "no unique compatible function");
+        if (!callableFlag(element(Expected), " whole"))
+          U.RestrictedPointers.emplace_back(Match, N.At);
         return {Expected, checkSelected(Match, N.At)->IR};
       }
       auto V = place(A[0]);
@@ -611,7 +613,8 @@ std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
         return 1;
       if (U.Signatures.count(From) && U.Signatures.count(To) &&
           U.Signatures.at(From) == U.Signatures.at(To) &&
-          (!ends(To, " noexcept>") || ends(From, " noexcept>")))
+          (!callableFlag(To, " noexcept") || callableFlag(From, " noexcept")) &&
+          (!callableFlag(From, " whole") || callableFlag(To, " whole")))
         return 1;
     }
   }
@@ -880,6 +883,8 @@ void Frame::admitArguments(CallArguments &A, Function *D, const Token &At) {
 }
 Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                     Value Receiver, bool Prepared) {
+  if (F && IR)
+    F->Calls.insert(&D);
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
   std::vector<llvm::Value *> Values;
@@ -954,6 +959,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     }
     fail(T, "constant invocation completed without a result");
   }
+  auto *Before = wholeEpoch();
   llvm::CallInst *Call = nullptr;
   if (D.Slot >= 0) {
     auto &R = U.Records.at(D.Owner);
@@ -972,6 +978,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     Call =
         B.CreateCall(Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR, Values);
   Call->setAttributes(D.IR->getAttributes());
+  propagateWhole(Before);
   // A helper can end or replace an extent reached through its receiver or
   // a borrowed argument. Its live state is subsequently checked at runtime.
   if (!Receiver.Storage.empty() && Active.count(Receiver.Storage))
@@ -1024,18 +1031,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     return V;
   }
   if ((Name == "destroy_base" || Name == "abandon_base") && Args.size() == 1 &&
-      C.TemplateArgs.size() == 1) {
-    if (!F || F->Decl.K != Node::Destructor || Args[0].K != Node::Name ||
-        Args[0].Text != "this" || !InlineReturn)
-      fail(C.At, "base request requires the current destructor layer");
-    auto Slot = "$base:" + resolve(C.TemplateArgs[0].Type, C.At);
-    endField(Slot, C.At, Name == "destroy_base", true);
-    cleanup(0);
-    branch(InlineReturn);
-    B.SetInsertPoint(block("unreachable"));
-    Live = false;
-    return {"void"};
-  }
+      C.TemplateArgs.size() == 1)
+    return baseRequest(C, Args.front());
   if (!FieldFlags.empty() && Args.size() == 1 &&
       (Name == "destroy" || Name == "abandon")) {
     auto Slot = directField(Args[0]);
@@ -1345,6 +1342,14 @@ void Frame::drop(Value V, bool AsBase) {
   }
   if (!V.Storage.empty() && Active.count(V.Storage) && !Active[V.Storage])
     return;
+  if (U.Whole && !AsBase && U.Records.count(V.Type) &&
+      !U.Records.at(V.Type).Views.empty()) {
+    B.CreateCall(U.coordinator(V.Type), {V.Address});
+    return;
+  }
+  dropLayer(V, AsBase);
+}
+void Frame::dropLayer(Value V, bool AsBase) {
   if (ends(V.Type, "]")) {
     auto E = element(V.Type);
     if (!TracksStorage && !U.Records.count(E) && !ends(E, "]"))

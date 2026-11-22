@@ -351,6 +351,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
   validate(N, P, Owner);
   Function D;
   D.Decl = N;
+  D.MayWhole = N.Settings.count("lifecycle_effect");
   D.DefaultParams = N.Params;
   D.Name = Name;
   D.Owner = Owner;
@@ -414,6 +415,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
             (N.Settings.count("category") ? N.Settings.at("category") : "")) {
       if (Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
+          Prev->Decl.Settings.count("lifecycle_effect") !=
+              N.Settings.count("lifecycle_effect") ||
           (!N.Settings.count("qualifier") &&
            Prev->isStatic() != D.isStatic()) ||
           Prev->Decl.Required != N.Required ||
@@ -590,6 +593,7 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   Frame Check(*this, nullptr, nullptr, P);
   Check.Env = R.Env;
   buildViews(Name);
+  bindOwners(Name, P);
   std::vector<Function *> Members;
   for (auto &D : N.Children)
     if (D.K == Node::Constructor || D.K == Node::Destructor ||
@@ -840,9 +844,11 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
 }
 void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));
-  if (llvm::any_of(AST, Frame::usesStorage))
+  U.Whole = llvm::any_of(AST, Frame::usesWhole);
+  if (U.Whole || llvm::any_of(AST, Frame::usesStorage))
     U.enableStorage();
   U.unit(AST);
+  U.checkWholeContracts();
   for (auto &F : U.Functions)
     for (auto *Entry : {F.IR, F.BaseIR})
       if (Entry && Entry->isDeclaration() && !F.Decl.Foreign) {

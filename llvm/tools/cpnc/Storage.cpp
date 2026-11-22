@@ -121,6 +121,17 @@ Value Frame::subobject(Value Parent, Value V) {
   return V;
 }
 void Frame::dropChild(Value Parent, Value V, bool AsBase) {
+  if (AsBase && U.Whole) {
+    auto *Run = block("base.scheduled"), *Done = block("base.done");
+    B.CreateCondBr(B.CreateCall(U.M.getFunction("cpn.view.available"),
+                                {V.Address, U.typeID(V.Type), B.getTrue()}),
+                   Run, Done);
+    B.SetInsertPoint(Run);
+    drop(V, true);
+    branch(Done);
+    B.SetInsertPoint(Done);
+    return;
+  }
   if (!TracksStorage || AsBase) {
     drop(V, AsBase);
     return;

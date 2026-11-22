@@ -48,14 +48,21 @@ void Frame::retirement() {
   for (auto &D : R.Decl.Children)
     if (D.K == Node::Init && D.Type == "Complete") {
       if (D.Text == "*") {
-        for (auto &Field : R.Fields)
-          Manual.insert(Field.Decl.Text);
+        for (size_t I = R.VirtualCount; I < R.Fields.size(); ++I)
+          Manual.insert(R.Fields[I].Decl.Text);
       } else if (FieldFlags.count(D.Text))
         Manual.insert(D.Text);
       else
         fail(D.At, "Complete must select a direct subobject");
     }
   InlineReturn = block("dtor.sweep");
+  if (U.Whole) {
+    auto *Body = block("dtor.body");
+    B.CreateCondBr(B.CreateCall(U.M.getFunction("cpn.view.skip"),
+                                {Self.Address, U.typeID(Self.Type)}),
+                   InlineReturn, Body);
+    B.SetInsertPoint(Body);
+  }
   stmt(F->Decl.Children[0]);
   branch(InlineReturn);
   B.SetInsertPoint(InlineReturn);
@@ -69,8 +76,16 @@ void Frame::retirement() {
       break;
     if (Manual.count(Slot)) {
       auto *Next = block("dtor.pass");
-      B.CreateCondBr(B.CreateLoad(B.getInt1Ty(), FieldFlags.at(Slot)), Cleanup,
-                     Next);
+      auto *Alive = B.CreateLoad(B.getInt1Ty(), FieldFlags.at(Slot));
+      llvm::Value *Barrier = Alive;
+      if (U.Whole && llvm::StringRef(Slot).starts_with("$base:")) {
+        auto *Addr =
+            fieldAddress(Self, std::distance(R.Fields.begin(), I.base()) - 1);
+        Barrier = B.CreateAnd(
+            Alive, B.CreateCall(U.M.getFunction("cpn.view.available"),
+                                {Addr, U.typeID(I->Type), B.getFalse()}));
+      }
+      B.CreateCondBr(Barrier, Cleanup, Next);
       B.SetInsertPoint(Next);
     } else
       endField(Slot, I->Decl.At, true, false);

@@ -171,6 +171,22 @@ class Parser {
     }
     return T;
   }
+  Node baseSelector() {
+    Node Selector(Node::TypeArg, peek());
+    if (is("base_path") && peek(1).Text == "<") {
+      take();
+      expect("<");
+      do {
+        Node Edge(Node::TypeArg, peek());
+        Edge.Type = type();
+        Selector.TemplateArgs.push_back(Edge);
+      } while (eat(","));
+      closeAngle();
+      Selector.Type = Selector.TemplateArgs.back().Type;
+    } else
+      Selector.Type = type();
+    return Selector;
+  }
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr) {
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
@@ -183,7 +199,13 @@ class Parser {
                         T.Text == "destroy_base" || T.Text == "abandon_base" ||
                         T.Text == "std::forward")))) {
         auto Start = Pos;
-        auto Args = templateArgs(T.Text);
+        std::vector<Node> Args;
+        if (T.Text == "destroy_base" || T.Text == "abandon_base") {
+          expect("<");
+          Args.push_back(baseSelector());
+          closeAngle();
+        } else
+          Args = templateArgs(T.Text);
         if (!Application || is("::") || Types.count(T.Text))
           T.Text += spelling(Start);
         else {
@@ -279,6 +301,11 @@ class Parser {
       S += ")";
       if (eat("noexcept"))
         S += " noexcept";
+      for (const auto &[Key, Value] : attributes()) {
+        if (Key != "lifecycle_effect")
+          fail(T, "invalid callable type attribute");
+        S += " whole";
+      }
       closeAngle();
       S += ">";
     } else {
@@ -738,6 +765,19 @@ class Parser {
            peek(I).Text == "override" || peek(I).Text == "final" ||
            peek(I).Text == "&" || peek(I).Text == "&&")
       ++I;
+    while (peek(I).Text == "[" && peek(I + 1).Text == "[") {
+      I += 2;
+      while (!peek(I).Text.empty() &&
+             !(peek(I).Text == "]" && peek(I + 1).Text == "]"))
+        ++I;
+      if (peek(I).Text.empty())
+        return false;
+      I += 2;
+    }
+    if (peek(I).Text == "override")
+      ++I;
+    if (peek(I).Text == "final")
+      ++I;
     return peek(I).Text == "{" || peek(I).Text == "=";
   }
   std::vector<Node> generic() {
@@ -815,6 +855,7 @@ class Parser {
     if (Drop && !D.Params.empty())
       fail(D.At, "a destructor takes no parameters");
     D.Noexcept = eat("noexcept");
+    applyAttributes(D, attributes());
     if (Drop && !Separate && eat("override"))
       D.Settings["override"] = "1";
     if (Drop && !Separate && eat("final"))
@@ -830,6 +871,45 @@ class Parser {
         D.Children.push_back(block());
     }
   }
+  using Attributes = std::map<std::string, std::string>;
+  Attributes attributes() {
+    Attributes Result;
+    while (is("[") && peek(1).Text == "[") {
+      take();
+      take();
+      do {
+        auto Key = name();
+        expect("(");
+        std::string Value;
+        if (Key.Text == "static_id")
+          Value = unquote(take());
+        else if (Key.Text == "init_after")
+          Value = qualified().Text;
+        else if (Key.Text == "lifecycle_effect")
+          Value = expect("whole").Text;
+        else
+          fail(Key, "unsupported attribute");
+        expect(")");
+        if (!Result.emplace(Key.Text, Value).second)
+          fail(Key, "duplicate attribute");
+      } while (eat(","));
+      expect("]");
+      expect("]");
+    }
+    return Result;
+  }
+  void applyAttributes(Node &D, const Attributes &Attrs) {
+    for (const auto &[Key, Value] : Attrs) {
+      if (Key == "lifecycle_effect") {
+        if (D.K != Node::Function && D.K != Node::Destructor &&
+            D.K != Node::Constructor)
+          fail(D.At, "lifecycle_effect requires a callable");
+      } else if (D.K != Node::Object)
+        fail(D.At, "static attribute requires an object");
+      if (!D.Settings.emplace(Key, Value).second)
+        fail(D.At, "duplicate attribute");
+    }
+  }
   Node declaration(bool Foreign = false, bool Member = false) {
     Nest Guard(Depth, peek());
     auto T = peek();
@@ -841,26 +921,9 @@ class Parser {
       return D;
     }
     if (is("[") && peek(1).Text == "[") {
-      std::map<std::string, std::string> Attr;
-      while (eat("[")) {
-        expect("[");
-        do {
-          auto Key = take();
-          if (Key.Text != "static_id" && Key.Text != "init_after")
-            fail(Key, "unsupported attribute");
-          expect("(");
-          auto V = Key.Text == "static_id" ? unquote(take()) : qualified().Text;
-          expect(")");
-          if (!Attr.emplace(Key.Text, V).second)
-            fail(Key, "duplicate attribute");
-        } while (eat(","));
-        expect("]");
-        expect("]");
-      }
+      auto Attributes = attributes();
       auto D = declaration(Foreign, Member);
-      if (D.K != Node::Object)
-        fail(T, "static attribute requires an object");
-      D.Settings.insert(Attr.begin(), Attr.end());
+      applyAttributes(D, Attributes);
       return D;
     }
     if (eat("configuration")) {
@@ -1034,6 +1097,17 @@ class Parser {
           R.Children.push_back(std::move(C));
           continue;
         }
+        if (!Union && eat("destruction_owner")) {
+          Node D(Node::DestructionOwner, peek());
+          expect("<");
+          D.Type = type();
+          closeAngle();
+          expect("=");
+          D.TemplateArgs.push_back(baseSelector());
+          expect(";");
+          R.Children.push_back(std::move(D));
+          continue;
+        }
         bool SpecialProto =
             is("declare") &&
             ((peek(1).Text == R.Text && peek(2).Text == "(") ||
@@ -1171,6 +1245,7 @@ class Parser {
         F.Settings["category"] = take().Text;
     }
     F.Noexcept = eat("noexcept");
+    applyAttributes(F, attributes());
     if (Member && eat("override"))
       F.Settings["override"] = "1";
     if (Member && eat("final"))

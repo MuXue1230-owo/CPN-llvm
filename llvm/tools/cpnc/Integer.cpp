@@ -89,8 +89,8 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
     }
     if (U.Signatures.count(A) && U.Signatures.count(D) &&
         U.Signatures.at(A) == U.Signatures.at(D) &&
-        (!StringRef(D).ends_with(" noexcept>") ||
-         StringRef(A).ends_with(" noexcept>"))) {
+        (!callableFlag(D, " noexcept") || callableFlag(A, " noexcept")) &&
+        (!callableFlag(A, " whole") || callableFlag(D, " whole"))) {
       V.Type = T;
       return V;
     }
