@@ -295,6 +295,8 @@ Value Frame::baseRequest(const Node &C, const Node &Operand) {
   const auto &R = U.Records.at(Object.Type);
   auto Path = selectBase(R, {}, C.TemplateArgs.front());
   auto Target = baseView(Object, Path);
+  if (C.Text == "abandon_base")
+    checkAbandon(Target.Type, C.At);
   auto Parent = Path;
   Parent.pop_back();
   auto Authority = baseView(Object, Parent);

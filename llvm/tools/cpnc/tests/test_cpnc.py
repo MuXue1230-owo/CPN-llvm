@@ -42,6 +42,113 @@ class CompilerTests(unittest.TestCase):
         subprocess.run([*cmd, "-o", exe], check=True)
         return subprocess.run([exe], cwd=self.dir).returncode
 
+    def test_empty_arrays_and_extent_pointer_arithmetic(self):
+        self.assertEqual(
+            self.program("""
+            i32 drops;struct Item{~Item(){++drops;}};
+            i32 main(){
+                {Item[0] empty;if(sizeof(empty)<1 || alignof(Item[0])!=alignof(Item)){return 1;}}
+                i32[4] a(1,2,3,4);i32[2] b(11,12);
+                i32* p(&a[1]);i32* end(p+3);if(end-p!=3 || *(end-2)!=3){return 2;}
+                p=&b[0]; if(*(1+p)!=12 || drops!=0){return 3;}return 42;
+            }"""),
+            42,
+        )
+        for body in (
+            "return *(p+2);",
+            "return *(p-1);",
+            "return (p-&b[0])==0 ? 1 : 2;",
+        ):
+            self.assertLess(
+                self.program(
+                    "i32 main(){i32[2] a;i32[2] b;i32* p(&a[0]);" + body + "}"
+                ),
+                0,
+            )
+        self.assertNotEqual(
+            self.compile("i32 main(){i32[0] a;return a[0];}", "--check").returncode, 0
+        )
+
+    def test_goto_drops_only_exited_objects_in_reverse(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;struct Item{i32 n;~Item(){trace=trace*10+n;}};
+            i32 main(){i32 loops;Item keep(4);
+              start: {++loops;}
+              Item a(1);
+              {Item b(2);if(loops==1){goto start;}goto done;}
+              done: {if(trace==212){return 42;}return 1;}
+            }"""),
+            42,
+        )
+
+    def test_type_specialization_order_and_ambiguity(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T> struct Tag{i32 value(1);};
+            generic<type U> requires(ObjectType<U>) specialize struct Tag<U*>{i32 value(2);};
+            specialize struct Tag<i32*>{i32 value(3);};
+            generic<const i32 N> struct Amount{i32 n(N);};
+            specialize struct Amount<6>{i32 n(30);};
+            i32 main(){Tag<i32*> a;Tag<u8*> b;Tag<i64> c;Amount<6> d;Amount<6+0> e;
+              if(a.value==3 && b.value==2 && c.value==1 && d.n==e.n){return d.n+12;}return 1;}
+            """),
+            42,
+        )
+        r = self.compile(
+            """
+            generic<type A,type B> struct Pair{};
+            generic<type A> specialize struct Pair<A,i32>{};
+            generic<type B> specialize struct Pair<i32,B>{};
+            void f(){Pair<i32,i32> ambiguous;}
+            """,
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("ambiguous type specialization", r.stderr)
+
+    def test_required_integer_evaluation_and_abandon_diagnostics(self):
+        for src in (
+            "constexpr i8 x(i8(127)+1);",
+            "void f(){constexpr i8 x(i8(127)+1);}",
+            "i32 f(u8 a,i8 b){return a|b;}",
+            "i32 f(u8 a,u16 b){return a^b;}",
+        ):
+            self.assertNotEqual(self.compile(src, "--check").returncode, 0)
+        body = (
+            "struct D{~D(){}};struct Holder{D member;};void f(){Holder h;abandon(h);}"
+        )
+        for config, code, msg in [
+            ("", 0, "ANOMALY: LIFE004"),
+            ("diagnostics.promote=[LIFE004];", 1, "ERROR: LIFE004"),
+            ("diagnostics.suppress=[LIFE004];", 0, ""),
+        ]:
+            r = self.compile(
+                ("configuration {" + config + "};" if config else "") + body, "--check"
+            )
+            self.assertEqual(r.returncode, code, r.stderr)
+            if msg:
+                self.assertIn(msg, r.stderr)
+            else:
+                self.assertEqual(r.stderr, "")
+
+    def test_borrow_parameter_contract_bindings(self):
+        for src in (
+            "[[noescape(x)]] void f(i32 x){}",
+            "[[returns_borrowed_from(y)]] i32& f(i32& x){return x;}",
+            "[[noescape(x)]] i32* f(i32* x){return x;}",
+            "i32* retained;[[noescape(x)]] void f(i32* x){retained=x;}",
+            "[[returns_borrowed_from(x)]] i32& f(i32& x,i32& y){return y;}",
+        ):
+            self.assertNotEqual(self.compile(src, "--check").returncode, 0)
+        self.assertEqual(
+            self.program("""
+            [[noescape(x),returns_borrowed_from(x)]] i32& f(i32[2]& x){return x[1];}
+            i32 main(){i32[2] a(0,40);f(a)+=2;return a[1];}
+        """),
+            42,
+        )
+
     def test_generic_loop_and_exact_literals(self):
         self.assertEqual(
             self.program("""

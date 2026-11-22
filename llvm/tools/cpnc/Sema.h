@@ -7,13 +7,21 @@
 #include <deque>
 #include <optional>
 namespace cpn {
+using SourcePosition = std::pair<unsigned, unsigned>;
+using JumpCleanups = std::map<SourcePosition, std::set<SourcePosition>>;
 struct Value {
+  SourcePosition DeclaredAt;
   std::string Type;
   llvm::Value *IR = nullptr, *Address = nullptr;
   bool Readonly = false, Expiring = false;
   std::string Storage, RealText;
   llvm::Value *Generation = nullptr, *Slot = nullptr;
   std::string ExtentType;
+  // Bounds of a pointer value and of a designated array element are distinct
+  // for arrays of pointers. BoundsCell follows reassignment of a local pointer.
+  llvm::Value *Lower = nullptr, *Upper = nullptr, *BoundsCell = nullptr;
+  llvm::Value *ElementLower = nullptr, *ElementUpper = nullptr;
+  std::set<unsigned> Origins;
   bool Subobject = false, OptionalTemp = false;
   void borrow(const Value &V) {
     Generation = V.Generation;
@@ -22,6 +30,9 @@ struct Value {
     ExtentType = V.ExtentType;
     Subobject = V.Subobject;
     BaseView = V.BaseView;
+    Lower = V.Lower;
+    Upper = V.Upper;
+    Origins = V.Origins;
   }
   bool BaseView = false, Prvalue = false;
   Value() = default;
@@ -50,7 +61,9 @@ struct Function {
   llvm::Function *IR = nullptr, *BaseIR = nullptr;
   bool Emitting = false, Emitted = false;
   int Slot = -1;
+  JumpCleanups ExitedLifetimes;
   bool MayWhole = false;
+  std::set<unsigned> NoEscape, BorrowedResult;
   std::set<Function *> Calls;
   bool isStatic() const { return Decl.Settings.count("static"); }
 };
@@ -143,6 +156,7 @@ struct Context {
   void checkDomain(const Node &, const std::string &);
 
   std::map<std::string, Family> Families;
+  std::map<std::string, std::vector<Family>> Specializations;
   std::map<std::string, std::deque<Family>> FunctionFamilies;
   std::map<std::string, std::vector<std::string>> Signatures;
   std::map<std::string, Family> Constraints;
@@ -178,8 +192,8 @@ struct Context {
   void unit(const std::vector<Node> &, std::string Prefix = "");
   void emit(Function &);
   void emitBody(Function &, llvm::Function *, bool);
-  void validate(const Node &, const std::string &,
-                const std::string &Owner = "");
+  JumpCleanups validate(const Node &, const std::string &,
+                        const std::string &Owner = "");
 };
 struct EnterDefinition {
   llvm::SaveAndRestore<Options> OptionsScope;
@@ -195,6 +209,8 @@ inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
+std::vector<std::string> splitArguments(llvm::StringRef);
+bool betterTypePattern(const Node &, const Node &);
 bool betterPattern(const Node &, const Node &);
 Family expand(const Family &, size_t, const Token &);
 std::string element(const std::string &T);
@@ -246,6 +262,7 @@ public:
   bool HasDelegated = false;
   std::map<std::string, llvm::Value *> FieldFlags;
   void retirement();
+  void checkAbandon(const std::string &, const Token &);
   void endField(const std::string &, const Token &, bool RunDestructor,
                 bool Explicit);
   std::string directField(const Node &) const;
@@ -267,6 +284,8 @@ public:
   Value constant(llvm::APInt, std::string Type = "integer");
   Value literal(int64_t, const std::string &Ty = "integer");
   Value convert(Value, const std::string &, const Token &);
+  Value pointerBinary(const Node &, Value, Value);
+  void saveBounds(llvm::Value *, Value);
   Value binary(const Node &, Value, Value);
   Value boolean(const Node &);
   Value eval(const Node &, std::string Expected = "",
@@ -296,6 +315,8 @@ public:
                    Value Receiver = {}, bool Operator = false);
   Function *prepareCandidate(const Family &, const std::string &, const Node &,
                              const std::vector<Value> &);
+  void selectTypeSpecialization(const std::string &, Family &, Substitution &,
+                                const Token &);
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
   std::string initSlot(const Node &);
@@ -329,7 +350,7 @@ public:
   void forgetStorage();
   void joinStorage(const std::map<std::string, int> &);
   static bool usesStorage(const Node &);
-  void cleanup(size_t);
+  void cleanup(size_t, const std::set<SourcePosition> *Exited = nullptr);
   void endExpression(size_t From = 0);
   void consume(Value);
   bool adjust(Value &, const std::string &, const Token &, bool Emit = true);

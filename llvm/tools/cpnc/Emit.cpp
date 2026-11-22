@@ -161,6 +161,8 @@ void Frame::bindParams() {
       }
       Scopes[0].Drops.push_back(V);
     }
+    if (ends(T, "&") || ends(T, "*"))
+      V.Origins.insert(J);
     if (!P.Text.empty())
       Scopes[0].Names[P.Text] = V;
   }
@@ -184,6 +186,11 @@ Value Frame::place(const Node &N, bool NeedLive) {
     auto Base = element(P.Type);
     V = {unconst(Base), nullptr, P.IR, Base != unconst(Base)};
     V.borrow(P);
+    V.ElementLower = P.Lower;
+    V.ElementUpper = P.Upper;
+    if (P.Upper && IR)
+      guard(B.CreateAnd(B.CreateIsNotNull(P.Upper),
+                        B.CreateICmpEQ(P.IR, P.Upper)));
     if (llvm::isa<llvm::ConstantPointerNull>(P.IR))
       fail(N.At, "null pointer access");
   } else if (N.K == Node::Member) {
@@ -216,17 +223,22 @@ Value Frame::subscript(const Node &N) {
   if (!ends(Base.Type, "]") || !integer(Index.Type) || !Base.Address)
     fail(N.At, "array object and integer index required");
   auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Base.Type));
+  auto Count = ends(Base.Type, "[0]") ? 0 : Array->getNumElements();
   if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(Index.IR)) {
-    if (K->getValue().uge(Array->getNumElements()))
+    if (K->getValue().uge(Count))
       fail(N.At, "array index outside extent");
   }
   auto *I = B.CreateIntCast(Index.IR, B.getInt64Ty(), signedType(Index.Type));
-  guard(B.CreateICmpUGE(I, B.getInt64(Array->getNumElements())));
+  guard(B.CreateICmpUGE(I, B.getInt64(Count)));
   auto E = element(Base.Type);
-  return subobject(
+  auto V = subobject(
       Base, {unconst(E), nullptr,
              B.CreateInBoundsGEP(Array, Base.Address, {B.getInt32(0), I}),
              Base.Readonly || E != unconst(E)});
+  V.ElementLower = Base.Address;
+  V.ElementUpper =
+      B.CreateGEP(Array->getElementType(), Base.Address, B.getInt64(Count));
+  return V;
 }
 Value Frame::constantEval(const Node &N) {
   if (IR) {
@@ -406,6 +418,10 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       auto V = place(A[0]);
       Value P{(V.Readonly ? "const<" + V.Type + ">" : V.Type) + "*", V.Address};
       P.borrow(V);
+      P.Lower = V.ElementLower ? V.ElementLower : V.Address;
+      P.Upper = V.ElementUpper
+                    ? V.ElementUpper
+                    : B.CreateGEP(U.ir(V.Type), V.Address, B.getInt64(1));
       return P;
     }
     if (Op == "*")
@@ -587,6 +603,15 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
                  N.At);
         return load(D);
       }
+      if (D.BoundsCell)
+        saveBounds(D.BoundsCell, R);
+      if (ends(D.Type, "*") &&
+          llvm::isa<llvm::GlobalVariable>(
+              llvm::getUnderlyingObject(D.Address)) &&
+          F)
+        for (auto Origin : R.Origins)
+          if (F->NoEscape.count(Origin))
+            fail(N.At, "noescape parameter retained in static storage");
       B.CreateStore(R.IR, D.Address);
       return {D.Type, R.IR, D.Address};
     }
@@ -1043,7 +1068,19 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if ((ends(D.Params[I], "&") || ends(D.Params[I], "*")) &&
         !Actual[I].Storage.empty() && Active.count(Actual[I].Storage))
       Active[Actual[I].Storage] = -1;
-  return callResult(D.Result, Call, T, ResultStorage);
+  auto Returned = callResult(D.Result, Call, T, ResultStorage);
+  if (D.BorrowedResult.size() == 1) {
+    auto Index = *D.BorrowedResult.begin();
+    if (Index < Actual.size()) {
+      Returned.Origins = Actual[Index].Origins;
+      Returned.Storage = Actual[Index].Storage;
+    }
+  } else
+    for (auto I : D.BorrowedResult)
+      if (I < Actual.size())
+        Returned.Origins.insert(Actual[I].Origins.begin(),
+                                Actual[I].Origins.end());
+  return Returned;
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
@@ -1207,7 +1244,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       fail(At, "array construction requires object storage");
     auto *Ptr = Dest ? Dest : allocate(T, At);
     auto *Array = llvm::cast<llvm::ArrayType>(Ty);
-    auto Count = Array->getNumElements();
+    auto Count = ends(T, "[0]") ? 0 : Array->getNumElements();
     if (Args.size() > Count)
       fail(At, "too many array initializers");
     if (Args.size() == 1 && Args[0].K == Node::Name &&
@@ -1434,7 +1471,8 @@ void Frame::drop(Value V, bool AsBase) {
 void Frame::dropLayer(Value V, bool AsBase) {
   if (ends(V.Type, "]")) {
     auto E = element(V.Type);
-    if (!TracksStorage && !U.Records.count(E) && !ends(E, "]"))
+    if (ends(V.Type, "[0]") ||
+        (!TracksStorage && !U.Records.count(E) && !ends(E, "]")))
       return;
     auto *Ty = llvm::cast<llvm::ArrayType>(U.ir(V.Type));
     auto *Entry = B.GetInsertBlock(), *Loop = block("array.drop"),
@@ -1470,10 +1508,12 @@ void Frame::dropLayer(Value V, bool AsBase) {
               I - 1 < R.Bases.size());
   }
 }
-void Frame::cleanup(size_t From) {
+void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
   for (size_t I = Scopes.size(); I > From; --I)
     for (auto V = Scopes[I - 1].Drops.rbegin(); V != Scopes[I - 1].Drops.rend();
          ++V) {
+      if (Exited && !Exited->count(V->DeclaredAt))
+        continue;
       drop(*V);
       if (V->Slot && !V->Subobject && Extents.count(V->Storage) &&
           Extents.at(V->Storage).Address == V->Address)
@@ -1587,6 +1627,9 @@ void Frame::object(const Node &N, bool Global) {
                      (Args[0].K == Node::Name &&
                       (Args[0].Text == "true" || Args[0].Text == "false")))));
     llvm::Value *StaticConstant = nullptr;
+    if (N.Required && Tail)
+      fail(N.At, "constant evaluation of construction tails is unavailable");
+    Simple |= N.Required;
     if (Simple) {
       auto V = construct(Ty, Args, N.At);
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
@@ -1659,7 +1702,22 @@ void Frame::object(const Node &N, bool Global) {
   }
   Value V;
   llvm::Value *Ptr = nullptr;
-  if (Ty == "auto") {
+  if (N.Required) {
+    Frame CF(U, F, nullptr, Prefix);
+    CF.Env = Env;
+    CF.Opt = Opt;
+    CF.LookupLimit = LookupLimit;
+    CF.Scopes = Scopes;
+    V = Ty == "auto" ? CF.constantEval(Args.at(0))
+                     : CF.construct(Ty, Args, N.At);
+    if (Ty == "auto")
+      Ty = V.Type == "integer" ? Opt.DefaultInt
+           : V.Type == "real"  ? Opt.DefaultReal
+                               : V.Type;
+    V = CF.convert(V, Ty, N.At);
+    Ptr = allocate(Ty, N.At);
+    B.CreateStore(V.IR, Ptr);
+  } else if (Ty == "auto") {
     V = eval(Args.at(0));
     Ty = V.Type == "integer" ? Opt.DefaultInt
          : V.Type == "real"  ? Opt.DefaultReal
@@ -1681,6 +1739,11 @@ void Frame::object(const Node &N, bool Global) {
   Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, N.Const};
   if (Ty == "storage" || ends(Ty, "*"))
     Cell.borrow(V);
+  if (ends(Ty, "*")) {
+    llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
+    Cell.BoundsCell = Entry.CreateAlloca(B.getPtrTy(), B.getInt32(2));
+    saveBounds(Cell.BoundsCell, V);
+  }
   if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {
     Cell.Storage = "local." + std::to_string(U.Serial++);
     Active[Cell.Storage] = true;
@@ -1688,6 +1751,7 @@ void Frame::object(const Node &N, bool Global) {
     Extents[Cell.Storage] = Cell;
   }
   names()[Name] = Cell;
+  Cell.DeclaredAt = {N.At.Line, N.At.Column};
   Scopes.back().Drops.push_back(Cell);
   endExpression();
 }
@@ -1753,6 +1817,12 @@ void Frame::stmt(const Node &N) {
       V = eval(A[0], F ? F->Result : "", Result);
     if (!F)
       fail(N.At, "return requires a function");
+    if (ends(F->Result, "*") || ends(F->Result, "&"))
+      for (auto Origin : V.Origins)
+        if ((F->NoEscape.count(Origin) || !F->BorrowedResult.empty()) &&
+            !F->BorrowedResult.count(Origin))
+          fail(N.At,
+               "returned borrow violates the declared parameter contract");
     if (ends(F->Result, "*") && !V.Storage.empty() && Extents.count(V.Storage))
       fail(N.At, "borrow of automatic storage escapes the function");
     if (F->Result == "void" && V.Type != "void")
@@ -1980,6 +2050,7 @@ void Frame::stmt(const Node &N) {
     if (!Target)
       Target = block("label." + N.Text);
     if (N.K == Node::Goto) {
+      cleanup(0, &F->ExitedLifetimes.at({N.At.Line, N.At.Column}));
       branch(Target);
       B.SetInsertPoint(block("unreachable"));
       Live = false;

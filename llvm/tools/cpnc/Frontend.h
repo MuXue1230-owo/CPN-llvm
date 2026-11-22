@@ -34,6 +34,7 @@ struct Options {
   std::string Overflow = "checked", DefaultInt = "i32";
   bool ASCII = false, Promote = false, Silence = false, Check = false,
        IR = false;
+  bool PromoteAbandon = false, SilenceAbandon = false;
   void warn(const Token &, llvm::StringRef) const;
 };
 std::vector<Token> lex(llvm::StringRef, const Options &);
@@ -106,7 +107,7 @@ struct Node {
   } K = Empty;
   Token At;
   std::string Text, Type;
-  std::vector<Node> Children, Params, Generics, TemplateArgs, Policies;
+  std::vector<Node> Children, Params, Generics, TemplateArgs, Policies, Pattern;
   std::map<std::string, std::string> Settings;
   bool HasInitializer = false, ExplicitApplication = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,

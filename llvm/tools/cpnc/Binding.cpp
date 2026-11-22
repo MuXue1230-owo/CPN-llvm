@@ -104,8 +104,8 @@ struct Check {
   }
 };
 } // namespace
-void Context::validate(const Node &N, const std::string &P,
-                       const std::string &Owner) {
+JumpCleanups Context::validate(const Node &N, const std::string &P,
+                               const std::string &Owner) {
   Check Ch{*this, P, Owner, {}, {}, {}, {}};
   Path Scope;
   Ch.Names.insert(N.Text);
@@ -190,8 +190,11 @@ void Context::validate(const Node &N, const std::string &P,
       fail(S.At, "duplicate statement label");
     if (S.K == Node::Goto)
       Flow.Jumps.emplace_back(&S, Live);
-    if (S.K == Node::Block || S.K == Node::For) {
+    if (S.K == Node::Block || S.K == Node::For || S.K == Node::Match ||
+        S.K == Node::Arm) {
       auto Nested = Live;
+      if (S.K == Node::Match || S.K == Node::Arm)
+        Nested.push_back(&S);
       for (auto &C : S.Children)
         walk(C, Nested);
       return;
@@ -201,6 +204,7 @@ void Context::validate(const Node &N, const std::string &P,
   };
   for (auto &C : N.Children)
     walk(C, Scope);
+  JumpCleanups Exited;
   for (auto &[Jump, From] : Flow.Jumps) {
     auto It = Flow.Labels.find(Jump->Text);
     if (It == Flow.Labels.end())
@@ -209,5 +213,9 @@ void Context::validate(const Node &N, const std::string &P,
     if (To.size() > From.size() ||
         !std::equal(To.begin(), To.end(), From.begin()))
       fail(Jump->At, "goto enters an unexecuted initializer");
+    auto &Ended = Exited[{Jump->At.Line, Jump->At.Column}];
+    for (const auto *Object : llvm::ArrayRef(From).drop_front(To.size()))
+      Ended.emplace(Object->At.Line, Object->At.Column);
   }
+  return Exited;
 }

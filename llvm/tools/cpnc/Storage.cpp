@@ -104,6 +104,7 @@ void Frame::track(Value &V, llvm::GlobalVariable *GlobalSlot) {
   }
 }
 Value Frame::subobject(Value Parent, Value V) {
+  V.Origins = Parent.Origins;
   if (!TracksStorage || !Parent.Address || !V.Address)
     return V;
   const auto &DL = U.M.getDataLayout();
@@ -244,6 +245,8 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
       (!U.Records.count(V.Type) || !U.Records.at(V.Type).VirtualDestructor))
     fail(C.At,
          "complete destruction through a base requires virtual destruction");
+  if (C.Text == "abandon")
+    checkAbandon(V.Type, C.At);
   retireStorage(V, C.Text == "destroy");
   return {"void"};
 }

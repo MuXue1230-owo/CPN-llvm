@@ -129,6 +129,9 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   const Token &At = N.At;
   bool Cmp = Op == "==" || Op == "!=" || Op == "<" || Op == "<=" || Op == ">" ||
              Op == ">=";
+  if ((StringRef(A.Type).ends_with("*") || StringRef(D.Type).ends_with("*")) &&
+      (Op == "+" || Op == "-" || (Cmp && Op != "==" && Op != "!=")))
+    return pointerBinary(N, A, D);
   if (!integer(A.Type) || !integer(D.Type)) {
     if ((Op == "==" || Op == "!=") && A.Type != D.Type &&
         StringRef(A.Type).ends_with("*") && StringRef(D.Type).ends_with("*")) {
@@ -169,6 +172,9 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
     T = Opt.DefaultInt;
   if (!Exact && A.Type != "integer" && D.Type != "integer" &&
       A.Type != D.Type && !Shift) {
+    if (Op == "&" || Op == "|" || Op == "^")
+      fail(At,
+           "bitwise operands require identical integer width and signedness");
     if (StringRef(A.Type).ends_with("size") ||
         StringRef(D.Type).ends_with("size"))
       fail(At, "incompatible integer families");
@@ -265,4 +271,67 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   } else
     fail(At, "unsupported integer operator");
   return {T, V};
+}
+
+cpn::Value Frame::pointerBinary(const Node &N, cpn::Value P, cpn::Value Other) {
+  if (N.Text == "+" && integer(P.Type))
+    std::swap(P, Other);
+  if (!StringRef(P.Type).ends_with("*"))
+    fail(N.At, "object pointer required");
+  auto T = element(P.Type);
+  if (StringRef(T).starts_with("const<") && T.back() == '>')
+    T = T.substr(6, T.size() - 7);
+  if (T == "void" || U.Signatures.count(T) || !U.ir(T)->isSized())
+    fail(N.At, "pointer arithmetic requires a complete object element");
+  auto *Long = B.getIntNTy(128);
+  auto address = [&](llvm::Value *V) {
+    return B.CreateZExt(B.CreatePtrToInt(V, B.getInt64Ty()), Long);
+  };
+  auto base = address(P.IR);
+  auto stride = ConstantInt::get(
+      Long, U.M.getDataLayout().getTypeAllocSize(U.ir(T)).getFixedValue());
+  guard(B.CreateIsNull(P.IR));
+  if (StringRef(Other.Type).ends_with("*")) {
+    if (element(P.Type) != element(Other.Type) || N.Text == "+")
+      fail(N.At,
+           "pointer difference or order requires compatible element types");
+    guard(B.CreateIsNull(Other.IR));
+    if (P.Lower && Other.Lower)
+      guard(B.CreateAnd(B.CreateAnd(B.CreateIsNotNull(P.Lower),
+                                    B.CreateIsNotNull(Other.Lower)),
+                        B.CreateICmpNE(P.Lower, Other.Lower)));
+    auto right = address(Other.IR);
+    if (N.Text != "-") {
+      auto Pred = N.Text == "<"    ? CmpInst::ICMP_ULT
+                  : N.Text == "<=" ? CmpInst::ICMP_ULE
+                  : N.Text == ">"  ? CmpInst::ICMP_UGT
+                                   : CmpInst::ICMP_UGE;
+      return {"bool", B.CreateICmp(Pred, base, right)};
+    }
+    auto Diff = B.CreateSub(base, right);
+    guard(B.CreateIsNotNull(B.CreateSRem(Diff, stride)));
+    auto Count = B.CreateSDiv(Diff, stride);
+    auto Result = B.CreateTrunc(Count, B.getInt64Ty());
+    guard(B.CreateICmpNE(B.CreateSExt(Result, Long), Count));
+    return {"isize", Result};
+  }
+  if (!integer(Other.Type) || (N.Text != "+" && N.Text != "-"))
+    fail(N.At, "pointer offset must be an integer");
+  if (Other.Type == "integer")
+    Other = convert(Other, "isize", N.At);
+  auto Offset = B.CreateMul(
+      B.CreateIntCast(Other.IR, Long, signedType(Other.Type)), stride);
+  auto Target =
+      N.Text == "+" ? B.CreateAdd(base, Offset) : B.CreateSub(base, Offset);
+  auto Raw = B.CreateTrunc(Target, B.getInt64Ty());
+  guard(B.CreateICmpNE(B.CreateZExt(Raw, Long), Target));
+  if (P.Lower && P.Upper)
+    guard(B.CreateAnd(B.CreateIsNotNull(P.Lower),
+                      B.CreateOr(B.CreateICmpULT(Target, address(P.Lower)),
+                                 B.CreateICmpUGT(Target, address(P.Upper)))));
+  P.IR = B.CreateIntToPtr(Raw, B.getPtrTy());
+  P.Address = nullptr;
+  P.BoundsCell = nullptr;
+  P.Prvalue = P.Expiring = true;
+  return P;
 }

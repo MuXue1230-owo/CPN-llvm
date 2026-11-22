@@ -4,8 +4,7 @@
 
 using namespace cpn;
 using llvm::StringRef;
-namespace {
-std::vector<std::string> arguments(StringRef S) {
+std::vector<std::string> cpn::splitArguments(StringRef S) {
   std::vector<std::string> Out;
   unsigned Depth = 0;
   size_t Start = 0;
@@ -25,6 +24,7 @@ std::vector<std::string> arguments(StringRef S) {
     Out.push_back(S.drop_front(Start).str());
   return Out;
 }
+namespace {
 std::string appliedName(std::string Name, const Family &Family,
                         const Substitution &S) {
   Name += "<";
@@ -74,7 +74,8 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
       fail(At, "incomplete record element");
     if (!llvm::ArrayType::isValidElementType(Element) || !Element->isSized())
       fail(At, "array requires a complete object element type");
-    return llvm::ArrayType::get(Element, N);
+    // Empty arrays reserve addressable, element-aligned storage on this target.
+    return llvm::ArrayType::get(Element, std::max<uint64_t>(1, N));
   }
   if (Signatures.count(T))
     fail(At, "function type requires a pointer");
@@ -121,7 +122,18 @@ cpn::Value Frame::load(cpn::Value V) {
                ? snapshot(V)
                : B.CreateLoad(U.ir(V.Type), V.Address);
   }
+  if (V.BoundsCell && IR) {
+    V.Lower = B.CreateLoad(B.getPtrTy(), V.BoundsCell);
+    V.Upper = B.CreateLoad(
+        B.getPtrTy(), B.CreateGEP(B.getPtrTy(), V.BoundsCell, B.getInt32(1)));
+  }
   return V;
+}
+void Frame::saveBounds(llvm::Value *Cell, Value V) {
+  auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
+  B.CreateStore(V.Lower ? V.Lower : Null, Cell);
+  B.CreateStore(V.Upper ? V.Upper : Null,
+                B.CreateGEP(B.getPtrTy(), Cell, B.getInt32(1)));
 }
 std::string
 cpn::scopeKey(StringRef Prefix, StringRef Name,
@@ -145,7 +157,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
     if (Open == std::string::npos || Close == std::string::npos)
       fail(At, "invalid function type");
     std::vector<std::string> Sig = {resolve(S.substr(9, Open - 9), At)};
-    for (auto &P : arguments(StringRef(S).slice(Open + 1, Close)))
+    for (auto &P : splitArguments(StringRef(S).slice(Open + 1, Close)))
       Sig.push_back(resolve(P, At));
     U.Signatures[S] = std::move(Sig);
     return S;
@@ -165,9 +177,9 @@ std::string Frame::resolve(std::string S, const Token &At) {
     auto N = constantEval(
         parseExpression(StringRef(S).slice(I + 1, S.size() - 1), Opt));
     auto *C = llvm::dyn_cast_or_null<llvm::ConstantInt>(N.IR);
-    if (!C || C->isZero() || (signedType(N.Type) && C->isNegative()) ||
+    if (!C || (signedType(N.Type) && C->isNegative()) ||
         C->getValue().getActiveBits() > 31)
-      fail(At, "array extent is outside the range of positive extents");
+      fail(At, "array extent is outside the range of nonnegative extents");
     return resolve(S.substr(0, I), At) + "[" +
            std::to_string(C->getZExtValue()) + "]";
   }
@@ -186,9 +198,14 @@ std::string Frame::resolve(std::string S, const Token &At) {
   });
   if (!Key.empty()) {
     if (U.Families.count(Key) && S.find('<') != std::string::npos) {
-      auto &Fam = U.Families.at(Key);
+      auto Fam = U.Families.at(Key);
       std::vector<Node> Explicit;
-      auto Parts = arguments(StringRef(S).slice(S.find('<') + 1, S.size() - 1));
+      auto Parts =
+          splitArguments(StringRef(S).slice(S.find('<') + 1, S.size() - 1));
+      if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack) {
+        auto Fixed = Fam.Decl.Generics.size() - 1;
+        Fam = expand(Fam, Parts.size() > Fixed ? Parts.size() - Fixed : 0, At);
+      }
       for (size_t I = 0; I < Parts.size(); ++I) {
         if (I >= Fam.Decl.Generics.size())
           fail(At, "too many generic arguments");
@@ -202,6 +219,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
       auto E = bind(Fam, Explicit, {}, At);
       auto Full = appliedName(Key, Fam, E);
       if (!U.Records.count(Full)) {
+        selectTypeSpecialization(Key, Fam, E, At);
         EnterDefinition Site(U, Fam.Site);
         llvm::SaveAndRestore Depth(U.SpecializationDepth,
                                    U.SpecializationDepth + 1);
@@ -348,8 +366,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
                            const std::string &Owner) {
   Frame Resolver(*this, nullptr, nullptr, P);
   Resolver.Env = E;
-  validate(N, P, Owner);
   Function D;
+  D.ExitedLifetimes = validate(N, P, Owner);
   D.Decl = N;
   D.MayWhole = N.Settings.count("lifecycle_effect");
   D.DefaultParams = N.Params;
@@ -386,6 +404,20 @@ Function *Context::declare(const Node &N, const std::string &Name,
   }
   if (operatorSpelling(N.Text))
     checkOperator(D, *this);
+  for (auto Attr : {"noescape", "returns_borrowed_from"}) {
+    auto It = N.Settings.find(Attr);
+    if (It == N.Settings.end())
+      continue;
+    std::set<unsigned> &Positions =
+        llvm::StringRef(Attr) == "noescape" ? D.NoEscape : D.BorrowedResult;
+    for (const auto &Param : splitArguments(It->second)) {
+      auto I = llvm::find_if(N.Params,
+                             [&](const Node &P) { return P.Text == Param; });
+      if (I == N.Params.end())
+        fail(N.At, "unknown borrow-contract parameter");
+      Positions.insert(I - N.Params.begin());
+    }
+  }
   auto &Group = Overloads[Name];
   if (N.Foreign) {
     auto Scalar = [&](const std::string &T) {
@@ -416,7 +448,9 @@ Function *Context::declare(const Node &N, const std::string &Name,
     if (Prev->Params == D.Params && Prev->Decl.Const == N.Const &&
         Prev->Decl.Settings["category"] ==
             (N.Settings.count("category") ? N.Settings.at("category") : "")) {
-      if (Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
+      if (Prev->NoEscape != D.NoEscape ||
+          Prev->BorrowedResult != D.BorrowedResult ||
+          Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
           Prev->Decl.Settings.count("lifecycle_effect") !=
               N.Settings.count("lifecycle_effect") ||
@@ -435,6 +469,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
       auto Defaults = Prev->Decl.Params;
       auto Canonical = Prev->Decl.Settings;
       Prev->Decl = N;
+      Prev->ExitedLifetimes = std::move(D.ExitedLifetimes);
       for (const auto *Key :
            {"access", "virtual", "static", "override", "final"})
         if (Canonical.count(Key))
@@ -745,6 +780,19 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       if (!Constraints.emplace(Name, Family{D, P, site()}).second)
         fail(D.At, "duplicate constraint declaration");
       validate(D, P);
+      continue;
+    }
+    if (D.Settings.count("specialize")) {
+      auto Primary = Families.find(Name);
+      if (Primary == Families.end() || Primary->second.Decl.K != D.K ||
+          Primary->second.Decl.Type != D.Type)
+        fail(D.At, "specialization must match its owning type family");
+      if (D.Pattern.size() != Primary->second.Decl.Generics.size())
+        fail(D.At, "specialization pattern has the wrong arity");
+      for (auto &Req : D.Params)
+        checkNormalForm(Req);
+      validate(D, P);
+      Specializations[Name].push_back({D, P, site()});
       continue;
     }
     if (!D.Generics.empty()) {

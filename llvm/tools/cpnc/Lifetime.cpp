@@ -26,12 +26,40 @@ void Frame::endField(const std::string &Slot, const Token &At,
   B.CreateStore(B.getFalse(), It->second);
   Token Name = At;
   Name.Text = Slot;
+  if (!RunDestructor && Explicit)
+    checkAbandon(member(Self, Name).Type, At);
   if (RunDestructor)
     dropChild(Self, member(Self, Name),
               llvm::StringRef(Slot).starts_with("$base:") ||
                   llvm::StringRef(Slot).starts_with("$virtual:"));
   branch(Done);
   B.SetInsertPoint(Done);
+}
+void Frame::checkAbandon(const std::string &Type, const Token &At) {
+  auto Nontrivial = [&](auto &&Visit, const std::string &T) -> bool {
+    if (llvm::StringRef(T).ends_with("]"))
+      return !llvm::StringRef(T).ends_with("[0]") && Visit(Visit, element(T));
+    if (!U.Records.count(T))
+      return false;
+    if (U.Overloads.count(T + "::$drop"))
+      return true;
+    if (auto It = U.Variants.find(T); It != U.Variants.end())
+      for (const auto &Case : It->second)
+        for (const auto &Field : U.Cases.at(Case).Types)
+          if (Visit(Visit, Field))
+            return true;
+    return llvm::any_of(U.Records.at(T).Fields,
+                        [&](const Field &F) { return Visit(Visit, F.Type); });
+  };
+  if (!Nontrivial(Nontrivial, Type))
+    return;
+  std::string Message =
+      "LIFE004: abandon bypasses nontrivial cleanup of " + Type;
+  if (Opt.PromoteAbandon)
+    fail(At, Message);
+  if (!Opt.SilenceAbandon)
+    llvm::errs() << Opt.Input << ":" << At.Line << ":" << At.Column
+                 << ": ANOMALY: " << Message << "\n";
 }
 void Frame::retirement() {
   auto &R = U.Records.at(Self.Type);

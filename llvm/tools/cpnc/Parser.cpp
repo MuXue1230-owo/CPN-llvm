@@ -886,7 +886,18 @@ class Parser {
           Value = unquote(take());
         else if (Key.Text == "init_after")
           Value = qualified().Text;
-        else if (Key.Text == "lifecycle_effect")
+        else if (Key.Text == "noescape" ||
+                 Key.Text == "returns_borrowed_from") {
+          std::set<std::string> Seen;
+          do {
+            auto Arg = name();
+            if (!Seen.insert(Arg.Text).second)
+              fail(Arg, "duplicate parameter in borrow contract");
+            if (!Value.empty())
+              Value += ",";
+            Value += Arg.Text;
+          } while (eat(","));
+        } else if (Key.Text == "lifecycle_effect")
           Value = expect("whole").Text;
         else
           fail(Key, "unsupported attribute");
@@ -901,7 +912,24 @@ class Parser {
   }
   void applyAttributes(Node &D, const Attributes &Attrs) {
     for (const auto &[Key, Value] : Attrs) {
-      if (Key == "lifecycle_effect") {
+      if (Key == "noescape" || Key == "returns_borrowed_from") {
+        if (D.K != Node::Function)
+          fail(D.At, "borrow contract requires a function");
+        if (Key == "returns_borrowed_from" &&
+            !StringRef(D.Type).ends_with("&") &&
+            !StringRef(D.Type).ends_with("*"))
+          fail(D.At, "borrowed return requires a pointer or reference result");
+        llvm::SmallVector<llvm::StringRef> Names;
+        StringRef(Value).split(Names, ',');
+        for (auto Name : Names) {
+          auto It = llvm::find_if(
+              D.Params, [&](const Node &P) { return P.Text == Name; });
+          if (It == D.Params.end() || (!StringRef(It->Type).ends_with("&") &&
+                                       !StringRef(It->Type).ends_with("*")))
+            fail(D.At,
+                 "borrow contract must name a pointer or reference parameter");
+        }
+      } else if (Key == "lifecycle_effect") {
         if (D.K != Node::Function && D.K != Node::Destructor &&
             D.K != Node::Constructor)
           fail(D.At, "lifecycle_effect requires a callable");
@@ -1040,14 +1068,25 @@ class Parser {
       Types.insert(D.Text);
       return D;
     }
+    bool Specialize = eat("specialize");
+    if (Specialize && !is("struct") && !is("class") && !is("union"))
+      fail(peek(), "specialize requires a type family");
     if (is("struct") || is("class") || is("union")) {
       auto Kind = take().Text;
       bool Union = Kind == "union", Class = Kind == "class";
       bool Manual = Class && eat("Manual");
       Node R(Union ? Node::Union : Node::Record, name());
       R.Generics = G;
+      if (Specialize) {
+        while (eat("::"))
+          R.Text += "::" + name().Text;
+        if (!Families.count(R.Text))
+          fail(R.At, "specialization must name an existing type family");
+        R.Pattern = templateArgs(R.Text);
+        R.Settings["specialize"] = "1";
+      }
       Types.insert(R.Text);
-      if (!G.empty())
+      if (!Specialize && !G.empty())
         Families[R.Text] = G;
       if (Requires.K != Node::Empty)
         R.Params.push_back(Requires);
@@ -1348,6 +1387,12 @@ void cpn::configure(Options &O, const Node &N) {
         fail(N.At, "unsupported floating format list");
       continue;
     }
+    if (K == "numeric.fp.relaxations") {
+      if (V != "[]")
+        fail(N.At,
+             "CFG002: requested floating-point relaxations are unavailable");
+      continue;
+    }
     if (K == "numeric.integer.overflow") {
       if (V != "checked" && V != "native" && V != "wrapping" &&
           V != "saturating")
@@ -1367,14 +1412,31 @@ void cpn::configure(Options &O, const Node &N) {
     } else if (K == "numeric.integer.widths") {
       if (V != "[8,16,32,64]")
         fail(N.At, "unsupported integer width catalogue");
-    } else if (K == "diagnostics.promote")
-      O.Promote = V.find("WARNING") != std::string::npos;
-    else if (K == "diagnostics.suppress") {
-      if (V.find("LIFE") != std::string::npos ||
-          V.find("ERROR") != std::string::npos)
-        fail(N.At, "CFG001: mandatory error cannot be suppressed");
-      O.Silence = V.find("WARNING") != std::string::npos;
+    } else if (K == "diagnostics.promote" || K == "diagnostics.suppress") {
+      if (!StringRef(V).starts_with("[") || !StringRef(V).ends_with("]"))
+        fail(N.At, "CFG001: diagnostic selection requires a list");
+      static const std::set<std::string> NonErrors{
+          "WARNING", "ANOMALY", "LIFE003", "LIFE004", "GEN001",
+          "NUM002",  "NUM003",  "STAT002", "EXC001"};
+      llvm::SmallVector<StringRef> Codes;
+      StringRef(V).drop_front().drop_back().split(Codes, ',', -1, false);
+      for (auto Code : Codes)
+        if (!NonErrors.count(Code.str()))
+          fail(N.At, "CFG001: mandatory error or unknown diagnostic cannot be "
+                     "suppressed or promoted");
+      bool W = llvm::is_contained(Codes, "WARNING");
+      bool A = llvm::is_contained(Codes, "ANOMALY") ||
+               llvm::is_contained(Codes, "LIFE004");
+      if (K == "diagnostics.promote") {
+        O.Promote = W;
+        O.PromoteAbandon = A;
+      } else {
+        O.Silence = W;
+        O.SilenceAbandon = A;
+      }
     } else
-      fail(N.At, "CFG002: unsupported configuration key '" + K + "'");
+      fail(N.At, K == "compilation.modules"
+                     ? "CFG002: module compilation unavailable"
+                     : "CFG001: unknown configuration key '" + K + "'");
   }
 }

@@ -143,6 +143,7 @@ void Frame::match(const Node &N) {
   Scopes.emplace_back();
   if (Subject.Prvalue) {
     consume(Subject);
+    Subject.DeclaredAt = {N.At.Line, N.At.Column};
     Scopes.back().Drops.push_back(Subject);
   }
   endExpression();
@@ -193,6 +194,7 @@ void Frame::match(const Node &N) {
                         : SpecialOperation::CopyConstruct,
                    P.At);
           Binding = {C.Types[J], nullptr, Copy};
+          Binding.DeclaredAt = {Arm.At.Line, Arm.At.Column};
           Scopes.back().Drops.push_back(Binding);
         }
         if (!Scopes.back().Names.emplace(P.Text, Binding).second)

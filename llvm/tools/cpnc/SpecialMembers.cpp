@@ -62,6 +62,8 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
                      const Token &At, bool AsBase) {
   auto *Ty = U.ir(Source.Type, At);
   if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty)) {
+    if (llvm::StringRef(Source.Type).ends_with("[0]"))
+      return;
     // Evaluate aggregate designators once. Each element's own declared
     // operation executes before continuing to the next element.
     auto Elem = element(Source.Type);

@@ -27,8 +27,7 @@ bool acceptsPattern(const Node &General, const Node &Specific) {
     return false;
   std::set<std::string> Variables;
   for (auto &P : General.Generics)
-    if (P.K == Node::TypeParam)
-      Variables.insert(P.Text);
+    Variables.insert(P.Text);
   std::map<std::string, std::string> Bound;
   auto Match = [&](auto &&Self, llvm::StringRef A, llvm::StringRef B) -> bool {
     if (Variables.count(A.str())) {
@@ -41,6 +40,25 @@ bool acceptsPattern(const Node &General, const Node &Specific) {
     if (A.consume_front("const<") && A.consume_back(">"))
       return B.consume_front("const<") && B.consume_back(">") &&
              Self(Self, A, B);
+    if (A.ends_with("]") && B.ends_with("]")) {
+      auto I = A.rfind('['), J = B.rfind('[');
+      return I != llvm::StringRef::npos && J != llvm::StringRef::npos &&
+             Self(Self, A.take_front(I), B.take_front(J)) &&
+             Self(Self, A.slice(I + 1, A.size() - 1),
+                  B.slice(J + 1, B.size() - 1));
+    }
+    auto I = A.find('<'), J = B.find('<');
+    if (I != llvm::StringRef::npos && J != llvm::StringRef::npos &&
+        A.take_front(I) == B.take_front(J)) {
+      auto L = splitArguments(A.slice(I + 1, A.size() - 1));
+      auto R = splitArguments(B.slice(J + 1, B.size() - 1));
+      if (L.size() != R.size())
+        return false;
+      for (size_t K = 0; K < L.size(); ++K)
+        if (!Self(Self, L[K], R[K]))
+          return false;
+      return true;
+    }
     return A == B;
   };
   for (size_t I = 0; I < General.Params.size(); ++I)
@@ -95,6 +113,9 @@ std::set<std::string> requirements(const Node &Decl) {
 bool cpn::betterPattern(const Node &A, const Node &B) {
   if (A.Generics.empty() || B.Generics.empty())
     return A.Generics.empty() && !B.Generics.empty() && B.TemplateArgs.empty();
+  return betterTypePattern(A, B);
+}
+bool cpn::betterTypePattern(const Node &A, const Node &B) {
   if (!acceptsPattern(B, A))
     return false;
   if (!acceptsPattern(A, B))
@@ -124,9 +145,14 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
   auto &D = Result.Decl;
   auto P = D.Generics.back();
   std::set<std::string> Names{P.Text};
-  for (auto &Param : D.Params)
-    if (Param.Pack)
-      Names.insert(Param.Text);
+  auto collect = [&](auto &&Visit, const Node &N) -> void {
+    for (auto &Param : N.Params)
+      if (Param.Pack)
+        Names.insert(Param.Text);
+    for (auto &Child : N.Children)
+      Visit(Visit, Child);
+  };
+  collect(collect, D);
   std::function<void(Node &, std::optional<size_t>)> transform;
   std::function<void(std::vector<Node> &, std::optional<size_t>)> sequence =
       [&](std::vector<Node> &Nodes, std::optional<size_t> I) {
@@ -213,7 +239,13 @@ bool Frame::predicate(const Node &N) {
                              : SpecialOperation::MoveConstruct,
                          N.At);
   }
-  auto &C = *constraint(N.Text);
+  auto C = *constraint(N.Text);
+  if (!C.Decl.Generics.empty() && C.Decl.Generics.back().Pack) {
+    auto Fixed = C.Decl.Generics.size() - 1;
+    C = expand(
+        C, N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0,
+        N.At);
+  }
   llvm::SaveAndRestore Depth(U.SpecializationDepth, U.SpecializationDepth + 1);
   if (U.SpecializationDepth > 128)
     throw ResourceExhausted{
@@ -282,4 +314,105 @@ bool Frame::predicate(const Node &N) {
   }
   Fn->eraseFromParent();
   return OK;
+}
+
+// Deduce each specialization's own parameters from the primary's canonical
+// arguments. Only matched heads enter constraint evaluation and ordering.
+void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
+                                     Substitution &Actual, const Token &At) {
+  auto Group = U.Specializations.find(Key);
+  if (Group == U.Specializations.end())
+    return;
+  struct Candidate {
+    const Family *Source;
+    Node Head;
+    Substitution Env;
+  };
+  std::vector<Candidate> Best;
+  for (auto &Spec : Group->second) {
+    if (Spec.Site.Through > LookupLimit)
+      continue;
+    Frame Probe(U, nullptr, nullptr, Spec.Prefix);
+    Probe.Opt = Spec.Site.Configuration;
+    Probe.LookupLimit = Spec.Site.Through;
+    Node Head;
+    Head.Generics = Spec.Decl.Generics;
+    Head.TemplateArgs = Spec.Decl.Params;
+    auto binder = [&](llvm::StringRef Name, Node::Kind K) {
+      return llvm::any_of(Head.Generics, [&](const Node &P) {
+        return P.K == K && P.Text == Name;
+      });
+    };
+    auto matchType = [&](auto &&Match, llvm::StringRef P,
+                         llvm::StringRef T) -> bool {
+      if (binder(P, Node::TypeParam)) {
+        auto [I, New] = Probe.Env.Types.emplace(P.str(), T.str());
+        return New || I->second == T;
+      }
+      for (auto S : {"&&", "&", "*"})
+        if (P.consume_back(S))
+          return T.consume_back(S) && Match(Match, P, T);
+      if (P.consume_front("const<") && P.consume_back(">"))
+        return T.consume_front("const<") && T.consume_back(">") &&
+               Match(Match, P, T);
+      auto A = P.find('<'), B = T.find('<');
+      if (A != llvm::StringRef::npos && B != llvm::StringRef::npos &&
+          P.take_front(A) == T.take_front(B)) {
+        auto L = splitArguments(P.slice(A + 1, P.size() - 1)),
+             R = splitArguments(T.slice(B + 1, T.size() - 1));
+        if (L.size() != R.size())
+          return false;
+        for (size_t I = 0; I < L.size(); ++I)
+          if (!Match(Match, L[I], R[I]))
+            return false;
+        return true;
+      }
+      return Probe.resolve(P.str(), At) == T;
+    };
+    bool Fits = Spec.Decl.Pattern.size() == Primary.Decl.Generics.size();
+    for (size_t I = 0; Fits && I < Spec.Decl.Pattern.size(); ++I) {
+      const auto &Pattern = Spec.Decl.Pattern[I],
+                 &Param = Primary.Decl.Generics[I];
+      Node Slot(Node::Parameter, Pattern.At);
+      if (Param.K == Node::TypeParam) {
+        Fits = Pattern.K == Node::TypeArg &&
+               matchType(matchType, Pattern.Type, Actual.Types.at(Param.Text));
+        Slot.Type = Pattern.Type;
+      } else {
+        auto V = Actual.Values.at(Param.Text);
+        Slot.Type = Pattern.Text;
+        if (Pattern.K == Node::Name && binder(Pattern.Text, Node::ValueParam)) {
+          auto [It, New] = Probe.Env.Values.emplace(Pattern.Text, V);
+          Fits = New || It->second.IR == V.IR;
+        } else {
+          Fits =
+              Pattern.K != Node::TypeArg &&
+              Probe.convert(Probe.constantEval(Pattern), V.Type, At).IR == V.IR;
+        }
+      }
+      Head.Params.push_back(std::move(Slot));
+    }
+    if (!Fits || Probe.Env.Types.size() + Probe.Env.Values.size() !=
+                     Head.Generics.size())
+      continue;
+    if (!Spec.Decl.Params.empty() &&
+        !llvm::cast<llvm::ConstantInt>(
+             Probe.constantEval(Spec.Decl.Params.front()).IR)
+             ->isOne())
+      continue;
+    if (llvm::any_of(Best, [&](const Candidate &Entry) {
+          return betterTypePattern(Entry.Head, Head);
+        }))
+      continue;
+    llvm::erase_if(Best, [&](const Candidate &Entry) {
+      return betterTypePattern(Head, Entry.Head);
+    });
+    Best.push_back({&Spec, std::move(Head), std::move(Probe.Env)});
+  }
+  if (Best.size() > 1)
+    fail(At, "ambiguous type specialization");
+  if (!Best.empty()) {
+    Primary = *Best.front().Source;
+    Actual = std::move(Best.front().Env);
+  }
 }
