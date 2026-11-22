@@ -15,13 +15,15 @@ void Context::tagged(const Node &D, const std::string &Name,
     return;
   R.Env = Env;
   R.Env.Types[D.Text] = Name;
-  Frame F(*this, nullptr, nullptr, P);
+  Frame F(*this, nullptr, nullptr, Name + "::");
   F.Env = R.Env;
   const auto &DL = M.getDataLayout();
   uint64_t Size = 0;
   llvm::Type *AlignType = llvm::Type::getInt8Ty(C);
   auto &Alternatives = Variants[Name];
   for (const auto &Decl : D.Children) {
+    if (nestedType(Decl, Name, F))
+      continue;
     if (Decl.K != Node::Variant) {
       if (Decl.K == Node::Field || Decl.K == Node::Init ||
           Decl.Settings.count("virtual"))
@@ -62,22 +64,15 @@ void Context::tagged(const Node &D, const std::string &Name,
                  llvm::ArrayType::get(llvm::Type::getInt8Ty(C), Size)});
   R.Layer = R.IR;
   R.Complete = true;
-  declareMembers(Name, P);
+  declareMembers(Name, Name + "::");
 }
 
 const Case *Frame::findCase(const std::string &Name, const Token &At) {
-  auto Pos = Name.rfind("::");
-  if (Pos == std::string::npos || Pos == 0)
+  std::string Tail;
+  auto Owner = memberQualifier(Name, At, Tail);
+  if (!Owner)
     return nullptr;
-  auto Owner = Name.substr(0, Pos);
-  auto Base = Owner.substr(0, Owner.find('<'));
-  if (!Env.Types.count(Owner) &&
-      scopeKey(Prefix, Base, [&](const std::string &Key) {
-        return U.Records.count(Key) || U.Aliases.count(Key) ||
-               U.Families.count(Key);
-      }).empty())
-    return nullptr;
-  auto It = U.Cases.find(resolve(Owner, At) + Name.substr(Pos));
+  auto It = U.Cases.find(*Owner + "::" + Tail);
   return It == U.Cases.end() ? nullptr : &It->second;
 }
 llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
@@ -203,6 +198,8 @@ void Frame::match(const Node &N) {
       }
     }
     Live = true;
+    if (Transaction)
+      Transaction->restoreFlow(Arm.Children[0]);
     stmt(Arm.Children[0]);
     Any |= Live;
     if (Live)
@@ -215,6 +212,8 @@ void Frame::match(const Node &N) {
   B.SetInsertPoint(Invalid);
   B.CreateUnreachable();
   B.SetInsertPoint(End);
+  if (Transaction)
+    Transaction->restoreFlow(N, true);
   Live = Any;
   if (Live)
     cleanup(Scopes.size() - 1);

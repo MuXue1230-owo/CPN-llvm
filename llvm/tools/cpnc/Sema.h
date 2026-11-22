@@ -53,6 +53,7 @@ struct DefinitionSite {
   Options Configuration;
   size_t Through;
 };
+class Frame;
 struct Family;
 struct Function {
   Node Decl;
@@ -69,6 +70,7 @@ struct Function {
   JumpCleanups ExitedLifetimes;
   bool MayWhole = false;
   std::set<unsigned> NoEscape, BorrowedResult;
+  std::set<unsigned> RequiresAlive, Initializes;
   std::set<Function *> Calls;
   bool isStatic() const { return Decl.Settings.count("static"); }
 };
@@ -130,6 +132,10 @@ struct Family {
   Node Decl;
   std::string Prefix;
   DefinitionSite Site;
+  Substitution Enclosing{};
+  std::string Owner{};
+  std::optional<Node> Body{};
+  std::optional<DefinitionSite> BodySite{};
 };
 struct Context {
   llvm::Module &M;
@@ -139,7 +145,8 @@ struct Context {
   std::map<std::string, Node::Kind> Declarations;
   std::set<std::string> DefinedEnums;
   std::map<std::string, Record> Records;
-  std::map<std::string, std::pair<std::string, Node>> StaticMembers;
+  std::map<std::string, std::pair<std::string, Node>> StaticMembers,
+      MemberTypes;
   std::map<std::string, Value> Globals, ExternalObjects;
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
@@ -194,6 +201,11 @@ struct Context {
   std::optional<BasePath> lookupPath(const std::string &, const Token &,
                                      bool Method) const;
   void buildTables(const std::string &, const std::vector<Function *> &);
+  void genericFunction(const Node &, const std::string &, const std::string &,
+                       const std::string &Owner = "");
+  void attachGenericBody(Function &, const Family &);
+  void enumeration(Frame &, const Node &, const std::string &);
+  bool nestedType(const Node &, const std::string &, Frame &);
   void tagged(const Node &, const std::string &, const std::string &,
               const Substitution & = {});
   void record(const Node &, const std::string &, const std::string &,
@@ -220,6 +232,7 @@ inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
+bool sameGenericResult(const Node &, const Node &);
 std::set<llvm::StringRef> callableFlags(llvm::StringRef);
 std::vector<std::string> splitArguments(llvm::StringRef);
 bool betterTypePattern(const Node &, const Node &);
@@ -246,6 +259,12 @@ struct Initializer {
   llvm::BasicBlock *Entry, *Exit;
   llvm::AllocaInst *Storage;
 };
+struct PointerCall {
+  llvm::Value *Previous = nullptr, *Rows = nullptr;
+};
+bool carriesPointerBounds(const std::string &);
+void forwardPointerCall(llvm::IRBuilder<> &, llvm::Function *,
+                        llvm::Function *);
 struct CallArguments {
   std::vector<Value> Values;
   std::vector<llvm::BasicBlock *> Entries, Exits;
@@ -289,6 +308,7 @@ public:
   Value ExpressionDestination;
   llvm::Value *resultAddress(const std::string &, const Token &);
   bool Live = true, RequireNoexcept = false, BaseLayer = false;
+  bool TypeQuery = false;
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
@@ -304,6 +324,15 @@ public:
   Value convert(Value, const std::string &, const Token &);
   Value pointerBinary(const Node &, Value, Value);
   llvm::StructType *pointerMetadataType();
+  llvm::Value *IncomingPointerRows = nullptr;
+  void receivePointerCall();
+  llvm::Value *incomingPointerCell(size_t);
+  void publishPointerResult(const Value &);
+  PointerCall openPointerCall(llvm::Value *, const std::string &,
+                              llvm::ArrayRef<std::string>,
+                              llvm::ArrayRef<Value>);
+  void closePointerCall(const PointerCall &);
+  Value pointerCallResult(Value, const PointerCall &, const std::string &);
   void saveBounds(llvm::Value *, Value);
   void offsetRegistration(Value &, llvm::Value *, const std::string &,
                           const Token &);
@@ -350,6 +379,7 @@ public:
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
                   bool AsBase = false);
+  void runConstructionTail(Value, const Node *, bool BoundSlots = false);
   void checkAccess(const Node &, const std::string &Owner, const Token &);
   Function *checkSelected(Function *, const Token &);
   Value member(Value, const Token &);
@@ -389,7 +419,9 @@ public:
   const Family *constraint(const std::string &) const;
   bool predicate(const Node &);
   bool constructible(const std::string &, SpecialOperation, const Token &);
-  bool typeCallee(const std::string &) const;
+  bool typeCallee(const std::string &, const Token &);
+  std::optional<std::string> memberQualifier(const std::string &, const Token &,
+                                             std::string &);
   const Case *findCase(const std::string &, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &,
                 llvm::Value *Dest = nullptr, bool Default = false);
@@ -422,6 +454,11 @@ class Construction {
   std::set<std::string> Reserved;
   llvm::Value *Cursor = nullptr;
   const Node *OrdinaryAssignment = nullptr;
+  Function *MethodContract = nullptr;
+  using Facts = std::map<SourcePosition, std::map<size_t, unsigned>>;
+  Facts Entries, Exits;
+  void finishSlot(Frame &);
+  std::pair<llvm::Function *, llvm::Value *> slotCallback(Frame &, unsigned);
   void findReservations(Frame &);
   void atEachPosition(Frame &, const std::function<void()> &);
   void publish(Frame &);
@@ -431,11 +468,14 @@ class Construction {
 public:
   Construction(Frame &, Function &, Value, const Node *, Frame *);
   void run(Frame &);
+  Construction(Frame &, Function &Method);
+  llvm::Value *admitCall(Frame &, const Function &, const Token &);
+  void checkReturn(const Token &) const;
   void delegate(Frame &, const Node &);
   using Positions = std::set<size_t>;
   Positions positions() const;
   void restore(const Positions &);
-  Positions loopPositions(const Node &) const;
+  void restoreFlow(const Node &, bool Exit = false);
   void checkAccess(Frame &, const Token &) const;
   std::optional<Value> firstWrite(Frame &, const Node &);
   bool needsDelegate(const Frame &) const;

@@ -265,6 +265,43 @@ bool Context::compatibleCallable(const std::string &From,
   }
   return true;
 }
+// Split at the last qualification outside generic arguments. Constant
+// arguments can contain parenthesized shifts and comparisons.
+std::optional<std::string> Frame::memberQualifier(const std::string &S,
+                                                  const Token &At,
+                                                  std::string &Tail) {
+  size_t Member = std::string::npos;
+  unsigned Depth = 0, Parens = 0;
+  for (size_t I = 0; I + 1 < S.size(); ++I) {
+    if (S[I] == '(')
+      ++Parens;
+    else if (S[I] == ')' && Parens)
+      --Parens;
+    else if (!Parens && S[I] == '<')
+      ++Depth;
+    else if (!Parens && S[I] == '>' && Depth)
+      --Depth;
+    else if (!Parens && !Depth && S[I] == ':' && S[I + 1] == ':' && I)
+      Member = I;
+  }
+  if (Member != std::string::npos) {
+    auto Qualifier = S.substr(0, Member);
+    auto Head = StringRef(Qualifier).split('<').first;
+    if (Env.Types.count(Qualifier) ||
+        llvm::any_of(Scopes,
+                     [&](const auto &Scope) {
+                       return Scope.Aliases.count(Qualifier);
+                     }) ||
+        !scopeKey(Prefix, Head, [&](const std::string &K) {
+           return U.Records.count(K) || U.Aliases.count(K) ||
+                  U.Families.count(K);
+         }).empty()) {
+      Tail = S.substr(Member + 2);
+      return resolve(Qualifier, At);
+    }
+  }
+  return {};
+}
 std::string Frame::resolve(std::string S, const Token &At) {
   if (auto Q = U.TypeQueries.find(S); Q != U.TypeQueries.end())
     return unevaluatedType(Q->second.Children.front(), true);
@@ -343,12 +380,29 @@ std::string Frame::resolve(std::string S, const Token &At) {
     auto T = resolve(S.substr(8), At);
     return StringRef(T).ends_with("&") ? T : T + "&&";
   }
+  std::string Tail;
+  if (auto Owner = memberQualifier(S, At, Tail)) {
+    auto Key = *Owner + "::" + Tail.substr(0, Tail.find('<'));
+    auto It = U.MemberTypes.find(Key);
+    if (It == U.MemberTypes.end())
+      fail(At, "unknown nested type '" + Tail + "'");
+    checkAccess(It->second.second, *Owner, At);
+    if (U.Aliases.count(Key))
+      return U.Aliases.at(Key);
+    if (U.Records.count(Key) || U.Enums.count(Key))
+      return Key;
+    // Instantiate a nested family using the fully resolved owning scope.
+    llvm::SaveAndRestore Scope(Prefix, *Owner + "::");
+    return resolve(Tail, At);
+  }
   auto Base = S.substr(0, S.find('<'));
   auto Key = scopeKey(Prefix, Base, [&](const std::string &K) {
     return U.Aliases.count(K) || U.Records.count(K) || U.Enums.count(K) ||
            U.Families.count(K);
   });
   if (!Key.empty()) {
+    if (auto It = U.MemberTypes.find(Key); It != U.MemberTypes.end())
+      checkAccess(It->second.second, It->second.first, At);
     if (U.Families.count(Key) && S.find('<') != std::string::npos) {
       auto Fam = U.Families.at(Key);
       std::vector<Node> Explicit;
@@ -406,7 +460,7 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
   auto Reject = [&](const std::string &Why) {
     throw DeductionFailure{{At, Why}};
   };
-  Substitution S;
+  Substitution S = Fam.Enclosing;
   auto &G = Fam.Decl.Generics;
   if (Explicit.size() > G.size())
     Reject("too many generic arguments");
@@ -559,6 +613,30 @@ Function *Context::declare(const Node &N, const std::string &Name,
     Types.push_back(aggregate(D.Params.back()) ? llvm::PointerType::getUnqual(C)
                                                : ir(D.Params.back(), Arg.At));
   }
+  for (auto Key : {"requires_initialized", "initializes"}) {
+    auto Attr = N.Settings.find(Key);
+    if (Attr == N.Settings.end())
+      continue;
+    if (Owner.empty() || D.isStatic() || N.K != Node::Function)
+      fail(N.At, "construction-state contract requires an instance method");
+    bool Builds = StringRef(Key) == "initializes";
+    if (Builds && N.Const)
+      fail(N.At, "initializes requires a mutable receiver");
+    const auto &Fields = Records.at(Owner).Fields;
+    for (const auto &Slot : splitArguments(Attr->second)) {
+      auto I = llvm::find_if(Fields, [&](const Field &F) {
+        return F.Decl.K == Node::Field && F.Decl.Text == Slot;
+      });
+      if (I == Fields.end())
+        fail(N.At, "unknown construction-state slot '" + Slot + "'");
+      (Builds ? D.Initializes : D.RequiresAlive).insert(I - Fields.begin());
+    }
+  }
+  if (!D.Initializes.empty() && !D.RequiresAlive.empty() &&
+      *D.RequiresAlive.rbegin() >= *D.Initializes.begin())
+    fail(N.At, "LIFE001: incompatible construction-state entry requirements");
+  if (!D.Initializes.empty())
+    Types.push_back(llvm::PointerType::getUnqual(C));
   if (operatorSpelling(N.Text))
     checkOperator(D, *this);
   for (auto Attr : {"noescape", "returns_borrowed_from"}) {
@@ -609,7 +687,11 @@ Function *Context::declare(const Node &N, const std::string &Name,
     if (Prev->Params == D.Params && Prev->Decl.Const == N.Const &&
         Prev->Decl.Settings["category"] ==
             (N.Settings.count("category") ? N.Settings.at("category") : "")) {
-      if (Prev->NoEscape != D.NoEscape ||
+      if ((N.Settings.count("initializes") &&
+           Prev->Initializes != D.Initializes) ||
+          (N.Settings.count("requires_initialized") &&
+           Prev->RequiresAlive != D.RequiresAlive) ||
+          Prev->NoEscape != D.NoEscape ||
           Prev->BorrowedResult != D.BorrowedResult ||
           Prev->Result != D.Result || Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
@@ -683,6 +765,62 @@ Function *Context::declare(const Node &N, const std::string &Name,
     ExternalFunctions[N.Text] = Group.back();
   return Group.back();
 }
+void Context::enumeration(Frame &F, const Node &D, const std::string &Name) {
+  auto Ty = F.resolve(D.Type, D.At);
+  if (!integer(Ty))
+    fail(D.At, "integer enum underlying type required");
+  if (Enums.count(Name) && Enums.at(Name) != Ty)
+    fail(D.At, "incompatible enum declaration");
+  if (!D.Prototype && !DefinedEnums.insert(Name).second)
+    fail(D.At, "duplicate enum definition '" + Name + "'");
+  Enums[Name] = Ty;
+  std::set<uint64_t> Values;
+  for (auto &Case : D.Children) {
+    if (Case.Children.empty())
+      fail(Case.At, "enum case requires an explicit value");
+    auto V = F.convert(F.constantEval(Case.Children[0]), Ty, Case.At);
+    auto K = llvm::cast<llvm::ConstantInt>(V.IR)->getZExtValue();
+    if (!Values.insert(K).second)
+      fail(Case.At, "duplicate enum value");
+    V.Type = Name;
+    if (!Globals.emplace(Name + "::" + Case.Text, V).second)
+      fail(Case.At, "duplicate enumerator '" + Case.Text + "'");
+  }
+}
+
+bool Context::nestedType(const Node &D, const std::string &Owner,
+                         Frame &Check) {
+  if (D.K != Node::Alias && D.K != Node::Enumeration && D.K != Node::Record &&
+      D.K != Node::Union)
+    return false;
+  std::string Prefix = Owner + "::", Key = Prefix + D.Text;
+  auto [It, New] = MemberTypes.try_emplace(Key, Owner, D);
+  if (!New &&
+      (It->second.second.K != D.K ||
+       It->second.second.Settings.at("access") != D.Settings.at("access")))
+    fail(D.At, "conflicting nested type declaration");
+  auto &Parent = Records.at(Owner);
+  llvm::SaveAndRestore Policy(Opt);
+  for (auto &Config : D.Policies)
+    configure(Opt, Config, ConfigScope::Declaration);
+  llvm::SaveAndRestore LocalPolicy(Check.Opt, Opt);
+  if (!D.Generics.empty()) {
+    validate(D, Prefix);
+    checkDomain(D, Prefix);
+    if (!Families.emplace(Key, Family{D, Prefix, site(), Parent.Env}).second)
+      fail(D.At, "duplicate nested generic declaration");
+  } else if (D.K == Node::Alias) {
+    if (!Aliases.emplace(Key, Check.resolve(D.Type, D.At)).second)
+      fail(D.At, "duplicate nested type alias");
+  } else if (D.K == Node::Enumeration)
+    enumeration(Check, D, Key);
+  else if (D.K == Node::Record)
+    record(D, Key, Prefix, Parent.Env);
+  else
+    tagged(D, Key, Prefix, Parent.Env);
+  return true;
+}
+
 void Context::record(const Node &N, const std::string &Name,
                      const std::string &P, const Substitution &E) {
   auto &R = Records[Name];
@@ -699,7 +837,7 @@ void Context::record(const Node &N, const std::string &Name,
   R.Decl = N;
   R.Env = E;
   R.Env.Types[N.Text] = Name;
-  Frame Check(*this, nullptr, nullptr, P);
+  Frame Check(*this, nullptr, nullptr, Name + "::");
   Check.Env = R.Env;
   std::vector<llvm::Type *> Layout;
   std::vector<std::pair<std::string, bool>> Direct;
@@ -741,7 +879,9 @@ void Context::record(const Node &N, const std::string &Name,
                                llvm::Type::getInt8Ty(C), 0))
                          : Records.at(T).Layer);
   }
-  for (auto &D : N.Children)
+  for (auto &D : N.Children) {
+    if (nestedType(D, Name, Check))
+      continue;
     if (D.K == Node::Field) {
       if (D.Settings.count("storage")) {
         if (!StaticMembers
@@ -767,6 +907,7 @@ void Context::record(const Node &N, const std::string &Name,
           {Member, unconst(T), DefinitionSite{Check.Opt, Check.LookupLimit}});
       Layout.push_back(Ty);
     }
+  }
   R.Polymorphic =
       llvm::any_of(R.Bases,
                    [&](auto &Base) { return Records.at(Base).Polymorphic; }) ||
@@ -792,7 +933,7 @@ void Context::record(const Node &N, const std::string &Name,
   }
   R.IR->setBody(Layout);
   R.Complete = true;
-  declareMembers(Name, P);
+  declareMembers(Name, Name + "::");
 }
 void Context::declareMembers(const std::string &Name, const std::string &P) {
   auto &R = Records.at(Name);
@@ -806,6 +947,10 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
         D.Text = D.Text.substr(0, Sep + 1) +
                  Check.resolve(D.Text.substr(Sep + 1), D.At);
     }
+  for (const auto &D : N.Children)
+    if ((D.K == Node::Field || D.K == Node::Function || D.K == Node::Variant) &&
+        MemberTypes.count(Name + "::" + D.Text))
+      fail(D.At, "member name conflicts with nested type");
   buildViews(Name);
   bindOwners(Name, P);
   std::vector<Function *> Members;
@@ -816,6 +961,10 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
       for (const auto &PrefixPolicy : D.Policies)
         configure(Opt, PrefixPolicy, ConfigScope::Declaration);
       llvm::SaveAndRestore MemberPolicy(Check.Opt, Opt);
+      if (!D.Generics.empty()) {
+        genericFunction(D, Name + "::" + D.Text, P, Name);
+        continue;
+      }
       bool Assign = D.Text == "operator=";
       bool Defaulted =
           D.Settings.count("control") && D.Settings.at("control") == "default";
@@ -931,6 +1080,98 @@ void Context::defineQualified(const Node &D, const std::string &P) {
   }
   emit(*F);
 }
+// The declaration retains the overload identity, defaults and substitution
+// order. An out-of-line body uses its own parameter names and definition site.
+void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
+  if (!FamilyDecl.Body)
+    return;
+  auto Body = *FamilyDecl.Body;
+  const auto &Public = F.Decl;
+  if (Body.Generics.back().Pack) {
+    Family Expanded{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite};
+    Body = expand(Expanded, Public.Generics.size() - (Body.Generics.size() - 1),
+                  Body.At)
+               .Decl;
+  }
+  auto Original = F.Env;
+  for (size_t I = 0; I < Body.Generics.size(); ++I) {
+    const auto &P = Public.Generics[I], &Q = Body.Generics[I];
+    if (P.K == Node::TypeParam)
+      F.Env.Types[Q.Text] = Original.Types.at(P.Text);
+    else
+      F.Env.Values[Q.Text] = Original.Values.at(P.Text);
+  }
+  for (size_t I = 0; I < Body.Params.size(); ++I) {
+    Body.Params[I].Children = Public.Params[I].Children;
+    Body.Params[I].Const |= Public.Params[I].Const;
+  }
+  Body.Settings.erase("qualifier");
+  Body.Settings.insert(Public.Settings.begin(), Public.Settings.end());
+  F.Decl = std::move(Body);
+  F.Definition = *FamilyDecl.BodySite;
+  F.ExitedLifetimes = validate(F.Decl, F.Prefix, F.Owner);
+}
+
+void Context::genericFunction(const Node &D, const std::string &Name,
+                              const std::string &P, const std::string &Owner) {
+  bool Qualified = D.Settings.count("qualifier");
+  auto Key = Qualified ? scopeKey(P, D.Settings.at("qualifier") + D.Text,
+                                  [&](const std::string &K) {
+                                    return FunctionFamilies.count(K);
+                                  })
+                       : Name;
+  if (Key.empty())
+    fail(D.At,
+         "qualified generic definition must match an existing declaration");
+  auto &Group = FunctionFamilies[Key];
+  auto It = llvm::find_if(Group, [&](const Family &Other) {
+    return sameGenericSignature(Other.Decl, D);
+  });
+  if (It == Group.end() && Qualified)
+    fail(D.At,
+         "qualified generic definition must match an existing declaration");
+  auto Scope = Qualified ? It->Prefix : P;
+  auto Class = Qualified ? It->Owner : Owner;
+  for (const auto &Requirement : D.TemplateArgs)
+    checkNormalForm(Requirement);
+  validate(D, Scope, Class);
+  checkDomain(D, Scope);
+  if (It == Group.end()) {
+    Family F{D, Scope, site(),
+             Class.empty() ? Substitution{} : Records.at(Class).Env, Class};
+    Families.try_emplace(Key, F);
+    Group.push_back(std::move(F));
+    return;
+  }
+  if (!It->Decl.Prototype || D.Prototype || It->Body)
+    fail(D.At, "duplicate generic signature");
+  if (!sameGenericResult(It->Decl, D) || D.Noexcept != It->Decl.Noexcept ||
+      D.Required != It->Decl.Required || D.Foreign != It->Decl.Foreign ||
+      D.Settings.count("mode") != It->Decl.Settings.count("mode"))
+    fail(D.At, "incompatible generic definition");
+  for (auto &G : D.Generics)
+    if (!G.Children.empty())
+      fail(G.At, "a separate definition cannot redeclare defaults");
+  for (auto &Arg : D.Params)
+    if (!Arg.Children.empty())
+      fail(Arg.At, "a separate definition cannot redeclare defaults");
+  for (auto &[Effect, Value] : D.Settings)
+    if (Effect != "qualifier" && Effect != "category" &&
+        (!It->Decl.Settings.count(Effect) ||
+         It->Decl.Settings.at(Effect) != Value))
+      fail(D.At, "incompatible generic definition contract");
+  It->Body = D;
+  It->BodySite = site();
+  std::vector<Function *> Pending;
+  for (auto &F : Functions)
+    if (F.Origin == &*It)
+      Pending.push_back(&F);
+  for (auto *F : Pending) {
+    attachGenericBody(*F, *It);
+    emit(*F);
+  }
+}
+
 void Context::unit(const std::vector<Node> &Decls, std::string P) {
   for (auto &D : Decls) {
     if (D.K == Node::TypeQuery)
@@ -976,22 +1217,16 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       continue;
     }
     if (!D.Generics.empty()) {
+      if (D.K == Node::Function) {
+        genericFunction(D, Name, P);
+        continue;
+      }
       for (auto &Req : D.TemplateArgs)
         checkNormalForm(Req);
       validate(D, P);
       checkDomain(D, P);
-      auto [It, New] = Families.emplace(Name, Family{D, P, site()});
-      if (!New &&
-          (D.K != Node::Function || It->second.Decl.K != Node::Function))
+      if (!Families.emplace(Name, Family{D, P, site()}).second)
         fail(D.At, "duplicate generic declaration");
-      if (D.K == Node::Function) {
-        auto &Group = FunctionFamilies[Name];
-        if (llvm::any_of(Group, [&](auto &F) {
-              return sameGenericSignature(F.Decl, D);
-            }))
-          fail(D.At, "duplicate generic signature");
-        Group.push_back({D, P, site()});
-      }
       continue;
     }
     if (D.Settings.count("qualifier")) {
@@ -1019,26 +1254,7 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       continue;
     }
     if (D.K == Node::Enumeration) {
-      auto Ty = F.resolve(D.Type, D.At);
-      if (!integer(Ty))
-        fail(D.At, "integer enum underlying type required");
-      if (Enums.count(Name) && Enums.at(Name) != Ty)
-        fail(D.At, "incompatible enum declaration");
-      if (!D.Prototype && !DefinedEnums.insert(Name).second)
-        fail(D.At, "duplicate enum definition '" + Name + "'");
-      Enums[Name] = Ty;
-      std::set<uint64_t> Values;
-      for (auto &Case : D.Children) {
-        if (Case.Children.empty())
-          fail(Case.At, "enum case requires an explicit value");
-        auto V = F.convert(F.constantEval(Case.Children[0]), Ty, Case.At);
-        auto K = llvm::cast<llvm::ConstantInt>(V.IR)->getZExtValue();
-        if (!Values.insert(K).second)
-          fail(Case.At, "duplicate enum value");
-        V.Type = Name;
-        if (!Globals.emplace(Name + "::" + Case.Text, V).second)
-          fail(Case.At, "duplicate enumerator '" + Case.Text + "'");
-      }
+      enumeration(F, D, Name);
       continue;
     }
     if (D.K == Node::Object) {
@@ -1073,7 +1289,14 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
     Transaction.run(F);
   } else if (D.Decl.K == Node::Destructor)
     F.retirement();
-  else
+  else if (!D.Initializes.empty() || !D.RequiresAlive.empty()) {
+    Construction Contract(F, D);
+    F.Transaction = &Contract;
+    F.stmt(Body);
+    if (F.Live)
+      Contract.checkReturn(D.Decl.At);
+    F.Transaction = nullptr;
+  } else
     F.stmt(Body);
   if (F.Live) {
     if (D.Result != "void")

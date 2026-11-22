@@ -62,6 +62,13 @@ Value Frame::lookup(const Token &T) {
   auto Key = scopeKey(Prefix, T.Text,
                       [&](const std::string &K) { return U.Globals.count(K); });
   if (!Key.empty()) {
+    auto Qualified = llvm::StringRef(Key);
+    while (Qualified.contains("::")) {
+      Qualified = Qualified.rsplit("::").first;
+      if (auto It = U.MemberTypes.find(Qualified.str());
+          It != U.MemberTypes.end())
+        checkAccess(It->second.second, It->second.first, T);
+    }
     if (auto I = U.StaticMembers.find(Key); I != U.StaticMembers.end())
       checkAccess(I->second.second, I->second.first, T);
     return U.Globals.at(Key);
@@ -72,7 +79,8 @@ void Frame::checkAccess(const Node &Decl, const std::string &Owner,
                         const Token &At) {
   auto Access = Decl.Settings.find("access");
   if (Access == Decl.Settings.end() || Access->second == "public" ||
-      (F && F->Owner == Owner))
+      (F && F->Owner == Owner) ||
+      llvm::StringRef(Prefix).starts_with(Owner + "::"))
     return;
   if (F && Access->second == "protected") {
     Value SelfView{F->Owner};
@@ -123,6 +131,7 @@ Value Frame::member(Value Obj, const Token &T) {
   fail(T, "unknown member '" + T.Text + "'");
 }
 void Frame::bindParams() {
+  receivePointerCall();
   size_t I = U.aggregate(F->Result) ? 1 : 0;
   if (!F->Owner.empty() && !F->isStatic()) {
     Self = {F->Owner, nullptr, IR->getArg(I++), F->Decl.Const};
@@ -158,6 +167,8 @@ void Frame::bindParams() {
       }
       Scopes[0].Drops.push_back(V);
     }
+    if (carriesPointerBounds(T))
+      V.BoundsCell = incomingPointerCell(J + 1);
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
     if (!P.Text.empty())
@@ -193,6 +204,11 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
         auto *Cell = allocate(Type, Param.At);
         B.CreateStore(load(convert(V, Type, Param.At)).IR, Cell);
         V.Address = Cell;
+        V.IR = nullptr;
+        if (carriesPointerBounds(Type)) {
+          V.BoundsCell = B.CreateAlloca(pointerMetadataType());
+          saveBounds(V.BoundsCell, V);
+        }
       }
       V.Readonly = Param.Const;
       V.Prvalue = V.Expiring = false;
@@ -319,6 +335,7 @@ std::string Frame::unevaluatedType(const Node &N, bool IncludeCategory) {
   if (F)
     QueryOwner = *F;
   Frame Probe(U, F ? &QueryOwner : nullptr, Tmp, Prefix);
+  Probe.TypeQuery = true;
   Probe.Opt = Opt;
   Probe.LookupLimit = LookupLimit;
   Probe.Env = Env;
@@ -444,8 +461,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       auto T = A[0].K == Node::TypeArg ? resolve(A[0].Type, N.At)
                : A[0].K == Node::String
                    ? "u8[" + std::to_string(unquote(A[0].At).size() + 1) + "]"
-               : A[0].K == Node::Name ? lookup(A[0].At).Type
-                                      : "";
+                   : "";
       if (T.empty())
         T = unevaluatedType(A[0], false);
       auto *Ty = U.ir(T, N.At);
@@ -852,7 +868,8 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
        Fam.Decl.Params[Args.size()].Children.empty()))
     throw DeductionFailure{{N.At, "no viable overload"}};
   auto S = bind(Fam, N.TemplateArgs, Args, N.At);
-  std::string ID = Key + "$" + std::to_string(Fam.Site.Through) + "<";
+  std::string ID = Key + "$" + std::to_string(Fam.Decl.At.Line) + "." +
+                   std::to_string(Fam.Decl.At.Column) + "<";
   for (auto &P : Fam.Decl.Generics) {
     if (P.K == Node::TypeParam)
       ID += S.Types.at(P.Text);
@@ -879,8 +896,9 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
       throw DeductionFailure{{N.At, "constraint is not satisfied"}};
   }
   U.chargeInstance(N.At);
-  auto *D = U.declare(Fam.Decl, ID, Fam.Prefix, S);
+  auto *D = U.declare(Fam.Decl, ID, Fam.Prefix, S, Fam.Owner);
   D->Origin = &Source;
+  U.attachGenericBody(*D, Source);
   U.Instances[ID] = D;
   return D;
 }
@@ -1098,7 +1116,12 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if (!ends(Ty, "&") && !U.aggregate(Ty) && Defaults && !Constant) {
       auto *Addr = allocate(Ty, P.At);
       B.CreateStore(V.IR, Addr);
-      V = {Ty, nullptr, Addr};
+      V.Address = Addr;
+      V.IR = nullptr;
+      if (carriesPointerBounds(Ty)) {
+        V.BoundsCell = B.CreateAlloca(pointerMetadataType());
+        saveBounds(V.BoundsCell, V);
+      }
     }
     Cells.push_back(V);
     if (!P.Text.empty())
@@ -1108,6 +1131,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     auto &P = D.DefaultParams[I];
     auto V =
         Defaults && !P.Text.empty() ? Scopes.back().Names.at(P.Text) : Cells[I];
+    if (Defaults && !Constant && carriesPointerBounds(D.Params[I]))
+      Cells[I] = load(V);
     Values.push_back((ends(D.Params[I], "&") || U.aggregate(D.Params[I])) &&
                              !Constant
                          ? V.Address
@@ -1145,8 +1170,18 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     }
     fail(T, "constant invocation completed without a result");
   }
+  if (!D.Owner.empty() && D.Decl.K == Node::Function && !D.isStatic()) {
+    if (Transaction && Receiver.Address == Self.Address) {
+      if (auto *Hooks = Transaction->admitCall(*this, D, T))
+        Values.push_back(Hooks);
+    } else if (!D.Initializes.empty()) {
+      if (!TypeQuery)
+        fail(T, "LIFE001: initializes requires Pending receiver slots");
+      Values.push_back(llvm::PoisonValue::get(B.getPtrTy()));
+    }
+  }
   auto *Before = wholeEpoch();
-  llvm::CallInst *Call = nullptr;
+  llvm::Value *Target = Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR;
   if (D.Slot >= 0) {
     auto &R = U.Records.at(D.Owner);
     auto *Vptr = B.CreateStructGEP(R.IR, Receiver.Address, R.Fields.size());
@@ -1159,12 +1194,12 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                      B.CreateGEP(B.getInt64Ty(), Deltas, B.getInt64(D.Slot)));
     Values[ResultStorage ? 1 : 0] =
         B.CreateGEP(B.getInt8Ty(), Receiver.Address, Delta);
-    Call = B.CreateCall(D.IR->getFunctionType(),
-                        B.CreateLoad(B.getPtrTy(), Slot), Values);
-  } else
-    Call =
-        B.CreateCall(Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR, Values);
+    Target = B.CreateLoad(B.getPtrTy(), Slot);
+  }
+  auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
+  auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values);
   Call->setAttributes(D.IR->getAttributes());
+  closePointerCall(Metadata);
   propagateWhole(Before);
   // A helper can end or replace an extent reached through its receiver or
   // a borrowed argument. Its live state is subsequently checked at runtime.
@@ -1186,7 +1221,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       if (I < Actual.size())
         Returned.Origins.insert(Actual[I].Origins.begin(),
                                 Actual[I].Origins.end());
-  return Returned;
+  return pointerCallResult(Returned, Metadata, D.Result);
 }
 Value Frame::call(const Node &C, const std::vector<Node> &Args,
                   Value Receiver) {
@@ -1260,13 +1295,18 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
        Args.size() == 1) ||
       (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1))
     return storageCall(C, Args);
-  if (C.K == Node::Name && typeCallee(Name)) {
+  if (C.K == Node::Name && typeCallee(Name, C.At)) {
     auto T = resolve(Name, C.At);
     return construct(
         T, Args, C.At,
         (T == ExpressionDestination.Type || ExpressionDestination.Type.empty())
             ? ExpressionDestination.Address
             : nullptr);
+  }
+  if (C.K == Node::Name) {
+    std::string Tail;
+    if (auto Owner = memberQualifier(Name, C.At, Tail))
+      Name = *Owner + "::" + Tail;
   }
   if (Receiver.Type.empty() && !Self.Type.empty() &&
       !methodOwner(Self.Type, C.At).empty())
@@ -1295,7 +1335,7 @@ std::string Frame::initSlot(const Node &N) {
     return "$virtual:" + resolve(N.Text.substr(13), N.At);
   return N.Text;
 }
-bool Frame::typeCallee(const std::string &Name) const {
+bool Frame::typeCallee(const std::string &Name, const Token &At) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
     if (I->Aliases.count(Name))
       return true;
@@ -1304,6 +1344,9 @@ bool Frame::typeCallee(const std::string &Name) const {
   }
   if (builtin(Name) || Env.Types.count(Name))
     return true;
+  std::string Tail;
+  if (auto Owner = memberQualifier(Name, At, Tail))
+    return U.MemberTypes.count(*Owner + "::" + Tail.substr(0, Tail.find('<')));
   auto Base = Name.substr(0, Name.find('<'));
   return !scopeKey(Prefix, Base, [&](const std::string &Key) {
             auto Family = U.Families.find(Key);
@@ -1327,7 +1370,7 @@ std::optional<Value> Frame::directConstruction(const Node &Arg,
   if (const auto *Case = findCase(Key, Arg.At); Case && Case->Owner == T)
     return variant(*Case, {Arg.Children.begin() + 1, Arg.Children.end()},
                    Arg.At, Dest);
-  if (typeCallee(Key) && resolve(Key, Arg.At) == T)
+  if (typeCallee(Key, Arg.At) && resolve(Key, Arg.At) == T)
     return construct(T, {Arg.Children.begin() + 1, Arg.Children.end()}, Arg.At,
                      Dest);
   return {};
@@ -1362,9 +1405,31 @@ Value Frame::runInitializer(Initializer &Init, Value Target, const Token &At) {
   return V;
 }
 
+void Frame::runConstructionTail(Value Object, const Node *Tail,
+                                bool BoundSlots) {
+  if (!Tail)
+    return;
+  llvm::SaveAndRestore Receiver(Self, Object);
+  llvm::SaveAndRestore<Construction *> OuterTransaction(Transaction, nullptr);
+  Scopes.emplace_back();
+  Scopes.back().Names["this"] = {Object.Type + "*", Object.Address};
+  for (const auto &S : Tail->Children) {
+    if (S.K == Node::Init) {
+      if (!BoundSlots)
+        fail(S.At, "unknown initialization target");
+    } else
+      stmt(S);
+  }
+  cleanup(Scopes.size() - 1);
+  Scopes.pop_back();
+}
+
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
+  if (!Args.empty() && Args.back().K == Node::Tail)
+    return construct(T, {Args.begin(), Args.end() - 1}, At, Dest, &Args.back(),
+                     AsBase);
   if (auto Mutable = unconst(T); Mutable != T) {
     auto V = construct(Mutable, Args, At, Dest, Tail, AsBase);
     V.Readonly = true;
@@ -1379,12 +1444,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                            : floatingConvert(eval(Args[0], T), T, At, true);
     if (Dest)
       B.CreateStore(V.IR, Dest);
-    if (Tail) {
-      Scopes.emplace_back();
-      Scopes.back().Names["this"] = {T + "*", Dest};
-      stmt(*Tail);
-      Scopes.pop_back();
-    }
+    runConstructionTail({T, nullptr, Dest}, Tail);
     return V;
   }
   auto *Ty = U.ir(T, At);
@@ -1449,6 +1509,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       B.SetInsertPoint(End);
     }
     Value V{T, nullptr, Ptr};
+    runConstructionTail(V, Tail);
     V.Prvalue = V.Expiring = !Dest;
     if (!Dest)
       Temps.push_back(V);
@@ -1458,8 +1519,11 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (auto Direct = directConstruction(Args[0], T, Dest))
       return *Direct;
   if (U.Variants.count(T)) {
-    if (Args.empty() && U.DefaultCase.count(T))
-      return variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Dest, true);
+    if (Args.empty() && U.DefaultCase.count(T)) {
+      auto V = variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Dest, true);
+      runConstructionTail(V, Tail);
+      return V;
+    }
     if (Args.size() != 1)
       fail(At, "union construction requires a selected case");
     const auto &Arg = Args.front();
@@ -1468,7 +1532,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     auto *Ptr = Dest ? Dest : allocate(T, At);
     auto V = convert(eval(Arg, T, Ptr), T, At);
     materialize(V, At, Ptr);
-    Value Result{T, B.CreateLoad(Ty, Ptr), Ptr};
+    Value Result{T, nullptr, Ptr};
+    runConstructionTail(Result, Tail);
+    Result.IR = B.CreateLoad(Ty, Ptr);
     if (!Dest) {
       Result.Prvalue = Result.Expiring = true;
       Temps.push_back(Result);
@@ -1605,18 +1671,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     }
     if (!Producers.empty())
       fail(At, "unknown initialization target");
-    if (Tail) {
-      auto Old = Self;
-      Self = Obj;
-      Scopes.emplace_back();
-      Scopes.back().Names["this"] = {T + "*", Ptr};
-      for (auto &S : Tail->Children)
-        if (S.K != Node::Init)
-          stmt(S);
-      cleanup(Scopes.size() - 1);
-      Scopes.pop_back();
-      Self = Old;
-    }
+    runConstructionTail(Obj, Tail, true);
     if (!Dest)
       Temps.push_back(Obj);
     if (!AsBase)
@@ -1645,13 +1700,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   }
   if (Dest)
     B.CreateStore(V.IR, Dest);
-  if (Tail) {
-    Scopes.emplace_back();
-    Scopes.back().Names["this"] = {T + "*", Dest};
-    for (auto &S : Tail->Children)
-      stmt(S);
-    Scopes.pop_back();
-  }
+  runConstructionTail({T, nullptr, Dest}, Tail);
   return V;
 }
 void Frame::drop(Value V, bool AsBase) {
@@ -1952,7 +2001,7 @@ void Frame::object(const Node &N, bool Global) {
   Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, Readonly};
   if (Ty == "storage" || ends(Ty, "*"))
     Cell.borrow(V);
-  if (ends(Ty, "*")) {
+  if (carriesPointerBounds(Ty)) {
     llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
     Cell.BoundsCell = Entry.CreateAlloca(pointerMetadataType());
     saveBounds(Cell.BoundsCell, V);
@@ -2063,6 +2112,10 @@ void Frame::stmt(const Node &N) {
       if (IR)
         V = materialize(V, N.At, Result);
     }
+    if (IR)
+      publishPointerResult(V);
+    if (Transaction && Live)
+      Transaction->checkReturn(N.At);
     if (!IR)
       throw Transfer{Node::Return, V};
     endExpression();
@@ -2173,27 +2226,30 @@ void Frame::stmt(const Node &N) {
     Scopes.emplace_back();
     if (For)
       stmt(A[0]);
-    auto Header =
-        Transaction ? Transaction->loopPositions(N) : Construction::Positions{};
-    if (Transaction)
-      Transaction->restore(Header);
     auto *Cond = block("loop.test"), *Body = block("loop.body"),
          *Next = block("loop.next"), *End = block("loop.end");
     branch(Do ? Body : Cond);
     B.SetInsertPoint(Cond);
     auto &Test = A[For || Do ? 1 : 0];
+    if (Transaction && Test.K != Node::Empty)
+      Transaction->restoreFlow(Test);
     auto C = Test.K == Node::Empty ? literal(1, "bool") : boolean(Test);
     B.CreateCondBr(C.IR, Body, End);
     B.SetInsertPoint(Body);
     Loops.push_back({End, Next, Scopes.size(), Label});
+    if (Transaction)
+      Transaction->restoreFlow(A[For ? 3 : Do ? 0 : 1]);
     stmt(A[For ? 3 : Do ? 0 : 1]);
     branch(Next);
     B.SetInsertPoint(Next);
-    if (For && A[2].K != Node::Empty)
+    if (For && A[2].K != Node::Empty) {
+      if (Transaction)
+        Transaction->restoreFlow(A[2]);
       eval(A[2]);
+    }
     branch(Cond);
-    if (Transaction && !Do)
-      Transaction->restore(Header);
+    if (Transaction)
+      Transaction->restoreFlow(N, true);
     auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR);
     Live = Loops.back().BreakUsed || !K || K->isZero();
     Loops.pop_back();
@@ -2259,10 +2315,14 @@ void Frame::stmt(const Node &N) {
           fail(Arm.At, "invalid final fallthrough");
         Body.Children.pop_back();
       }
+      if (Transaction)
+        Transaction->restoreFlow(Body);
       stmt(Body);
       CanExit |= Live && !Fall;
       branch(Fall ? Arms[I] : End);
     }
+    if (Transaction)
+      Transaction->restoreFlow(N, true);
     Live = !Default || CanExit || Loops.back().BreakUsed;
     Loops.pop_back();
     B.SetInsertPoint(End);
@@ -2284,6 +2344,8 @@ void Frame::stmt(const Node &N) {
     branch(Target);
     B.SetInsertPoint(Target);
     Live = true;
+    if (Transaction)
+      Transaction->restoreFlow(N);
     StatementLabel = N.Text;
     stmt(A[0]);
     return;

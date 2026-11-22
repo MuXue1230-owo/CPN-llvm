@@ -26,7 +26,87 @@ struct SourceAnalysis {
   Frame &Em;
   const std::string &Slot;
   const std::vector<std::pair<Function *, const Node *>> &Chain;
+  std::map<const Node *, Function *> &Selected;
+  std::map<SourcePosition, unsigned> Entry, Exit;
+  std::map<std::string, unsigned> Labels, Breaks, Continues;
+  Function *Owner = nullptr;
+  std::vector<const Node *> Declarations;
+  SourceAnalysis(Frame &Em, const std::string &Slot,
+                 const std::vector<std::pair<Function *, const Node *>> &Chain,
+                 std::map<const Node *, Function *> &Selected)
+      : Em(Em), Slot(Slot), Chain(Chain), Selected(Selected) {}
+  Function *method(const Node &Call, const Names &Locals) {
+    const auto &Callee = Call.Children.front();
+    bool Self = Callee.K == Node::Name && !Locals.count(Callee.Text);
+    Self |= Callee.K == Node::Member && Callee.Definition &&
+            Callee.Children[0].K == Node::Name &&
+            Callee.Children[0].Text == "this";
+    if (!Self)
+      return nullptr;
+    auto Key = Owner->Owner + "::" + Callee.Text;
+    auto I = Em.U.Overloads.find(Key);
+    bool Families = Em.U.FunctionFamilies.count(Key);
+    if (I == Em.U.Overloads.end() && !Families)
+      return nullptr;
+    if (auto Cached = Selected.find(&Call); Cached != Selected.end())
+      return Cached->second;
+    auto *D = I == Em.U.Overloads.end() ? nullptr : I->second.front();
+    if (Families ||
+        (I->second.size() > 1 && llvm::any_of(I->second, [&](auto *Other) {
+           return D->Initializes != Other->Initializes ||
+                  D->RequiresAlive != Other->RequiresAlive;
+         }))) {
+      auto *FT = llvm::FunctionType::get(Em.B.getVoidTy(), false);
+      auto *Tmp = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
+                                         "cpn.contract.lookup", Em.U.M);
+      Function Query = *Owner;
+      Frame Probe(Em.U, &Query, Tmp);
+      Probe.TypeQuery = true;
+      Probe.B.SetInsertPoint(Probe.block("entry"));
+      Probe.Self = {Owner->Owner, nullptr,
+                    Probe.allocate(Owner->Owner, Call.At)};
+      Probe.Scopes[0].Names["this"] = {Owner->Owner + "*", Probe.Self.Address};
+      auto local = [&](const Node &N, std::string T) {
+        if (llvm::StringRef(T).ends_with("&"))
+          T.resize(T.find_last_not_of('&') + 1);
+        auto Mutable = unconst(T);
+        Probe.Scopes[0].Names[N.Text] = {Mutable, nullptr,
+                                         Probe.allocate(Mutable, N.At),
+                                         N.Const || T != Mutable};
+      };
+      for (unsigned J = 0; J < Owner->Params.size(); ++J)
+        local(Owner->Decl.Params[J], Owner->Params[J]);
+      for (auto *N : Declarations)
+        if (N->K == Node::Alias)
+          Probe.Scopes[0].Aliases[N->Text] = Probe.resolve(N->Type, N->At);
+        else
+          local(*N, N->Type == "auto"
+                        ? Probe.unevaluatedType(N->Children.front(), false)
+                        : Probe.resolve(N->Type, N->At));
+      std::vector<Value> Actual;
+      for (const auto &Arg : llvm::ArrayRef(Call.Children).drop_front())
+        Actual.push_back(Probe.eval(Arg));
+      D = Probe.select(Callee.Text, Callee, Actual, Probe.Self);
+      Tmp->eraseFromParent();
+    }
+    Selected[&Call] = D;
+    return D;
+  }
   unsigned expression(const Node &N, unsigned S, const Names &Locals) {
+    if (!S)
+      return 0;
+    if (N.K == Node::Unary && (N.Text == "sizeof" || N.Text == "alignof"))
+      return S;
+    if (N.K == Node::Lambda) {
+      for (const auto &Capture : N.TemplateArgs) {
+        if (Capture.Type == "initializer")
+          S = expression(Capture.Children.front(), S, Locals);
+        else if (Capture.Type != "this" && Capture.Text == Slot &&
+                 !Locals.count(Slot))
+          S = observe(S, Read);
+      }
+      return S;
+    }
     if (field(N, Slot, Locals) || (N.K == Node::Name && N.Text == "this"))
       return observe(S, Read);
     if (N.K == Node::Binary && N.Text == "=" &&
@@ -46,28 +126,67 @@ struct SourceAnalysis {
       S = expression(N.Children[0], S, Locals);
       return S | expression(N.Children[1], S, Locals);
     }
-    if (N.K == Node::Call && N.Children.front().K == Node::Name &&
-        Em.U.Overloads.count(Chain.front().first->Owner +
-                             "::" + N.Children.front().Text))
-      S = observe(S, Read);
+    if (N.K == Node::Call)
+      if (auto *D = method(N, Locals)) {
+        for (const auto &Arg : llvm::ArrayRef(N.Children).drop_front())
+          S = expression(Arg, S, Locals);
+        const auto &Fields = Em.U.Records.at(D->Owner).Fields;
+        for (auto I : D->Initializes)
+          if (Fields[I].Decl.Text == Slot)
+            return observe(S, Written);
+        for (auto I : D->RequiresAlive)
+          if (Fields[I].Decl.Text == Slot)
+            return observe(S, Read);
+        return D->Initializes.empty() && D->RequiresAlive.empty()
+                   ? observe(S, Read)
+                   : S;
+      }
     for (auto &C : N.Children)
       S = expression(C, S, Locals);
     return S;
   }
   unsigned activation(size_t Depth, unsigned S) {
     auto *D = Chain[Depth].first;
-    Names Locals;
-    for (auto &P : D->Decl.Params)
-      Locals.insert(P.Text);
-    auto End = statement(D->Decl.Children.front(), S, Locals, Depth);
-    return End.Next | End.Return;
+    llvm::SaveAndRestore Current(Owner, D);
+    llvm::SaveAndRestore Environment(Declarations);
+    Declarations.clear();
+    // Gotos form ordinary CFG edges, including back edges and jumps into
+    // another lexical block admitted by the binding pass. Each destination
+    // can gain at most three first-use histories during fixed-point iteration.
+    llvm::SaveAndRestore SaveLabels(Labels), SaveBreaks(Breaks),
+        SaveContinues(Continues);
+    Labels.clear();
+    Breaks.clear();
+    Continues.clear();
+    for (;;) {
+      auto Previous = Labels;
+      Names Locals;
+      for (auto &P : D->Decl.Params)
+        Locals.insert(P.Text);
+      auto End = statement(D->Decl.Children.front(), S, Locals, Depth);
+      if (Labels == Previous)
+        return End.Next | End.Return;
+    }
   }
-  Flow statement(const Node &N, unsigned S, Names &Locals, size_t Depth) {
-    if (!S)
-      return {};
+  Flow statement(const Node &N, unsigned S, Names &Locals, size_t Depth,
+                 const std::string &Label = "") {
+    if (N.K == Node::Label)
+      S |= Labels[N.Text];
+    SourcePosition P{N.At.Line, N.At.Column};
+    if (N.K == Node::Block || N.K == Node::Label)
+      Entry[P] |= S;
+    auto F = traverse(N, S, Locals, Depth, Label);
+    if (N.K == Node::For || N.K == Node::While || N.K == Node::Do ||
+        N.K == Node::Switch || N.K == Node::Match)
+      Exit[P] |= F.Next;
+    return F;
+  }
+  Flow traverse(const Node &N, unsigned S, Names &Locals, size_t Depth,
+                const std::string &Label) {
     auto &A = N.Children;
     switch (N.K) {
     case Node::Block: {
+      llvm::SaveAndRestore Environment(Declarations);
       Names Scope = Locals;
       Flow Out{S};
       for (auto &C : A) {
@@ -79,7 +198,12 @@ struct SourceAnalysis {
     }
     case Node::Init:
       return {S};
+    case Node::Alias:
+      Declarations.push_back(&N);
+      Locals.insert(N.Text);
+      return {S};
     case Node::Object:
+      Declarations.push_back(&N);
       Locals.insert(N.Text);
       return {expression(N, S, Locals)};
     case Node::Delegate:
@@ -104,44 +228,98 @@ struct SourceAnalysis {
     case Node::Return:
       return {0, expression(N, S, Locals)};
     case Node::Break:
-      return {0, 0, S, 0};
     case Node::Continue:
-      return {0, 0, 0, S};
+      if (!N.Text.empty()) {
+        (N.K == Node::Break ? Breaks : Continues)[N.Text] |= S;
+        return {};
+      }
+      return N.K == Node::Break ? Flow{0, 0, S, 0} : Flow{0, 0, 0, S};
     case Node::For:
     case Node::While:
     case Node::Do: {
+      llvm::SaveAndRestore Environment(Declarations);
       bool For = N.K == Node::For, Do = N.K == Node::Do;
       Names Scope = Locals;
       if (For)
         S = statement(A[0], S, Scope, Depth).Next;
-      unsigned Header = S, Previous = 0;
+      unsigned Header = S, Previous;
       Flow Out;
-      while (Header != Previous) {
+      do {
         Previous = Header;
-        unsigned Entry =
-            Do ? Header : expression(A[For ? 1 : 0], Header, Scope);
-        auto R = statement(A[For ? 3 : Do ? 0 : 1], Entry, Scope, Depth);
-        unsigned Back = R.Next | R.Continue;
-        if (For)
+        auto &Test = A[For || Do ? 1 : 0];
+        if (!Do)
+          Entry[{Test.At.Line, Test.At.Column}] |= Header;
+        unsigned BodyEntry = Do ? Header : expression(Test, Header, Scope);
+        auto R = statement(A[For ? 3 : Do ? 0 : 1], BodyEntry, Scope, Depth);
+        unsigned Back = R.Next | R.Continue | Continues[Label];
+        if (For && A[2].K != Node::Empty) {
+          Entry[{A[2].At.Line, A[2].At.Column}] |= Back;
           Back = expression(A[2], Back, Scope);
-        if (Do)
-          Back = expression(A[1], Back, Scope);
-        Out.Next |= R.Break | (Do ? Back : Entry);
+        }
+        if (Do) {
+          Entry[{Test.At.Line, Test.At.Column}] |= Back;
+          Back = expression(Test, Back, Scope);
+        }
+        if (Test.K != Node::Empty &&
+            !(Test.K == Node::Name && Test.Text == "true"))
+          Out.Next |= Do ? Back : BodyEntry;
+        Out.Next |= R.Break | Breaks[Label];
         Out.Return |= R.Return;
         Header |= Back;
-      }
+      } while (Header != Previous);
       return Out;
     }
     case Node::Configured:
       return statement(A[0], S, Locals, Depth);
     case Node::Label:
-      return statement(A[0], S, Locals, Depth);
-    // An unmodelled transfer or switch may reach a read first. It cannot
-    // provide the all-path evidence needed to reserve a pending slot.
+      return statement(A[0], S, Locals, Depth, N.Text);
     case Node::Goto:
+      Labels[N.Text] |= S;
+      return {};
     case Node::Switch:
-    case Node::Match:
-      return {observe(S, Read)};
+    case Node::Match: {
+      bool Switch = N.K == Node::Switch, Default = false;
+      unsigned Input = expression(A[0], S, Locals), Fall = 0;
+      Flow Out;
+      for (const auto &Arm : llvm::ArrayRef(A).drop_front()) {
+        Names Scope = Locals;
+        llvm::SaveAndRestore Bindings(Declarations);
+        std::vector<Node> Payload;
+        if (!Switch && !Arm.Params.empty()) {
+          const Case *Variant = Em.findCase(Arm.Text, Arm.At);
+          if (!Variant || Variant->Types.size() != Arm.Params.size())
+            fail(Arm.At, "unknown case or incomplete payload pattern");
+          Payload.reserve(Arm.Params.size());
+          for (size_t J = 0; J < Arm.Params.size(); ++J) {
+            auto &P = Arm.Params[J];
+            if (P.Type == "_")
+              continue;
+            auto &V = Payload.emplace_back(Node::Object, P.At);
+            V.Text = P.Text;
+            V.Type = Variant->Types[J];
+            V.Const = P.Type == "ref" && Variant->Decl.Params[J].Const;
+            Scope.insert(P.Text);
+            Declarations.push_back(&V);
+          }
+        }
+        const auto &Body = Arm.Children.back();
+        auto R = statement(Body, Input | Fall, Scope, Depth);
+        bool Falls = Switch && !Body.Children.empty() &&
+                     Body.Children.back().K == Node::Fallthrough;
+        Fall = Falls ? R.Next : 0;
+        Out.Next |= Falls ? 0 : R.Next;
+        if (Switch)
+          Out.Next |= R.Break | Breaks[Label];
+        else
+          Out.Break |= R.Break;
+        Out.Continue |= R.Continue;
+        Out.Return |= R.Return;
+        Default |= Arm.Children.size() == 1;
+      }
+      if (Switch && !Default)
+        Out.Next |= Input;
+      return Out;
+    }
     default:
       return {expression(N, S, Locals)};
     }
@@ -149,14 +327,29 @@ struct SourceAnalysis {
 };
 } // namespace
 void Construction::findReservations(Frame &Em) {
-  for (auto &Field : Em.U.Records.at(Object.Type).Fields) {
-    auto &Name = Field.Decl.Text;
-    if (Field.Decl.K != Node::Field || Field.Decl.HasInitializer ||
-        Explicit.count(Name))
+  std::map<const Node *, Function *> Selected;
+  for (size_t I = 0; I < Order.size(); ++I) {
+    const auto &Field = Em.U.Records.at(Object.Type).Fields[I];
+    auto &Name = Order[I];
+    if (MethodContract ? !MethodContract->Initializes.count(I)
+                       : Field.Decl.K != Node::Field ||
+                             Field.Decl.HasInitializer || Explicit.count(Name))
       continue;
-    SourceAnalysis Analysis{Em, Name, Chain};
-    if (Analysis.activation(0, Unseen) == Written)
-      Reserved.insert(Name);
+    SourceAnalysis Analysis(Em, Name, Chain, Selected);
+    auto End = Analysis.activation(0, Unseen);
+    if (MethodContract && (End & Read))
+      fail(MethodContract->Decl.At,
+           "LIFE002: use before initialization of '" + Name + "'");
+    if (MethodContract && (End & Unseen))
+      fail(MethodContract->Decl.At, "LIFE001: initializes postcondition is not "
+                                    "established on normal return");
+    if (End != Written && !MethodContract)
+      continue;
+    Reserved.insert(Name);
+    for (auto &[P, States] : Analysis.Entry)
+      Entries[P][I] = States;
+    for (auto &[P, States] : Analysis.Exit)
+      Exits[P][I] = States;
   }
 }
 Construction::Positions Construction::positions() const {
@@ -178,10 +371,13 @@ void Construction::checkAccess(Frame &Em, const Token &T) const {
   size_t Slot = I - Order.begin();
   auto States = positions();
   if (*States.rbegin() <= Slot)
-    fail(T, "use before initialization");
-  if (*States.begin() <= Slot)
+    fail(T, "LIFE002: use before initialization");
+  if (*States.begin() <= Slot) {
+    Em.Opt.diagnose(T, Severity::Anomaly, "LIFE003",
+                    "slot lifetime depends on the incoming path");
     Em.guard(Em.B.CreateICmpULE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
                                 Em.B.getInt32(Slot)));
+  }
 }
 void Construction::atEachPosition(Frame &Em,
                                   const std::function<void()> &Action) {
@@ -249,34 +445,33 @@ std::optional<Value> Construction::firstWrite(Frame &Em, const Node &N) {
                    Right.At, Addr);
     else
       Em.construct(Type, {Right}, Right.At, Addr);
-    ++Frontier;
-    publish(Em);
-    advance(Em);
+    finishSlot(Em);
   });
   return Em.load({Type, nullptr, Addr});
 }
 
-Construction::Positions Construction::loopPositions(const Node &Loop) const {
-  auto P = positions();
+void Construction::restoreFlow(const Node &N, bool Exit) {
   if (Reserved.empty())
-    return P;
-  std::function<void(const Node &)> visit = [&](const Node &N) {
-    if (N.K == Node::Binary && N.Text == "=") {
-      auto &Target = N.Children[0];
-      if ((Target.K == Node::Name || Target.K == Node::Member) &&
-          Reserved.count(Target.Text)) {
-        auto I = std::find(Order.begin(), Order.end(), Target.Text);
-        do {
-          ++I;
-        } while (I != Order.end() && !Reserved.count(*I) &&
-                 (!Explicit.count(*I) || !Explicit.at(*I).Owner ||
-                  Activations.count(Explicit.at(*I).Owner)));
-        P.insert(I - Order.begin());
-      }
+    return;
+  const auto &Facts = Exit ? Exits : Entries;
+  auto It = Facts.find({N.At.Line, N.At.Column});
+  if (It == Facts.end())
+    return;
+  Positions Possible;
+  size_t End =
+      MethodContract ? *MethodContract->Initializes.rbegin() + 1 : Order.size();
+  for (size_t I = 0; I <= End; ++I) {
+    if (I < End && !Reserved.count(Order[I])) {
+      auto E = Explicit.find(Order[I]);
+      if (E == Explicit.end() || !E->second.Owner ||
+          Activations.count(E->second.Owner))
+        continue;
     }
-    for (auto &C : N.Children)
-      visit(C);
-  };
-  visit(Loop);
-  return P;
+    if (llvm::all_of(It->second, [&](const auto &Slot) {
+          return Slot.second & (I > Slot.first ? Written : Unseen | Read);
+        }))
+      Possible.insert(I);
+  }
+  if (!Possible.empty())
+    restore(Possible);
 }

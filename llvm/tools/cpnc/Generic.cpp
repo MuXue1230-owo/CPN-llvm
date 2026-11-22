@@ -124,7 +124,16 @@ bool cpn::betterTypePattern(const Node &A, const Node &B) {
   return Left.size() > Right.size() &&
          std::includes(Left.begin(), Left.end(), Right.begin(), Right.end());
 }
+bool cpn::sameGenericResult(const Node &A, const Node &B) {
+  return normalized(A.Type, A) == normalized(B.Type, B);
+}
 bool cpn::sameGenericSignature(const Node &A, const Node &B) {
+  auto category = [](const Node &N) {
+    auto I = N.Settings.find("category");
+    return I == N.Settings.end() ? std::string() : I->second;
+  };
+  if (A.Const != B.Const || category(A) != category(B))
+    return false;
   if (A.Generics.size() != B.Generics.size() ||
       A.Params.size() != B.Params.size())
     return false;

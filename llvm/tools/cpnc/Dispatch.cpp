@@ -45,7 +45,8 @@ std::optional<BasePath> Context::lookupPath(const std::string &Type,
   std::set<BasePath> Matches;
   auto collect = [&](auto &&Visit, const BasePath &Path, const Record &R,
                      const std::string &Name) -> void {
-    if (Method ? Overloads.count(Name + "::" + T.Text) != 0
+    if (Method ? Overloads.count(Name + "::" + T.Text) != 0 ||
+                     FunctionFamilies.count(Name + "::" + T.Text) != 0
                : StaticMembers.count(Name + "::" + T.Text) ||
                      llvm::any_of(R.Fields, [&](auto &F) {
                        return F.Decl.Text == T.Text;
@@ -99,6 +100,12 @@ void Context::buildTables(const std::string &Name,
     bool Override = D->Decl.Settings.count("override");
     if (It != R.Virtuals.end()) {
       if (!Override || (*It)->Decl.Settings.count("final") ||
+          // These indices designate fields declared by the owning layer.
+          // Equal offsets in two different layers denote different slots.
+          (D->Owner != (*It)->Owner &&
+           (!D->Initializes.empty() || !D->RequiresAlive.empty())) ||
+          D->Initializes != (*It)->Initializes ||
+          D->RequiresAlive != (*It)->RequiresAlive ||
           ((*It)->Decl.Noexcept && !D->Decl.Noexcept) ||
           !compatibleCallable(callableType(*D), callableType(**It)))
         fail(D->Decl.At, "invalid override of inherited virtual slot");
@@ -261,6 +268,7 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto Flags = callableFlags(T);
   std::set<unsigned> Origins;
   std::string StorageOrigin;
+  std::vector<Value> Actual;
   unsigned Sources = 0;
   if (Storage) {
     Types.push_back(B.getPtrTy());
@@ -281,15 +289,19 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
       V = materialize(convert(V, Param, At), At);
       Vals.push_back(U.aggregate(Param) ? V.Address : V.IR);
     }
+    Actual.push_back(V);
   }
   auto *FT = llvm::FunctionType::get(
       Storage ? B.getVoidTy() : U.ir(Sig.front()), Types, false);
   auto *Before = wholeEpoch();
+  auto Metadata = openPointerCall(Ptr.IR, Sig.front(),
+                                  llvm::ArrayRef(Sig).drop_front(), Actual);
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  closePointerCall(Metadata);
   propagateWhole(Before);
   auto Result = callResult(Sig[0], Call, At, Storage);
   Result.Origins = std::move(Origins);
   if (Sources == 1)
     Result.Storage = std::move(StorageOrigin);
-  return Result;
+  return pointerCallResult(Result, Metadata, Sig.front());
 }

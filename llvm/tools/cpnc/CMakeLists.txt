@@ -28,6 +28,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Lifetime.cpp
     Whole.cpp
     Parser.cpp
+    PointerCalls.cpp
     Reservations.cpp
     Sema.cpp
     SpecialMembers.cpp

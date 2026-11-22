@@ -4,6 +4,7 @@
 
 #include "llvm/ADT/StringRef.h"
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -33,10 +34,13 @@ struct Options {
   std::string Input, Output, Config, RootID;
   std::string FPProfile = "strict", FPRounding, DefaultReal = "f64",
               LiteralRounding = "nearest_ties_even";
+  std::string InitialRounding, FPSubnormal, InitialSubnormal;
+  std::optional<unsigned> FPTrapMask, FPInitialTraps;
   std::set<unsigned> IntegerWidths{8, 16, 32, 64};
   std::set<std::string> FloatFormats{"f32", "f64"};
   std::string Overflow = "checked", DefaultInt = "i32";
   bool ASCII = false, Check = false, IR = false;
+  bool InterproceduralConstruction = true, InterproceduralEffects = true;
   Severity Minimum = Severity::Warning;
   std::set<std::string> Promote, Suppress;
   void diagnose(const Token &, Severity, llvm::StringRef Code,

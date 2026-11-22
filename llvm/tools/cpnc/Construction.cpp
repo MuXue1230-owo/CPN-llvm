@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/SetVector.h"
 using namespace cpn;
 namespace {
 const Node *site(const Node &N, bool Conditional = false) {
@@ -68,6 +69,7 @@ Construction::Construction(Frame &Em, Function &Root, Value Obj,
     auto *Tmp = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                        "cpn.probe", Em.U.M);
     Frame Probe(Em.U, D, Tmp);
+    Probe.TypeQuery = true;
     Probe.B.SetInsertPoint(Probe.block("entry"));
     Probe.Self = {Obj.Type, nullptr, llvm::PoisonValue::get(Em.B.getPtrTy())};
     for (size_t I = 0; I < D->Params.size(); ++I) {
@@ -134,8 +136,10 @@ void Construction::advance(Frame &Current) {
     if (It != Explicit.end() && !It->second.Owner) {
       Source->Scopes = Old;
       Source->Scopes.push_back(std::move(Earlier));
-    } else {
+    } else if (It != Explicit.end()) {
       Source->Scopes = {std::move(Earlier), Old.front()};
+    } else {
+      Source->Scopes = {std::move(Earlier)};
     }
     llvm::SaveAndRestore Policy(Source->Opt);
     llvm::SaveAndRestore Limit(Source->LookupLimit);
@@ -143,9 +147,10 @@ void Construction::advance(Frame &Current) {
       Source->Opt = F.DefaultSite->Configuration;
       Source->LookupLimit = F.DefaultSite->Through;
     }
+    size_t Mark = Source->Temps.size();
     Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
                       Frontier < R.Bases.size());
-    Source->endExpression();
+    Source->endExpression(Mark);
     Source->Scopes = std::move(Old);
     Source->Self = Previous;
     Source->Transaction = PreviousTxn;
@@ -194,4 +199,191 @@ void Construction::delegate(Frame &Em, const Node &N) {
   Next.branch(Next.InlineReturn);
   Em.B.SetInsertPoint(Next.InlineReturn);
   Em.HasDelegated = true;
+}
+
+// A method's public entry contract supplies the minimum guaranteed live prefix.
+// The containing constructor owns the remaining producers, including those
+// originating in a construction tail or in a suspended delegating activation.
+Construction::Construction(Frame &Em, Function &Method)
+    : Object(Em.Self), TailFrame(nullptr), MethodContract(&Method) {
+  for (const auto &F : Em.U.Records.at(Object.Type).Fields)
+    Order.push_back(F.Decl.Text);
+  Chain.emplace_back(&Method, nullptr);
+  findReservations(Em);
+  if (!Method.Initializes.empty()) {
+    Frontier = *Method.Initializes.begin();
+    Cursor = Em.allocate("i32", Method.Decl.At);
+    publish(Em);
+  } else if (!Method.RequiresAlive.empty())
+    Frontier = *Method.RequiresAlive.rbegin() + 1;
+}
+
+void Construction::checkReturn(const Token &At) const {
+  if (MethodContract && !MethodContract->Initializes.empty() &&
+      *positions().begin() <= *MethodContract->Initializes.rbegin())
+    fail(At, "LIFE001: initializes postcondition is not established on normal "
+             "return");
+}
+
+static llvm::StructType *hookType(Frame &Em) {
+  auto *Ptr = Em.B.getPtrTy();
+  return llvm::StructType::get(Em.U.C, {Ptr, Ptr});
+}
+
+void Construction::finishSlot(Frame &Em) {
+  if (!MethodContract) {
+    ++Frontier;
+    publish(Em);
+    advance(Em);
+    return;
+  }
+  const auto &Outputs = MethodContract->Initializes;
+  auto It = Outputs.find(Frontier);
+  assert(It != Outputs.end());
+  auto *Hooks = MethodContract->IR->getArg(MethodContract->IR->arg_size() - 1);
+  auto *Type = hookType(Em);
+  auto *Entry = Em.B.CreateGEP(
+      Type, Hooks, Em.B.getInt64(std::distance(Outputs.begin(), It)));
+  auto get = [&](unsigned I) {
+    return Em.B.CreateLoad(Em.B.getPtrTy(),
+                           Em.B.CreateStructGEP(Type, Entry, I));
+  };
+  auto *Before = Em.wholeEpoch();
+  Em.B.CreateCall(
+      llvm::FunctionType::get(Em.B.getVoidTy(), {Em.B.getPtrTy()}, false),
+      get(0), {get(1)});
+  Em.propagateWhole(Before);
+  ++Frontier;
+  if (++It != Outputs.end())
+    Frontier = *It;
+  publish(Em);
+}
+
+// Emit the caller's deferred producers in a native continuation. Its captured
+// values refer to the live activation supplying each producer. The helper calls
+// it immediately after constructing that slot, before its next source
+// statement.
+std::pair<llvm::Function *, llvm::Value *>
+Construction::slotCallback(Frame &Em, unsigned Slot) {
+  auto *FT =
+      llvm::FunctionType::get(Em.B.getVoidTy(), {Em.B.getPtrTy()}, false);
+  auto *Hook = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
+                                      "cpn.initializes." + Order[Slot], Em.U.M);
+  std::set<Frame *> Frames{&Em};
+  if (TailFrame)
+    Frames.insert(TailFrame);
+  for (auto &[Owner, F] : Activations)
+    Frames.insert(F);
+  struct SavedFrame {
+    Frame *F;
+    llvm::Function *IR;
+    llvm::IRBuilderBase::InsertPoint IP;
+    llvm::BasicBlock *Return;
+    std::vector<Value> Temps;
+    std::vector<Local> Scopes;
+  };
+  std::vector<SavedFrame> Saved;
+  for (auto *F : Frames) {
+    Saved.push_back({F, F->IR, F->B.saveIP(), F->InlineReturn,
+                     std::move(F->Temps), F->Scopes});
+    F->Temps.clear();
+    for (auto &Scope : F->Scopes)
+      Scope.Drops.clear();
+    F->InlineReturn = nullptr;
+    F->IR = Hook;
+  }
+  Em.B.SetInsertPoint(Em.block("entry"));
+  finishSlot(Em);
+  Em.B.CreateRetVoid();
+  for (auto &S : Saved) {
+    S.F->IR = S.IR;
+    S.F->InlineReturn = S.Return;
+    S.F->Temps = std::move(S.Temps);
+    S.F->Scopes = std::move(S.Scopes);
+    S.F->B.restoreIP(S.IP);
+  }
+
+  llvm::SetVector<llvm::Value *> Inputs;
+  auto captured = [&](llvm::Value *V) {
+    if (auto *I = llvm::dyn_cast<llvm::Instruction>(V))
+      return I->getFunction() != Hook;
+    if (auto *A = llvm::dyn_cast<llvm::Argument>(V))
+      return A->getParent() != Hook;
+    return false;
+  };
+  for (auto &Block : *Hook)
+    for (auto &I : Block)
+      for (auto &U : I.operands())
+        if (captured(U.get()))
+          Inputs.insert(U.get());
+  if (Inputs.empty())
+    return {Hook, llvm::ConstantPointerNull::get(Em.B.getPtrTy())};
+  std::vector<llvm::Type *> Types;
+  for (auto *V : Inputs)
+    Types.push_back(V->getType());
+  auto *Env = llvm::StructType::get(Em.U.C, Types);
+  llvm::IRBuilder<> Allocate(Em.IR->getEntryBlock().begin());
+  auto *Capture = Allocate.CreateAlloca(Env, nullptr, "construction.context");
+  llvm::IRBuilder<> Entry(&*Hook->getEntryBlock().begin());
+  for (size_t I = 0; I < Inputs.size(); ++I) {
+    auto *V = Inputs[I];
+    Em.B.CreateStore(V, Em.B.CreateStructGEP(Env, Capture, I));
+    auto *Local = Entry.CreateLoad(
+        Types[I], Entry.CreateStructGEP(Env, Hook->getArg(0), I));
+    V->replaceUsesWithIf(Local, [&](llvm::Use &U) {
+      auto *User = llvm::dyn_cast<llvm::Instruction>(U.getUser());
+      return User && User->getFunction() == Hook;
+    });
+  }
+  return {Hook, Capture};
+}
+
+llvm::Value *Construction::admitCall(Frame &Em, const Function &D,
+                                     const Token &At) {
+  if (D.Owner != Object.Type) {
+    if (!D.Initializes.empty())
+      fail(At,
+           "LIFE001: initializes requires Pending slots in the receiver layer");
+    return nullptr;
+  }
+  for (auto I : D.RequiresAlive) {
+    auto T = At;
+    T.Text = Order[I];
+    checkAccess(Em, T);
+  }
+  if (D.Initializes.empty()) {
+    if (D.RequiresAlive.empty() && !Order.empty()) {
+      auto Last = At;
+      Last.Text = Order.back();
+      checkAccess(Em, Last);
+    }
+    return nullptr;
+  }
+  auto States = positions();
+  unsigned First = *D.Initializes.begin();
+  if (!States.count(First))
+    fail(At, "LIFE001: initializes requires Pending slots at the "
+             "initialization frontier");
+  if (States.size() != 1) {
+    Em.Opt.diagnose(At, Severity::Anomaly, "LIFE003",
+                    "initializes entry depends on the incoming path");
+    Em.guard(Em.B.CreateICmpNE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
+                               Em.B.getInt32(First)));
+  }
+  restore({First});
+  auto *Type = hookType(Em);
+  llvm::IRBuilder<> Allocate(Em.IR->getEntryBlock().begin());
+  auto *Hooks = Allocate.CreateAlloca(Type, Em.B.getInt32(D.Initializes.size()),
+                                      "construction.hooks");
+  unsigned J = 0;
+  for (auto I : D.Initializes) {
+    if (Frontier != I || !Reserved.count(Order[I]))
+      fail(At, "LIFE001: initializes slot '" + Order[I] +
+                   "' is not reserved at the frontier");
+    auto [Callback, Environment] = slotCallback(Em, I);
+    auto *Entry = Em.B.CreateGEP(Type, Hooks, Em.B.getInt32(J++));
+    Em.B.CreateStore(Callback, Em.B.CreateStructGEP(Type, Entry, 0));
+    Em.B.CreateStore(Environment, Em.B.CreateStructGEP(Type, Entry, 1));
+  }
+  return Hooks;
 }

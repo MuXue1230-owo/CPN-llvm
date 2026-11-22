@@ -1,5 +1,6 @@
 #include "Frontend.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
 
 using namespace cpn;
@@ -109,7 +110,19 @@ int precedence(const std::string &S) {
 class Parser {
   std::vector<Token> Tokens;
   size_t Pos = 0;
-  std::set<std::string> Types, HiddenTypes;
+  std::set<std::string> Types, HiddenTypes, TypeParameters;
+  void publishMemberNames(const Node &Owner, const std::string &Prefix) {
+    for (const auto &C : Owner.Children) {
+      auto Key = Prefix + C.Text;
+      if (C.K == Node::Record || C.K == Node::Alias ||
+          C.K == Node::Enumeration || C.K == Node::Union)
+        Types.insert(Key);
+      if (!C.Generics.empty() || C.K == Node::Constraint)
+        Families[Key] = C.Generics;
+      if (C.K == Node::Record || C.K == Node::Union || C.K == Node::Namespace)
+        publishMemberNames(C, Key + "::");
+    }
+  }
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
   unsigned Depth = 0;
@@ -193,9 +206,10 @@ class Parser {
     auto T = Application && is("operator")          ? operatorName()
              : AllowBuiltin && builtin(peek().Text) ? take()
                                                     : name();
+    std::string Schema = T.Text;
     while (true) {
       if (is("<") &&
-          (Families.count(T.Text) ||
+          (Families.count(Schema) ||
            (Application &&
             (builtinPredicate(T.Text) || T.Text == "construct_at" ||
              T.Text == "destroy_base" || T.Text == "abandon_base" ||
@@ -208,8 +222,8 @@ class Parser {
           Args.push_back(baseSelector());
           closeAngle();
         } else
-          Args = templateArgs(T.Text, &Canonical);
-        if (!Application || is("::") || Types.count(T.Text))
+          Args = templateArgs(Schema, &Canonical);
+        if (!Application || is("::") || Types.count(Schema))
           T.Text += Canonical.empty() ? spelling(Start) : Canonical;
         else {
           Application->ExplicitApplication = true;
@@ -218,12 +232,11 @@ class Parser {
       }
       if (!eat("::"))
         break;
-      if (Application && is("operator"))
-        T.Text += "::" + operatorName().Text;
-      else if (is("forward") && T.Text == "std")
-        T.Text += "::" + take().Text;
-      else
-        T.Text += "::" + name().Text;
+      auto Next = Application && is("operator")      ? operatorName()
+                  : is("forward") && T.Text == "std" ? take()
+                                                     : name();
+      T.Text += "::" + Next.Text;
+      Schema += "::" + Next.Text;
     }
     if (Root)
       T.Text = "::" + T.Text;
@@ -234,6 +247,8 @@ class Parser {
     if (!Root && HiddenTypes.count(S.str()))
       return false;
     return builtin(S) || Types.count(S.split('<').first.str()) ||
+           (!Root && S.contains("::") &&
+            TypeParameters.count(S.split("::").first.str())) ||
            S == "const" || S == "function" || S == "decltype";
   }
   std::string spelling(size_t Start) const {
@@ -356,7 +371,8 @@ class Parser {
       if (!is("::") && !identifier(peek().Text))
         fail(T, "unsupported or unknown type '" + T.Text + "'");
       S = qualified(true).Text;
-      if (!known(S))
+      if (!known(S) && !(StringRef(S).contains("::") &&
+                         known(StringRef(S).split("::").first)))
         fail(T, "unsupported or unknown type '" + S + "'");
     }
     for (;;) {
@@ -491,6 +507,10 @@ class Parser {
           N = std::move(C);
         } else {
           Node M(Node::Member, Id);
+          if (is("<") && Families.count(Id.Text)) {
+            M.TemplateArgs = templateArgs(Id.Text);
+            M.ExplicitApplication = true;
+          }
           M.Children.push_back(std::move(N));
           M.Definition = Ptr;
           N = std::move(M);
@@ -601,6 +621,7 @@ class Parser {
     if (O.Type == "auto" && O.Children.size() != 1)
       fail(T, "auto requires a single initializer");
     if (eat("->")) {
+      O.HasInitializer = true;
       if (O.Type == "auto")
         fail(T, "a construction tail requires a typed declaration");
       auto B = block(true);
@@ -622,7 +643,8 @@ class Parser {
     std::string S = Root ? "::" + peek(Start).Text : peek(Start).Text;
     for (size_t I = Start + 1; peek(I).Text == "::"; I += 2)
       S += "::" + peek(I + 1).Text;
-    if (!known(S))
+    if (!known(S) && !(Declarator && StringRef(S).contains("::") &&
+                       known(StringRef(S).split("::").first)))
       return false;
     auto Saved = Pos;
     bool Match = false;
@@ -888,8 +910,10 @@ class Parser {
       P.Pack = eat("...");
       P.At = name();
       P.Text = P.At.Text;
-      if (P.K == Node::TypeParam)
+      if (P.K == Node::TypeParam) {
         Types.insert(P.Text);
+        TypeParameters.insert(P.Text);
+      }
       if (eat("=")) {
         if (P.K == Node::TypeParam) {
           Node A(Node::TypeArg, peek());
@@ -980,12 +1004,14 @@ class Parser {
         else if (Key.Text == "init_after")
           Value = qualified().Text;
         else if (Key.Text == "noescape" ||
-                 Key.Text == "returns_borrowed_from") {
+                 Key.Text == "returns_borrowed_from" ||
+                 Key.Text == "initializes" ||
+                 Key.Text == "requires_initialized") {
           std::set<std::string> Seen;
           do {
             auto Arg = name();
             if (!Seen.insert(Arg.Text).second)
-              fail(Arg, "duplicate parameter in borrow contract");
+              fail(Arg, "duplicate name in attribute");
             if (!Value.empty())
               Value += ",";
             Value += Arg.Text;
@@ -1008,6 +1034,9 @@ class Parser {
       if (Key == "noescape" || Key == "returns_borrowed_from") {
         if (D.K != Node::Function)
           fail(D.At, "borrow contract requires a function");
+      } else if (Key == "initializes" || Key == "requires_initialized") {
+        if (D.K != Node::Function)
+          fail(D.At, "construction-state contract requires an instance method");
       } else if (Key == "lifecycle_effect") {
         if (D.K != Node::Function && D.K != Node::Destructor &&
             D.K != Node::Constructor)
@@ -1019,6 +1048,7 @@ class Parser {
     }
   }
   Node declaration(bool Foreign = false, bool Member = false) {
+    llvm::SaveAndRestore Binders(TypeParameters);
     Nest Guard(Depth, peek());
     auto T = peek();
     if (eat("configured")) {
@@ -1054,16 +1084,8 @@ class Parser {
         N.Children.push_back(declaration(true));
       else
         fail(T, "expected '{'");
-      if (NS) {
-        for (auto &C : N.Children) {
-          auto Key = N.Text + "::" + C.Text;
-          if (C.K == Node::Record || C.K == Node::Alias ||
-              C.K == Node::Enumeration || C.K == Node::Union)
-            Types.insert(Key);
-          if (!C.Generics.empty())
-            Families[Key] = C.Generics;
-        }
-      }
+      if (NS)
+        publishMemberNames(N, N.Text + "::");
       return N;
     }
     if (eat("constraint")) {
@@ -1272,6 +1294,7 @@ class Parser {
       expect(";");
       Types = std::move(Saved);
       Types.insert(R.Text);
+      publishMemberNames(R, R.Text + "::");
       return R;
     }
     if (eat("enum")) {
@@ -1420,6 +1443,8 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (V != "Debug" && V != "Release" && V != "MinimalDebug" &&
         V != "MinimalRelease")
       fail(N.At, "unknown preset");
+    O.InterproceduralConstruction = O.InterproceduralEffects =
+        StringRef(V).ends_with("Debug");
     O.FPProfile = StringRef(V).ends_with("Debug") ? "strict" : "native";
     O.Overflow = StringRef(V).ends_with("Debug") ? "checked" : "native";
   }
@@ -1448,6 +1473,17 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (K == "compilation.modules" || K == "compilation.separate" ||
         K == "tooling.contract_export")
       continue;
+    if (K == "construction.analysis" || K == "effects.inference") {
+      if (Scope > ConfigScope::Declaration)
+        fail(N.At,
+             "CFG001: " + K + " cannot be overridden below declaration scope");
+      if (V != "local" && V != "interprocedural")
+        fail(N.At, "CFG001: invalid analysis mode for " + K);
+      (K == "construction.analysis" ? O.InterproceduralConstruction
+                                    : O.InterproceduralEffects) =
+          V == "interprocedural";
+      continue;
+    }
     if (K == "source.unicode_version") {
       if (V != "\"17.0.0\"")
         fail(N.At, "CFG002: unavailable Unicode data version");
@@ -1472,20 +1508,54 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       O.DefaultReal = V;
       continue;
     }
-    if (K == "numeric.literal.real_rounding" || K == "numeric.fp.rounding") {
+    if (K == "numeric.fp.trap_mask" || K == "numeric.fp.initial_trap_mask") {
+      if (K == "numeric.fp.trap_mask" && V == "current") {
+        O.FPTrapMask.reset();
+        continue;
+      }
+      StringRef Items(V);
+      if (!Items.consume_front("[") || !Items.consume_back("]"))
+        fail(N.At, "CFG001: floating event mask requires a set");
+      static const std::map<StringRef, unsigned> Events{{"Invalid", 1},
+                                                        {"DivideByZero", 4},
+                                                        {"Overflow", 8},
+                                                        {"Underflow", 16},
+                                                        {"Inexact", 32}};
+      llvm::SmallVector<StringRef> Members;
+      Items.split(Members, ',', -1, false);
+      unsigned Mask = 0;
+      for (auto Member : Members) {
+        auto It = Events.find(Member);
+        if (It == Events.end() || (Mask & It->second))
+          fail(N.At, "CFG001: invalid or duplicate floating event");
+        Mask |= It->second;
+      }
+      (K == "numeric.fp.trap_mask" ? O.FPTrapMask : O.FPInitialTraps) = Mask;
+      continue;
+    }
+    if (K == "numeric.fp.subnormal" || K == "numeric.fp.initial_subnormal") {
+      if (V != "preserve" && !(V == "current" && K == "numeric.fp.subnormal"))
+        fail(N.At, "CFG002: unsupported subnormal control");
+      (K == "numeric.fp.subnormal" ? O.FPSubnormal : O.InitialSubnormal) = V;
+      continue;
+    }
+    if (K == "numeric.literal.real_rounding" || K == "numeric.fp.rounding" ||
+        K == "numeric.fp.initial_rounding") {
       static const std::set<std::string> Modes = {
           "nearest_ties_even", "nearest_ties_away", "toward_zero",
           "toward_positive_infinity", "toward_negative_infinity"};
-      bool Operation = K == "numeric.fp.rounding";
-      if (!Modes.count(V) && !(Operation && V == "current"))
+      bool Literal = K == "numeric.literal.real_rounding";
+      if (!Modes.count(V) && !(K == "numeric.fp.rounding" && V == "current"))
         fail(N.At, "CFG001: invalid rounding mode");
-      if (Operation && V == "nearest_ties_away")
+      if (!Literal && V == "nearest_ties_away")
         fail(N.At, "CFG002: native x86-64 arithmetic does not supply "
                    "nearest_ties_away");
-      if (Operation)
+      if (Literal)
+        O.LiteralRounding = V;
+      else if (K == "numeric.fp.rounding")
         O.FPRounding = V;
       else
-        O.LiteralRounding = V;
+        O.InitialRounding = V;
       continue;
     }
     if (K == "numeric.fp.profile") {
