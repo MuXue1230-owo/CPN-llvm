@@ -14,51 +14,120 @@ void Context::tagged(const Node &D, const std::string &Name,
   if (D.Prototype)
     return;
   Frame F(*this, nullptr, nullptr, P);
-  std::vector<llvm::Type *> Layout{llvm::Type::getInt32Ty(C)};
-  for (auto &Decl : D.Children) {
+  const auto &DL = M.getDataLayout();
+  uint64_t Size = 0;
+  llvm::Type *AlignType = llvm::Type::getInt8Ty(C);
+  auto &Alternatives = Variants[Name];
+  R.Env.Types[D.Text] = Name;
+  for (const auto &Decl : D.Children) {
+    if (Decl.K != Node::Variant) {
+      if (Decl.K == Node::Field || Decl.K == Node::Init ||
+          Decl.Settings.count("virtual"))
+        fail(Decl.At,
+             "union members cannot add common fields or virtual bases");
+      if (Decl.K == Node::Constructor && !Decl.Settings.count("control"))
+        fail(Decl.At, "authored union constructors are unavailable");
+      if (Decl.Text == "operator=" && Decl.Settings.count("control") &&
+          Decl.Settings.at("control") == "default")
+        fail(Decl.At,
+             "union assignment requires an active-case replacement contract");
+      continue;
+    }
     auto Key = Name + "::" + Decl.Text;
     if (Cases.count(Key))
       fail(Decl.At, "duplicate union case");
-    Case V{Name,
-           unsigned(Variants[Name].size()),
-           unsigned(Layout.size()),
-           Decl,
-           {}};
+    Case V{Name, unsigned(Alternatives.size()), nullptr, Decl, {}};
+    std::vector<llvm::Type *> Fields;
     for (auto &A : Decl.Params) {
       auto T = F.resolve(A.Type, A.At);
       auto *Ty = ir(T, A.At);
-      if (!Ty->isSized())
-        fail(A.At, "incomplete union payload");
-      if (Records.count(T))
-        fail(A.At, "nontrivial union payload is unavailable");
+      if (!Ty->isSized() || llvm::StringRef(T).ends_with("&"))
+        fail(A.At, "union payload requires a complete object type");
       V.Types.push_back(T);
-      Layout.push_back(Ty);
+      Fields.push_back(Ty);
     }
+    V.Payload = llvm::StructType::get(C, Fields);
+    Size = std::max(Size, DL.getTypeAllocSize(V.Payload).getFixedValue());
+    if (DL.getABITypeAlign(V.Payload) > DL.getABITypeAlign(AlignType))
+      AlignType = V.Payload;
     if (Decl.Definition && !DefaultCase.emplace(Name, Key).second)
       fail(Decl.At, "duplicate default case");
-    Cases[Key] = V;
-    Variants[Name].push_back(Key);
+    Cases.emplace(Key, std::move(V));
+    Alternatives.push_back(Key);
   }
-  R.IR->setBody(Layout);
+  R.IR->setBody({llvm::Type::getInt32Ty(C), llvm::ArrayType::get(AlignType, 0),
+                 llvm::ArrayType::get(llvm::Type::getInt8Ty(C), Size)});
+  R.Layer = R.IR;
   R.Complete = true;
+  declareMembers(Name, P);
 }
+
+llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
+                                   unsigned Index) {
+  auto *Storage = B.CreateStructGEP(U.ir(C.Owner), Object, 2);
+  return B.CreateStructGEP(C.Payload, Storage, Index);
+}
+
 Value Frame::variant(const Case &C, const std::vector<Node> &Args,
-                     const Token &At) {
-  if (Args.size() != C.Types.size())
+                     const Token &At, llvm::Value *Dest, bool Default) {
+  if (!Default && Args.size() != C.Types.size())
     fail(At, "wrong union payload arity");
-  auto *Ty = U.Records.at(C.Owner).IR;
-  llvm::Value *V = B.CreateInsertValue(llvm::Constant::getNullValue(Ty),
-                                       B.getInt32(C.Tag), 0);
-  for (size_t I = 0; I < Args.size(); ++I) {
-    auto A = convert(eval(Args[I]), C.Types[I], At);
-    V = B.CreateInsertValue(V, A.IR, C.First + I);
+  if (!IR)
+    fail(At, "union construction requires object storage");
+  auto *Ptr = Dest ? Dest : allocate(C.Owner, At);
+  for (size_t I = 0; I < C.Types.size(); ++I) {
+    auto *Slot = payloadAddress(C, Ptr, I);
+    if (Default)
+      construct(C.Types[I], {}, At, Slot);
+    else if (!directConstruction(Args[I], C.Types[I], Slot)) {
+      auto V = convert(eval(Args[I], C.Types[I]), C.Types[I], Args[I].At);
+      materialize(V, Args[I].At, Slot);
+    }
   }
-  return {C.Owner, V};
+  B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(U.ir(C.Owner), Ptr, 0));
+  Value V{C.Owner, B.CreateLoad(U.ir(C.Owner), Ptr), Ptr};
+  if (!Dest) {
+    V.Prvalue = V.Expiring = true;
+    Temps.push_back(V);
+  }
+  return V;
+}
+
+// Only the active alternative has live payload objects.
+void Frame::visitPayload(Value Object,
+                         llvm::function_ref<void(const Case &)> Visit) {
+  auto *Invalid = block("union.invalid"), *End = block("union.end");
+  auto *Tag = B.CreateStructGEP(U.ir(Object.Type), Object.Address, 0);
+  auto *Switch = B.CreateSwitch(B.CreateLoad(B.getInt32Ty(), Tag), Invalid);
+  for (const auto &Key : U.Variants.at(Object.Type)) {
+    const auto &C = U.Cases.at(Key);
+    auto *BB = block("union.case");
+    Switch->addCase(B.getInt32(C.Tag), BB);
+    B.SetInsertPoint(BB);
+    Visit(C);
+    branch(End);
+  }
+  B.SetInsertPoint(Invalid);
+  B.CreateUnreachable();
+  B.SetInsertPoint(End);
+}
+
+void Frame::dropPayload(Value Object) {
+  visitPayload(Object, [&](const Case &C) {
+    for (size_t I = C.Types.size(); I; --I)
+      drop({C.Types[I - 1], nullptr, payloadAddress(C, Object.Address, I - 1)});
+  });
 }
 void Frame::match(const Node &N) {
   auto Subject = eval(N.Children[0]);
   if (!U.Variants.count(Subject.Type))
     fail(N.At, "match requires a union value");
+  Scopes.emplace_back();
+  if (Subject.Prvalue) {
+    consume(Subject);
+    Scopes.back().Drops.push_back(Subject);
+  }
+  endExpression();
   auto *Address = Subject.Address;
   if (!Address) {
     Address = allocate(Subject.Type, N.At);
@@ -73,13 +142,15 @@ void Frame::match(const Node &N) {
     auto *BB = block("match.case");
     B.SetInsertPoint(BB);
     Scopes.emplace_back();
+    if (Wild)
+      fail(Arm.At, "wildcard must be the final match arm");
     if (Arm.Text == "_") {
-      if (Wild)
-        fail(Arm.At, "duplicate wildcard");
       Wild = true;
       SW->setDefaultDest(BB);
     } else {
-      auto It = U.Cases.find(Arm.Text);
+      auto It = U.Cases.find(Prefix + Arm.Text);
+      if (It == U.Cases.end())
+        It = U.Cases.find(Arm.Text);
       if (It == U.Cases.end() || It->second.Owner != Subject.Type)
         fail(Arm.At, "unknown union case");
       auto &C = It->second;
@@ -90,21 +161,30 @@ void Frame::match(const Node &N) {
         auto &P = Arm.Params[J];
         if (P.Type == "_")
           continue;
-        auto *Ptr = B.CreateStructGEP(U.ir(Subject.Type), Address, C.First + J);
+        auto *Ptr = payloadAddress(C, Address, J);
+        Value Binding{C.Types[J], nullptr, Ptr,
+                      Subject.Readonly || C.Decl.Params[J].Const};
         if (P.Type != "ref") {
-          if (P.Type == "move" && !Subject.Expiring)
+          bool Move = P.Type == "move";
+          if (Move && !Subject.Expiring)
             fail(P.At, "move binding requires an expiring subject");
-          auto *Copy = allocate(C.Types[J], P.At);
-          B.CreateStore(B.CreateLoad(U.ir(C.Types[J]), Ptr), Copy);
-          Ptr = Copy;
+          auto *Copy = allocate(Binding.Type, P.At);
+          transfer(Binding, Copy,
+                   Move ? SpecialOperation::MoveConstruct
+                        : SpecialOperation::CopyConstruct,
+                   P.At);
+          Binding = {C.Types[J], nullptr, Copy};
+          Scopes.back().Drops.push_back(Binding);
         }
-        Scopes.back().Names[P.Text] = {C.Types[J], nullptr, Ptr,
-                                       Subject.Readonly};
+        if (!Scopes.back().Names.emplace(P.Text, Binding).second)
+          fail(P.At, "duplicate match binding");
       }
     }
     Live = true;
     stmt(Arm.Children[0]);
     Any |= Live;
+    if (Live)
+      cleanup(Scopes.size() - 1);
     branch(End);
     Scopes.pop_back();
   }
@@ -114,4 +194,7 @@ void Frame::match(const Node &N) {
   B.CreateUnreachable();
   B.SetInsertPoint(End);
   Live = Any;
+  if (Live)
+    cleanup(Scopes.size() - 1);
+  Scopes.pop_back();
 }

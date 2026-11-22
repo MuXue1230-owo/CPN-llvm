@@ -50,6 +50,11 @@ bool Frame::constructible(const std::string &T, SpecialOperation Op,
     if (Member->second.Body)
       return true;
   }
+  if (R.Decl.K == Node::Union)
+    for (const auto &Key : U.Variants.at(T))
+      for (const auto &Field : U.Cases.at(Key).Types)
+        if (!constructible(Field, Op, At))
+          return false;
   return llvm::all_of(
       R.Fields, [&](auto &Field) { return constructible(Field.Type, Op, At); });
 }
@@ -106,6 +111,16 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
       invoke(*Member.Body, {Source}, At, Result);
       return;
     }
+  }
+  if (R.Decl.K == Node::Union) {
+    visitPayload(Source, [&](const Case &C) {
+      for (size_t I = 0; I < C.Types.size(); ++I)
+        transfer({C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
+                  Source.Readonly || C.Decl.Params[I].Const},
+                 payloadAddress(C, Dest, I), Op, At);
+      B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(Ty, Dest, 0));
+    });
+    return;
   }
   if (!assignment(Op) && R.Fields.empty())
     B.CreateStore(llvm::Constant::getNullValue(Ty), Dest);

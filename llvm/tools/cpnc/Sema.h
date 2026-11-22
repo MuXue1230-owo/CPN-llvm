@@ -85,7 +85,8 @@ struct Record {
 };
 struct Case {
   std::string Owner;
-  unsigned Tag, First;
+  unsigned Tag;
+  llvm::StructType *Payload;
   Node Decl;
   std::vector<std::string> Types;
 };
@@ -133,6 +134,7 @@ struct Context {
   llvm::Type *ir(const std::string &T, const Token &At = {});
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
+  void declareMembers(const std::string &, const std::string &);
   void buildViews(const std::string &);
   std::optional<BasePath> lookupPath(const std::string &, const Token &,
                                      bool Method) const;
@@ -251,6 +253,8 @@ public:
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
   std::string initSlot(const Node &);
+  std::optional<Value> directConstruction(const Node &, const std::string &,
+                                          llvm::Value *);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
                   bool AsBase = false);
@@ -280,7 +284,11 @@ public:
   const Family *constraint(const std::string &) const;
   bool predicate(const Node &);
   bool constructible(const std::string &, SpecialOperation, const Token &);
-  Value variant(const Case &, const std::vector<Node> &, const Token &);
+  Value variant(const Case &, const std::vector<Node> &, const Token &,
+                llvm::Value *Dest = nullptr, bool Default = false);
+  void visitPayload(Value, llvm::function_ref<void(const Case &)>);
+  void dropPayload(Value);
+  llvm::Value *payloadAddress(const Case &, llvm::Value *, unsigned);
   void match(const Node &);
   llvm::Value *fieldAddress(Value, unsigned);
   Value baseView(Value, const BasePath &);

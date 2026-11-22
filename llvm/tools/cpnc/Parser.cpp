@@ -489,7 +489,7 @@ class Parser {
       while (!eat("}")) {
         expect("case");
         Node Arm(Node::Arm, qualified());
-        if (eat("(")) {
+        if (Arm.Text != "_" && eat("(")) {
           if (!eat(")")) {
             do {
               Node P(Node::Parameter, take());
@@ -802,10 +802,11 @@ class Parser {
       Types.insert(D.Text);
       return D;
     }
-    if (is("struct") || is("class")) {
-      bool Class = take().Text == "class";
+    if (is("struct") || is("class") || is("union")) {
+      auto Kind = take().Text;
+      bool Union = Kind == "union", Class = Kind == "class";
       bool Manual = Class && eat("Manual");
-      Node R(Node::Record, name());
+      Node R(Union ? Node::Union : Node::Record, name());
       R.Generics = G;
       Types.insert(R.Text);
       if (!G.empty())
@@ -816,9 +817,9 @@ class Parser {
         fail(R.At, "incomplete declaration requires declare");
       if (Manual)
         R.Settings["manual"] = "1";
-      if (eat("final"))
+      if (!Union && eat("final"))
         R.Settings["final"] = "1";
-      if (eat(":")) {
+      if (!Union && eat(":")) {
         do {
           Node B(Node::TypeArg, peek());
           B.Definition = eat("virtual");
@@ -832,6 +833,31 @@ class Parser {
         if (is("public") || is("private") || is("protected")) {
           Access = take().Text;
           expect(":");
+          continue;
+        }
+        if (Union && (is("default") || is("case"))) {
+          bool Default = eat("default");
+          expect("case");
+          Node C(Node::Variant, name());
+          C.Definition = Default;
+          if (eat("(")) {
+            std::set<std::string> Fields;
+            do {
+              bool RO = is("const") && peek(1).Text != "<";
+              if (RO)
+                take();
+              auto Ty = type();
+              Node Field(Node::Parameter, name());
+              Field.Type = Ty;
+              Field.Const = RO;
+              if (!Fields.insert(Field.Text).second)
+                fail(Field.At, "duplicate union payload field");
+              C.Params.push_back(std::move(Field));
+            } while (eat(","));
+            expect(")");
+          }
+          expect(";");
+          R.Children.push_back(std::move(C));
           continue;
         }
         bool SpecialProto =
@@ -895,23 +921,6 @@ class Parser {
       expect(";");
       Types = std::move(Saved);
       Types.insert(R.Text);
-      return R;
-    }
-    if (eat("union")) {
-      Node R(Node::Union, name());
-      Types.insert(R.Text);
-      expect("{");
-      while (!eat("}")) {
-        bool Default = eat("default");
-        expect("case");
-        Node C(Node::Variant, name());
-        C.Definition = Default;
-        if (is("("))
-          C.Params = params();
-        expect(";");
-        R.Children.push_back(std::move(C));
-      }
-      expect(";");
       return R;
     }
     if (eat("enum")) {

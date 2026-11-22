@@ -1412,6 +1412,119 @@ class CompilerTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("assignment used directly", r.stderr)
 
+    def test_union_active_payload_operations(self):
+        self.assertEqual(
+            self.program("""
+            i32 copies; i32 moves; i32 drops;
+            struct Cell {
+                i32 n(3);
+                Cell() = default;
+                Cell(i32 v) { init n(v); }
+                Cell(const<Cell>& other) { init n(other.n); ++copies; }
+                Cell(Cell&& other) { init n(other.n); other.n=0; ++moves; }
+                ~Cell() { ++drops; }
+            };
+            union U {
+                default case Item(Cell c);
+                case Pair(Cell left, Cell right);
+                case None;
+                U(const<U>&) = default;
+                U(U&&) = default;
+                i32 number() const {
+                    match (*this) {
+                        case U::Item(ref c) { return c.n; }
+                        case _ { return 0; }
+                    }
+                }
+            };
+            i32 main(){
+                { U initial; if(initial.number()!=3){return 1;}
+                  U p(U::Pair(Cell(10),Cell(32)));
+                  U copied(p); U moved(std::move(p));
+                  if(copies!=2 || moves!=2 || drops!=0){return 2;}
+                  match (std::move(moved)) {
+                      case U::Pair(value a, move b) {
+                          if(a.n+b.n!=42){return 3;}
+                      }
+                      case _ {return 4;}
+                  }
+                  if(copies!=3 || moves!=3 || drops!=2){return 5;}
+                  match (moved) {
+                      case U::Pair(_, ref b){if(b.n!=0){return 6;}}
+                      case _ {return 7;}
+                  }
+                }
+                if(drops!=9){return 8;}
+                return 42;
+            }"""),
+            42,
+        )
+
+    def test_union_payload_destruction_order_and_early_return(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct T { i32 n; T(i32 x){init n(x);}
+                       T(const<T>& b){init n(b.n);}
+                       ~T(){trace=trace*10+n;} };
+            union U { case Pair(T a, T b); case Empty; };
+            i32 take(){match(U::Pair(T(1),T(2))){
+                case U::Pair(value a, _){return a.n;}
+                case _ { return 0; }
+            }}
+            i32 main(){if(take()!=1 || trace!=121){return 1;}
+                       return 42;}
+            """),
+            42,
+        )
+
+    def test_union_payload_uses_final_address(self):
+        self.assertEqual(
+            self.program("""
+            struct Self { Self* saved; Self(){init saved(this);} };
+            union Inner { case A(Self object); };
+            union Outer { case Wrap(Inner data); };
+            i32 main(){
+                Outer o(Outer::Wrap(Inner::A(Self())));
+                match(o){case Outer::Wrap(ref inner){
+                    match(inner){case Inner::A(ref s){
+                        if(s.saved==&s){return 42;}
+                    }}
+                }}
+                return 0;
+            }"""),
+            42,
+        )
+
+    def test_union_payload_rules(self):
+        for source, message in [
+            ("union U{case A(i32);};", "identifier"),
+            ("union U{case A();};", "type"),
+            ("union U{case A(i32 x, i32 x);};", "duplicate union payload"),
+            ("union U{case A(i32 x(1));};", "expected ')'"),
+            ("union U{case A; i32 x;};", "common fields"),
+            ("union U{case A;}; struct R:U {};", "complete record"),
+            ("union U{case A;}; void f(){U x(U::A()); U y(x);}", "copy constructor"),
+            (
+                "struct T {}; union U{case A;case B(T t); U(const<U>&)=default;};"
+                "void f(){U x(U::A());U y(x);}",
+                "copy constructor",
+            ),
+            (
+                "union U{case A;};void f(U x){match(x){case _{}case U::A{}}}",
+                "final match arm",
+            ),
+            (
+                "union U{case A(const i32 n);};void f(U x){"
+                "match(x){case U::A(ref n){n=1;}}}",
+                "writable lvalue",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_tagged_union_and_match(self):
         self.assertEqual(
             self.program("""

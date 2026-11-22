@@ -498,6 +498,13 @@ void Context::record(const Node &N, const std::string &Name,
   }
   R.IR->setBody(Layout);
   R.Complete = true;
+  declareMembers(Name, P);
+}
+void Context::declareMembers(const std::string &Name, const std::string &P) {
+  auto &R = Records.at(Name);
+  const auto &N = R.Decl;
+  Frame Check(*this, nullptr, nullptr, P);
+  Check.Env = R.Env;
   buildViews(Name);
   std::vector<Function *> Members;
   for (auto &D : N.Children)

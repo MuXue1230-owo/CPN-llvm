@@ -885,6 +885,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   auto Name = C.Text;
   if (U.Cases.count(Prefix + Name))
     return variant(U.Cases.at(Prefix + Name), Args, C.At);
+  if (U.Cases.count(Name))
+    return variant(U.Cases.at(Name), Args, C.At);
   if (Name == "std::forward" && C.TemplateArgs.size() == 1 &&
       Args.size() == 1) {
     auto Ty = resolve(C.TemplateArgs[0].Type, C.At);
@@ -999,6 +1001,30 @@ std::string Frame::initSlot(const Node &N) {
     return "$virtual:" + resolve(N.Text.substr(13), N.At);
   return N.Text;
 }
+std::optional<Value> Frame::directConstruction(const Node &Arg,
+                                               const std::string &T,
+                                               llvm::Value *Dest) {
+  if (!U.Records.count(T) || Arg.K != Node::Call ||
+      Arg.Children.front().K != Node::Name)
+    return {};
+  const auto &Callee = Arg.Children.front();
+  const auto &Key = Callee.Text;
+  for (const auto &Scope : Scopes)
+    if (Scope.Names.count(Key))
+      return {};
+  auto Case = U.Cases.find(Prefix + Key);
+  if (Case == U.Cases.end())
+    Case = U.Cases.find(Key);
+  if (Case != U.Cases.end() && Case->second.Owner == T)
+    return variant(Case->second, {Arg.Children.begin() + 1, Arg.Children.end()},
+                   Arg.At, Dest);
+  if ((Key == T || Env.Types.count(Key) || U.Aliases.count(Prefix + Key) ||
+       U.Records.count(Prefix + Key)) &&
+      resolve(Key, Arg.At) == T)
+    return construct(T, {Arg.Children.begin() + 1, Arg.Children.end()}, Arg.At,
+                     Dest);
+  return {};
+}
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
@@ -1047,17 +1073,26 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     }
     return {T, B.CreateLoad(Ty, Ptr), Ptr};
   }
+  if (Args.size() == 1 && !Tail && !AsBase)
+    if (auto Direct = directConstruction(Args[0], T, Dest))
+      return *Direct;
   if (U.Variants.count(T)) {
-    Value V;
-    if (Args.size() == 1)
-      V = convert(eval(Args[0]), T, At);
-    else if (Args.empty() && U.DefaultCase.count(T))
-      V = variant(U.Cases.at(U.DefaultCase.at(T)), {}, At);
-    else
+    if (Args.empty() && U.DefaultCase.count(T))
+      return variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Dest, true);
+    if (Args.size() != 1)
       fail(At, "union construction requires a selected case");
-    if (Dest)
-      B.CreateStore(V.IR, Dest);
-    return V;
+    const auto &Arg = Args.front();
+    auto V = convert(eval(Arg), T, At);
+    if (!IR)
+      fail(At, "union construction requires object storage");
+    auto *Ptr = Dest ? Dest : allocate(T, At);
+    materialize(V, At, Ptr);
+    Value Result{T, B.CreateLoad(Ty, Ptr), Ptr};
+    if (!Dest) {
+      Result.Prvalue = Result.Expiring = true;
+      Temps.push_back(Result);
+    }
+    return Result;
   }
   if (U.Records.count(T)) {
     if (!IR)
@@ -1246,6 +1281,10 @@ void Frame::drop(Value V, bool AsBase) {
     return;
   }
   auto &R = U.Records.at(V.Type);
+  if (R.Decl.K == Node::Union) {
+    dropPayload(V);
+    return;
+  }
   installTables(V);
   for (size_t I = R.Fields.size(); I > (AsBase ? R.VirtualCount : 0); --I) {
     auto &F = R.Fields[I - 1];

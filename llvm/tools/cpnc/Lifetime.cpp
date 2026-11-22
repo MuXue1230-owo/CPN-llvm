@@ -60,6 +60,8 @@ void Frame::retirement() {
   branch(InlineReturn);
   B.SetInsertPoint(InlineReturn);
   Live = true;
+  if (R.Decl.K == Node::Union)
+    dropPayload(Self);
   auto *Cleanup = block("dtor.cleanup");
   for (auto I = R.Fields.rbegin(); I != R.Fields.rend(); ++I) {
     auto &Slot = I->Decl.Text;
