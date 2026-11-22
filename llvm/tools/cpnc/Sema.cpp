@@ -143,12 +143,13 @@ cpn::Value Frame::load(cpn::Value V) {
     V.BoundsCell = storedPointerCell(V.Address);
   if (!V.IR && V.Address && !StringRef(V.Type).ends_with("]")) {
     if (!IR) {
-      auto *Address = symbolicAddress(V, {});
-      auto *Object = llvm::dyn_cast<llvm::GlobalVariable>(
-          llvm::getUnderlyingObject(Address));
-      if (Object && U.ConstantObjects.count(Object))
-        V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
-                                                  U.M.getDataLayout());
+      if (auto *Address = llvm::dyn_cast<llvm::Constant>(V.Address)) {
+        auto *Object = llvm::dyn_cast<llvm::GlobalVariable>(
+            llvm::getUnderlyingObject(Address));
+        if (Object && U.ConstantObjects.count(Object))
+          V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
+                                                    U.M.getDataLayout());
+      }
       if (!V.IR || llvm::isa<llvm::UndefValue>(V.IR))
         fail({}, "constant expression required");
       return V;
