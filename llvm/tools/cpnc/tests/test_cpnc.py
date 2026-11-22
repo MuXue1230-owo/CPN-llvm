@@ -3,15 +3,12 @@
 import os
 from pathlib import Path
 import subprocess
-import sys
+import shutil
 import tempfile
 import unittest
 
 
-FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
-DRIVER = (
-    [os.environ["CPNC"]] if "CPNC" in os.environ else [sys.executable, str(FRONTEND)]
-)
+DRIVER = [os.environ.get("CPNC") or shutil.which("cpnc") or "cpnc"]
 
 
 class CompilerTests(unittest.TestCase):
@@ -378,6 +375,74 @@ class CompilerTests(unittest.TestCase):
                 result = self.compile(source, "--check")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stderr)
+
+    def test_construction_tail_shares_frontier_and_final_storage(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            i32 mark(i32 n) { trace = trace * 10 + n; return n; }
+            struct S {
+                i32 first; i32 second;
+                S(i32& a) { ++a; mark(1); delegate(a,0); mark(4); }
+                S(i32 a, i32 tag) { init first(a + mark(2)); mark(3); }
+            };
+            struct P { i32 x; i32 y; };
+            P global -> { init y(2); this->x = y; };
+            i32 main() {
+                i32 a(17);
+                S s(a) -> { init second(first + a); mark(5); this->second += 2; };
+                P p(global.x) -> { init y(x + s.second); };
+                if (trace == 12345 && s.first == 20 && s.second == 40) { return p.y; }
+                return 1;
+            }
+        """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+            struct R { i32 a; R() {} };
+            i32 main() {
+                i32 x(5);
+                R one -> { init a(x + 5); };
+                R two -> { init a(x + 27); };
+                return one.a + two.a;
+            }
+        """),
+            42,
+        )
+
+    def test_construction_tail_diagnostics(self):
+        for source, message in [
+            ("void f(){auto x(1) -> {};}", "typed declaration"),
+            (
+                "struct R{i32 a;}; void f(){R r -> {init b(1);};}",
+                "unknown initialization",
+            ),
+            (
+                "struct R{i32 a;R(){init a(1);}}; void f(){R r -> {init a(1);};}",
+                "duplicate initialization",
+            ),
+            (
+                "struct R{i32 a;}; void f(){R r(1) -> {init a(2);};}",
+                "duplicate aggregate",
+            ),
+            (
+                "struct R{i32 a; i32 b;}; void f(){R r -> {init a(this->b);};}",
+                "before initialization",
+            ),
+            (
+                "struct R{i32 a; R(){}}; void f(){R r -> {i32 x(1); init a(x);};}",
+                "unknown name",
+            ),
+            (
+                "struct R{R(){return; delegate(1);} R(i32 x){}};",
+                "bypasses required delegation",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
     def test_unified_delegation_frontier(self):
         self.assertEqual(
@@ -1014,11 +1079,15 @@ class CompilerTests(unittest.TestCase):
         r = self.compile("i32 main(){ return invalid; }", "-o", output)
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(output.read_bytes(), b"kept")
-        r = self.compile(
-            "i32 main(){ return 42; }", "-o", output, "--llc", self.dir / "missing"
+        self.src.write_text("i32 main(){ return 42; }", encoding="utf-8")
+        driver = shutil.which(DRIVER[0]) or DRIVER[0]
+        result = subprocess.run(
+            [driver, "--std=CPN26", "-c", self.src, "-o", output],
+            env={**os.environ, "PATH": ""},
+            capture_output=True,
         )
-        self.assertNotEqual(r.returncode, 0)
-        self.assertEqual(output.read_bytes(), b"kept")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(output.read_bytes()[:4], b"\x7fELF")
 
 
 if __name__ == "__main__":

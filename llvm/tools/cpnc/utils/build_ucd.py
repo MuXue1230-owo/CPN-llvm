@@ -1,4 +1,4 @@
-"""Generate frontend/ucd17.json.gz from the Unicode 17.0.0 UCD text files.
+"""Generate unicode/ucd17.json.gz from the Unicode 17.0.0 UCD text files.
 
 Usage: python3 utils/build_ucd.py <ucd-directory> <output.gz>
 Inputs: https://www.unicode.org/Public/17.0.0/ucd/
