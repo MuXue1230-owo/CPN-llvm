@@ -1,0 +1,1025 @@
+"""Exercise the command line, LLVM verifier, native linker, and generated programs."""
+
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+
+FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
+DRIVER = (
+    [os.environ["CPNC"]] if "CPNC" in os.environ else [sys.executable, str(FRONTEND)]
+)
+
+
+class CompilerTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = Path(temp.name)
+        self.src = self.dir / "example.cpn"
+
+    def compile(self, source, *options, edition=True):
+        self.src.write_text(source, encoding="utf-8")
+        standard = ["--std=CPN26"] if edition else []
+        return subprocess.run(
+            [*DRIVER, *standard, *options, self.src], capture_output=True, text=True
+        )
+
+    def program(self, source, *options, host=None):
+        ir = self.compile(source, "-S", *options)
+        self.assertEqual(ir.returncode, 0, ir.stderr)
+        subprocess.run(
+            ["llvm-as", self.src.with_suffix(".ll"), "-o", os.devnull], check=True
+        )
+        obj = self.compile(source, "-c", *options)
+        self.assertEqual(obj.returncode, 0, obj.stderr)
+        cmd = ["cc", self.src.with_suffix(".o")]
+        if host:
+            cfile = self.dir / "host.c"
+            cfile.write_text(host, encoding="utf-8")
+            cmd.append(cfile)
+        exe = self.dir / "program"
+        subprocess.run([*cmd, "-o", exe], check=True)
+        return subprocess.run([exe], cwd=self.dir).returncode
+
+    def test_generic_loop_and_exact_literals(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T, const i32 N> requires (SameType<T, i32>) T repeat(T x) {
+                T sum;
+                for (i32 i(0); i < N; i++) { sum += x; }
+                return sum;
+            }
+            i32 main() {
+                const u8 a(0b1010_1010);
+                auto b(repeat<i32, (3 + 3)>(7));
+                if (a < 300 && b == 42 && -7 % 3 == -1) { return b; }
+                return 1;
+            }"""),
+            42,
+        )
+
+    def test_binding_calls_and_evaluation_order(self):
+        self.assertEqual(
+            self.program("""
+            i32 state(1);
+            declare i32 mutate();
+            i32 first(i32 a, i32 b) { return a; }
+            i32 go() {
+                state += mutate();
+                return first(state, mutate());
+            }
+            i32 mutate() { state = 10; return 2; }
+            i32 main() {
+                i32 n(go());
+                if (false && mutate() == 2) { return 90; }
+                if (true || (state = 7) == 7) { return n + state; }
+                return 0;
+            }"""),
+            13,
+        )
+
+    def test_native_wrap_and_comparison(self):
+        self.assertEqual(
+            self.program("""
+            configuration { preset = Release; };
+            i32 main() {
+                /* outer /* nested */ ok */
+                i64 low(-9223372036854775808);
+                u64 high(0xffff_ffff_ffff_ffff);
+                i8 s(127);
+                s++;
+                if (low < high && s == -128 && high > -1) { return 42; }
+                return 0;
+            }"""),
+            42,
+        )
+
+    def test_checked_runtime_trap(self):
+        self.assertLess(
+            self.program("""
+            i8 increment(i8 n) { return n + 1; }
+            i32 main() { return increment(127); }
+        """),
+            0,
+        )
+
+    def test_saturation_and_unsigned_subtraction(self):
+        self.assertEqual(
+            self.program("""
+            configuration { numeric.integer.overflow = saturating; };
+            i32 main() {
+                i8 a(120); u8 b(3); u8 c(20);
+                a += 40; b -= c;
+                if (b == 0 && a == 127) { return a; }
+                return 0;
+            }"""),
+            127,
+        )
+
+    def test_control_flow_and_selected_lvalue(self):
+        self.assertEqual(
+            self.program("""
+            i32 main() {
+                i32 x; i32 y; bool flag(true);
+                (flag ? x : y) = 3;
+                do {
+                    switch (x) {
+                        case 3: { y += 7; fallthrough; }
+                        case 4: { y += 5; break; }
+                        default: { return 1; }
+                    }
+                    ++x;
+                } while (x < 5);
+                while (true) { if (x == 5) { break; } continue; }
+                return y;
+            }"""),
+            17,
+        )
+
+    def test_overload_and_deduction(self):
+        self.assertEqual(
+            self.program("""
+            alias Small = i8;
+            i32 select(Small x) { return 10; }
+            i32 select(i32 x) { return 20; }
+            generic<type T> T identity(T x) { return x; }
+            i32 main() { return select(identity(Small(7))) + select(7); }
+        """),
+            30,
+        )
+
+    def test_native_c_link(self):
+        self.assertEqual(
+            self.program(
+                """
+            extern "C" i32 host_value(i32 n);
+            extern "C" i32 compute(i32 x) { return host_value(x) + 2; }
+        """,
+                host="""
+            extern int compute(int);
+            int host_value(int n) { return n * 2; }
+            int main(void) { return compute(20); }
+        """,
+            ),
+            42,
+        )
+
+    def test_manual_storage_generation(self):
+        self.assertEqual(
+            self.program("""
+            i32 main() {
+                i64 old(3);
+                auto storage(storage_of(old));
+                destroy(old);
+                auto replacement(construct_at<i32>(storage, 40));
+                *replacement += 2;
+                return *replacement;
+            }"""),
+            42,
+        )
+
+    def test_record_lifetime(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Item {
+                i32 id;
+                Item(i32 n) { init id(n); }
+                ~Item() { trace = trace * 10 + id; }
+            };
+            void populate() { Item a(2); Item b(4); return; }
+            i32 main() { populate(); return trace; }
+        """),
+            42,
+        )
+
+    def test_generic_record_and_references(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T, const usize N> struct Buffer { T[N] data; };
+            void add(i32& dst, const i32& value) { dst += value; }
+            i32 main() {
+                Buffer<i32, 3> buffer;
+                i32 delta(2);
+                buffer.data[1] = 40;
+                add(buffer.data[1], delta);
+                return buffer.data[1];
+            }"""),
+            42,
+        )
+
+    def test_constant_expressions_in_types(self):
+        self.assertEqual(
+            self.program("""
+            generic<type T, const usize N> struct Buffer { T[N + 1] data; };
+            generic<const bool Select, type T> T pick(T x, T y) {
+                if (Select) { return x; }
+                return y;
+            }
+            consteval usize extent(usize n) { return n + 1; }
+            i32 main() {
+                constexpr usize limit(extent(7));
+                Buffer<Buffer<i32, (limit >> 1)>, limit & 1> outer;
+                outer.data[0].data[4] = 40;
+                i32[limit / 4] tail(1, 2);
+                return pick<limit >= 8>(outer.data[0].data[4], i32(0)) + tail[1];
+            }"""),
+            42,
+        )
+
+    def test_pack_expansion_and_forwarding(self):
+        self.assertEqual(
+            self.program("""
+            i32 sum(){return 0;}
+            i32 sum(i32 a, i32 b, i32 c){return a+b+c;}
+            generic<type... Ts> i32 relay(Ts... values){return sum(values...);}
+            generic<const i32... Ns> i32 constants(){return sum(Ns...);}
+            generic<type... Ts> i32 nested(Ts... x){return relay<Ts...>(x...);}
+            struct R {
+                i32 kind() & {return 1;}
+                i32 kind() && {return 2;}
+            };
+            generic<type T> i32 kind(forward T v){return std::forward<T>(v).kind();}
+            i32 main(){
+                R r;
+                return nested(10,11,12)+constants<1,2,3>()+relay()+kind(r)+kind(R());
+            }
+        """),
+            42,
+        )
+        for source, diagnostic in [
+            ("generic<type... Ts,type U> void f(){}", "last parameter"),
+            ("generic<type... Ts=i32> void f(){}", "cannot have a default"),
+            ("generic<type... Ts> i32 f(Ts... xs){return xs;}", "unexpanded pack"),
+            ("void f(i32... xs){}", "requires a generic pack"),
+            ("void f(forward i32 x){}", "forward requires"),
+        ]:
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(diagnostic, r.stderr)
+
+    def test_compile_time_branch_and_definition_lookup(self):
+        self.assertEqual(
+            self.program("""
+            generic<const bool Field, type T> i32 read(T value) {
+                if constexpr (Field) { return value.n; }
+                else { return value; }
+            }
+            struct Box { i32 n; };
+            i32 main() { return read<true>(Box(40)) + read<false>(i32(2)); }
+            """),
+            42,
+        )
+        for source in [
+            "generic<type T> i32 bad(T x) { return undefined(x); }",
+            "generic<type T> i32 bad(T x) {if constexpr(true){return 0;}else{return missing;}}",
+            "i32 f(){if constexpr(false){return unknown();}return 1;}",
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unknown name", result.stderr)
+
+    def test_array_construction_and_reverse_destruction(self):
+        self.assertEqual(
+            self.program("""
+            i32 order;
+            i32 serial;
+            struct Entry {
+                i32 id;
+                Entry() { init id(++serial); }
+                Entry(i32 n) { init id(n); }
+                ~Entry() { order = order * 10 + id; }
+            };
+            struct Row { Entry[2] entries; };
+            void take(Row) {}
+            i32 main() {
+                take(Row());
+                if (order != 21) {return 1;}
+                order = 0;
+                {
+                    Entry[3] entries(Entry(7));
+                    if (entries[2].id != 4) {return 2;}
+                }
+                if (order != 437) {return 3;}
+                return 42;
+            }"""),
+            42,
+        )
+
+    def test_root_static_initialization_and_shutdown(self):
+        self.assertEqual(
+            self.program(
+                """
+            extern "C" void note(i32 n);
+            extern "C" i32 observed();
+            i32 count;
+            struct Item {
+                i32 n;
+                Item() {init n(++count); note(n);}
+                ~Item(){note(n);}
+            };
+            [[static_id("first-item")]] Item first;
+            [[init_after(first), static_id("second-item")]] static Item second;
+            static i32 total(first.n + second.n);
+            i32 main(){if(total == 3 && observed() == 12){return 42;} return 1;}
+        """,
+                host="""
+            #include <stdlib.h>
+            static int trace;
+            void note(int n){trace = trace*10+n;}
+            int observed(void){return trace;}
+            __attribute__((destructor(101))) static void verify(void){
+                if(trace != 1221) _Exit(2);
+            }
+        """,
+            ),
+            42,
+        )
+
+        self.assertLess(
+            self.program("""
+            declare i32 early();
+            i32 first(early());
+            i32 make(){return 7;}
+            i32 later(make());
+            i32 early(){return later;}
+            i32 main(){return 0;}
+        """),
+            0,
+        )
+
+    def test_incomplete_type_identity(self):
+        self.assertEqual(
+            self.program("""
+            declare struct Cell;
+            alias Link = Cell*;
+            declare i32 read(const<Cell>& c);
+            struct Cell { i32 value; Link next; };
+            declare enum Kind:u8;
+            enum Kind:u8 {case A(1)};
+            i32 read(const<Cell>& c) {return c.value;}
+            i32 main(){Cell c(42,nullptr); return read(c);}
+        """),
+            42,
+        )
+        for source, diagnostic in [
+            ("declare struct T; void f(){T x;}", "complete object type"),
+            ("declare struct T; void f(){auto n(sizeof(T));}", "complete object type"),
+            ("declare class T; union T{case A;};", "conflicting nominal"),
+            ("declare enum E:i32; enum E:u32{case A(0)};", "incompatible enum"),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_unified_delegation_frontier(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            i32 mark(i32 digit,i32 value){trace=trace*10+digit;return value;}
+            struct Pair {
+                i32 a;
+                i32 b;
+                Pair(i32 x) {
+                    init b(mark(3,x));
+                    mark(1,0);
+                    ++x;
+                    { delegate(x + 2,0); }
+                    mark(5,0);
+                }
+                Pair(i32 x,i32 tag) {
+                    init a(mark(2,x));
+                    mark(4,0);
+                }
+            };
+            i32 main(){
+                Pair pair(19);
+                if(trace==12345 && pair.a==22 && pair.b==20){return 42;}
+                return 1;
+            }
+        """),
+            42,
+        )
+        for source, diagnostic in [
+            ("struct A{A(){delegate();}};", "cyclic"),
+            ("struct A{A(){delegate(1);} A(i32 x){delegate();}};", "cyclic"),
+            ("struct A{A(){if(true){delegate(1);}} A(i32 x){}};", "unconditional"),
+            (
+                "struct A{i32 x; A(){init x(1);delegate(1);} A(i32 n){init x(n);}};",
+                "duplicate initialization",
+            ),
+            ("void f(){delegate();}", "requires a constructor"),
+        ]:
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(diagnostic, r.stderr)
+
+    def test_virtual_slots_and_active_layers(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Left { i64 pad; };
+            struct Base {
+                virtual i32 read(i32 x(3)) const noexcept { return x; }
+                Base() { trace = read(); }
+                virtual ~Base() noexcept { trace = trace * 10 + read(1); }
+            };
+            struct Derived : Left, Base {
+                i32 n;
+                Derived(){ init n(7); trace = trace*10 + read(0); }
+                i32 read(i32 x) const noexcept override final { return n + x; }
+                ~Derived() noexcept override { trace = trace*10+read(0); }
+            };
+            i32 invoke(const<Base>& b){return b.read();}
+            i32 main(){
+                Derived d;
+                Base* p(&d);
+                if(invoke(d)!=10 || p->read(2)!=9 || trace!=37){return 1;}
+                destroy(*p);
+                if(trace==3771){return 42;}return 2;
+            }
+        """),
+            42,
+        )
+
+    def test_virtual_slot_diagnostics_and_receiver_category(self):
+        self.assertEqual(
+            self.program("""
+            struct R {
+                i32 which() & { return 40; }
+                i32 which() && { return 2; }
+            };
+            i32 main(){ R r; return r.which()+R().which(); }
+        """),
+            42,
+        )
+        for source, diagnostic in [
+            (
+                "struct B{virtual i32 f(){return 1;}};struct D:B{i32 f(){return 2;}};",
+                "invalid override",
+            ),
+            (
+                "struct B{virtual i32 f() noexcept{return 1;}};struct D:B{i32 f() override{return 2;}};",
+                "invalid override",
+            ),
+            (
+                "struct B{virtual i32 f() final{return 1;}};struct D:B{i32 f() override{return 2;}};",
+                "invalid override",
+            ),
+            ("struct B{i32 f() override{return 1;}};", "no matching inherited"),
+            ("struct B{i32 f(){return 1;}i32 f() & {return 2;}};", "duplicate"),
+        ]:
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(diagnostic, r.stderr)
+
+    def test_nonvirtual_bases_and_subobject_addresses(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Left {
+                i32 left;
+                Left() {init left(2); trace = trace * 10 + 1;}
+                ~Left() {trace = trace * 10 + 6;}
+            };
+            struct Right {
+                i32 right;
+                Right(i32 v){init right(v); trace = trace * 10 + 2;}
+                i32 get() const {return right;}
+                ~Right(){trace = trace * 10 + 5;}
+            };
+            struct Both final : Left, Right {
+                Both(){init base<Right>(40); trace = trace * 10 + 3;}
+                i32 sum() const {return left + get();}
+                ~Both(){trace = trace * 10 + 4;}
+            };
+            i32 read(const<Right>& base){return base.get();}
+            i32 main(){
+                {
+                    Both b;
+                    Right* r(&b);
+                    if (b.sum() != 42 || b.right != 40 || r->get() != 40 || read(b) != 40) {return 1;}
+                }
+                if (trace == 123456){return 42;}
+                return 2;
+            }
+        """),
+            42,
+        )
+        for source, diagnostic in [
+            ("struct A final {}; struct B:A {};", "complete non-final"),
+            ("struct A {}; struct B:A,A {};", "duplicate direct base"),
+            (
+                "struct A{i32 n;};struct B:A{};struct C:A{};struct D:B,C{};i32 f(D& d){return d.n;}",
+                "ambiguous inherited",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_direct_base_request_exits_the_destructor_body(self):
+        for request in ("destroy_base<Parent>(this);", "this->Parent::~Parent();"):
+            with self.subTest(request=request):
+                self.assertEqual(
+                    self.program(
+                        """
+                    i32 trace;
+                    void note(i32 n){trace=trace*10+n;}
+                    struct Parent {~Parent(){note(2);}};
+                    struct Member {~Member(){note(3);}};
+                    struct Child:Parent {
+                        Complete base<Parent>;
+                        Member m;
+                        ~Child(){note(1); REQUEST note(9);}
+                        cleanup {note(4);}
+                    };
+                    i32 main(){{Child c;} if(trace==1234){return 42;} return 1;}
+                """.replace("REQUEST", request)
+                    ),
+                    42,
+                )
+
+    def test_generic_defaults_and_literal_deduction(self):
+        self.assertEqual(
+            self.program("""
+            constexpr usize count(3);
+            generic<type T = i32, const usize N = count, const usize M = N + 1>
+            struct Buffer { T[M] data; };
+            generic<type A, type B = A, const B N = B(2)> B add(A x) { return x + N; }
+            i32 main() {
+                constexpr usize count(20);
+                Buffer<> buf;
+                buf.data[3] = 40;
+                if (sizeof(buf.data) == 16) { return add<>(buf.data[3]); }
+                return add(0);
+            }"""),
+            42,
+        )
+
+    def test_structural_and_constant_requirements(self):
+        definitions = """
+            constraint Addable<type T> {
+                expression(const<T>& a, const<T>& b) { a + b -> T; }
+            };
+            generic<type T> requires (ObjectType<T> && Addable<T>)
+            T sum(const<T>& x, const<T>& y) { return x + y; }
+            generic<type T, const usize N> requires (CompleteType<T> && N > 0)
+            struct Buffer { T[N] data; };
+            struct Empty {};
+        """
+        self.assertEqual(
+            self.program(
+                definitions
+                + """
+            i32 main() {
+                Buffer<i32,2> storage;
+                storage.data[0] = 40;
+                if constexpr (!Addable<Empty> && SameType<i32,i32>) {
+                    return sum(storage.data[0], 2);
+                }
+                return 0;
+            }"""
+            ),
+            42,
+        )
+        for extra in [
+            "void f(){ Buffer<i32,0> b; }",
+            "void f(){ sum(Empty(), Empty()); }",
+        ]:
+            result = self.compile(definitions + extra, "--check")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("constraint is not satisfied", result.stderr)
+
+    def test_function_pointer_binding_and_indirect_calls(self):
+        self.assertEqual(
+            self.program("""
+            i32 increment(i32 n) noexcept { return n+1; }
+            i64 increment(i64 n) { return n+2; }
+            alias Transform = function<i32(i32 value)>*;
+            Transform from(function<i32(i32) noexcept>* op) { return op; }
+            i32 apply(Transform op, i32 n) { return op(n); }
+            i32 main(){
+                function<i32(i32) noexcept>* fp(&increment);
+                Transform relaxed(from(fp));
+                return apply(&increment, (*relaxed)((fp)(39)));
+            }
+            """),
+            42,
+        )
+        for source, message in [
+            (
+                "i32 op(i32 x){return x;} void f(){auto p(&op);}",
+                "target function-pointer",
+            ),
+            (
+                "i32 op(i32 x){return x;} void f(){function<i32(i32) noexcept>* p(&op);}",
+                "no unique compatible",
+            ),
+            ("i32 f(function<i32(i32)>* p){return p();}", "wrong argument count"),
+            ("void f(){function<i32(i32)> x;}", "requires a pointer"),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_default_argument_ownership_and_order(self):
+        self.assertEqual(
+            self.program("""
+            i32 state(1);
+            i32 next(){ return ++state; }
+            declare i32 compute(i32 first, i32 second(++first), i32 third(second + next()));
+            i32 invoke() { i32 state(100); return compute(next()); }
+            i32 compute(i32 a, i32 b, i32 c){ return a * 10 + b + c; }
+            consteval i32 plus(i32 a, i32 b(a+1)){return a+b;}
+            i32 main(){constexpr i32 three(plus(1)); return invoke() + three;}
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program(
+                """
+            extern "C" i32 sum(i32 n, i32 m(n * 2));
+            struct C { i32 v; C(i32 n(7)){init v(n);} i32 add(i32 x(14)){return v+x;} };
+            i32 main() { C c; return c.add() + sum(7); }
+            """,
+                host="int sum(int n,int m) {return n+m;}",
+            ),
+            42,
+        )
+        for source, message in [
+            ("declare i32 f(i32 a(2), i32 b);", "trailing suffix"),
+            ("declare i32 f(i32 a = 2);", "expected ')'"),
+            ("declare i32 f(i32 a(later));", "unknown name"),
+            (
+                "declare i32 f(i32 a(2)); i32 f(i32 a(2)){return a;}",
+                "canonical declaration",
+            ),
+            (
+                "alias F = function<i32(i32 a(3))>*;",
+                "cannot contain a parameter default",
+            ),
+            ("i32 f(i32 a(true)){return a;}", "cannot convert"),
+            ("declare i32 f(i32 a(true));", "cannot convert"),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_unicode_source_and_literals(self):
+        self.assertEqual(
+            self.program(r"""
+            i32 求值() {
+                byte[2] values(40,42);
+                if ('🙂' == '\u{1F642}' && sizeof("β") == 3 && "A"[1] == 0) {
+                    return values[1];
+                }
+                return 0;
+            }
+            i32 main() { return 求值(); }
+        """),
+            42,
+        )
+        r = self.compile(
+            "i32 café(){return 42;} i32 main(){return cafe\u0301();}", "--check"
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("WARNING: identifier spelling is not NFC", r.stderr)
+
+    def test_scoped_configuration(self):
+        self.assertEqual(
+            self.program("""
+            configuration { preset = Release; };
+            i32 main() {
+                i8 x(127);
+                configured(numeric.integer.overflow = saturating) { ++x; }
+                if (x != 127) { return 1; }
+                ++x;
+                if (x != -128) { return 2; }
+                return configured(numeric.integer.overflow = wrapping) (x + i8(-86));
+            }
+        """),
+            42,
+        )
+
+    def test_conditional_reconstruction(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Item { i32 id; ~Item() { trace = trace * 10 + id; } };
+            void replace_if(bool change) {
+                Item a(4);
+                auto view(storage_of(a));
+                if (change) {
+                    destroy(a);
+                    construct_at<Item>(view, 2);
+                }
+            }
+            i32 main() { replace_if(true); return trace; }
+        """),
+            42,
+        )
+
+    def test_namespaces_enum_and_methods(self):
+        self.assertEqual(
+            self.program("""
+            enum Mode : u8 { case Keep(0), case Increment(1) };
+            namespace app {
+                class Counter {
+                    i32 n;
+                public:
+                    Counter(i32 v) { init n(v); }
+                    i32 read() const { return this->n; }
+                    void update(Mode m) {
+                        switch (m) {
+                            case Mode::Increment: { ++n; }
+                            default: {}
+                        }
+                    }
+                };
+            }
+            i32 main() {
+                app::Counter c(41);
+                c.update(Mode::Increment);
+                return c.read();
+            }
+        """),
+            42,
+        )
+
+    def test_full_expression_destruction(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Item {
+                i32 id;
+                ~Item() { trace = trace * 10 + id; }
+                bool check() const { return true; }
+            };
+            i32 main() {
+                if (false && Item(7).check()) { return 1; }
+                Item(4).check();
+                { Item x(Item(2)); }
+                return trace;
+            }
+        """),
+            42,
+        )
+
+    def test_constant_calls_and_control_transfers(self):
+        self.assertEqual(
+            self.program("""
+            constexpr i32 sum(i32 n) {
+                i32 result;
+                for (i32 i(1); i <= n; ++i) { result += i; }
+                return result;
+            }
+            consteval i32 answer(i32 n) { return sum(n) * 2; }
+            i32 main() {
+                constexpr i32 max(answer(6));
+                i32 i;
+                again: { ++i; }
+                if (i < max - 2) { goto again; }
+                outer: while (true) { while (true) { i += 2; break outer; } }
+                return i;
+            }
+        """),
+            42,
+        )
+
+    def test_project_config_and_c_objects(self):
+        config = self.dir / "cpn.config"
+        config.write_text(
+            """configuration {
+            preset = Release;
+            target = "x86_64-linux-gnu";
+            source.identifiers = ascii;
+            numeric.integer.widths = [8, 16, 32, 64];
+        };""",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            self.program(
+                """
+            extern "C" { i32 total; define i32 total(40); void bump(){ total += 2; } }
+            i32 main(){ bump(); return total; }
+        """,
+                "--config",
+                str(config),
+            ),
+            42,
+        )
+        config.write_text(
+            "configuration { diagnostics.promote = [WARNING]; };", encoding="utf-8"
+        )
+        r = self.compile(
+            "i32 main(){bool x; if(x = true){return 1;} return 2;}",
+            "--config",
+            str(config),
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("assignment used directly", r.stderr)
+
+    def test_tagged_union_and_match(self):
+        self.assertEqual(
+            self.program("""
+            union Reading { default case Missing; case Sample(i32 value); };
+            i32 main() {
+                Reading r(Reading::Sample(40));
+                match(r) {
+                    case Reading::Missing { return 1; }
+                    case Reading::Sample(ref n) { n += 2; return n; }
+                }
+            }
+        """),
+            42,
+        )
+
+    def test_declared_copy_move_and_assignment(self):
+        self.assertEqual(
+            self.program("""
+            struct Point {
+                i32 x; i32 y;
+                Point(const<Point>& source) = default;
+                Point(Point&& source) = default;
+                Point& operator=(const<Point>& source) = default;
+            };
+            i32 main() {
+                Point a(40,2); Point b(a); Point c(std::move(b));
+                a = c;
+                return a.x + a.y;
+            }
+        """),
+            42,
+        )
+
+    def test_small_integer_domains_with_c_caller(self):
+        source = """
+            configuration { numeric.integer.overflow = saturating; };
+            extern "C" i8 product(i8 a, i8 b) { return a*b; }
+            extern "C" u8 difference(u8 a, u8 b) { return a-b; }
+            extern "C" i8 quotient(i8 a, i8 b) { return a/b; }
+            extern "C" bool less(i8 a, u8 b) { return a < b; }
+        """
+        host = """
+            #include <stdint.h>
+            #include <stdbool.h>
+            extern int8_t product(int8_t,int8_t), quotient(int8_t,int8_t);
+            extern uint8_t difference(uint8_t,uint8_t);
+            extern bool less(int8_t,uint8_t);
+            static int clamp(int n) { return n < -128 ? -128 : n > 127 ? 127 : n; }
+            int main(void) {
+                for (int a = -128; a < 128; ++a)
+                    for (int b = -128; b < 128; ++b) {
+                        if (product(a,b) != clamp(a*b)) return 1;
+                        if (b && quotient(a,b) != clamp(a/b)) return 2;
+                        if (difference(a+128,b+128) != (a>b ? a-b : 0)) return 3;
+                        if (less(a,b+128) != (a < b+128)) return 4;
+                    }
+                return 42;
+            }
+        """
+        self.assertEqual(self.program(source, host=host), 42)
+
+    def test_cleanup_manual_member_barrier(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace;
+            struct Item { i32 id; ~Item(){ trace = trace*10 + id; } };
+            class Manual Pair {
+            public:
+                Item first; Item second;
+                Pair(){ init first(2); init second(4); }
+                ~Pair() {} cleanup { destroy(second); }
+            };
+            i32 main(){ { Pair p; } return trace; }
+        """),
+            42,
+        )
+
+    def test_source_errors(self):
+        bad = [
+            (
+                "union R { case A; case B; }; i32 f(R r){ match(r){case R::A{return 1;}} }",
+                "non-exhaustive",
+            ),
+            (
+                "struct P { i32 x; }; i32 f(){P a; P b(a); return 1;}",
+                "copy constructor",
+            ),
+            (
+                "struct P { P(const<P>&) = delete; }; i32 f(){P a; P b(a); return 1;}",
+                "copy constructor",
+            ),
+            ("i32 f(){ u8 n(-1); return n; }", "outside the range"),
+            ("i32 f(){ return 0b102; }", "malformed"),
+            ("i32 f(){ return 1__0; }", "malformed"),
+            ("i32 f(){ /*", "unterminated"),
+            ("i32 f(){ if (1) { return 2; } return 0; }", "requires bool"),
+            ("i8 f(i32 x){ return x; }", "lossless conversion"),
+            ("i32 f(){ i32 a(a); return a; }", "before initialization"),
+            ("i32 f(){ const i32 a(0); a++; return a; }", "writable lvalue"),
+            ("i32 f(i32 x){ return x / (2 - 2); }", "division by zero"),
+            ("i32 f(bool c){ if (c) { return 1; } }", "without returning"),
+            ("i32 f(){ return late(); } i32 late(){return 1;}", "unknown name"),
+            ("declare i32 f(); i32 main(){return f();}", "needs a definition"),
+            ("i32 f(){ switch(3){case 3:{} case 3:{}} return 1; }", "duplicate case"),
+            ("i32 f(){ i32 a = 3; return a; }", "expected ';'"),
+            ("i32 f(){ u64 a; i64 b; auto c(a+b); return 0; }", "i128 is unavailable"),
+            ("i32 f(){ goto end; i32 x; end: return x; }", "unexecuted initializer"),
+            (
+                "consteval i32 f(i32 a){return a;} i32 g(i32 x){return f(x);}",
+                "constant argument required",
+            ),
+            ("struct A{ A[1] array; };", "incomplete record"),
+            ("void f(){ void[1] array; }", "complete object element"),
+            ("void f(){ i32[1 - 2] a; }", "outside the range"),
+            ("void f(usize n){ i32[n + 1] a; }", "constant expression"),
+            ("configuration {diagnostics.promote=[[WARNING]];};", "CFG001"),
+            ("configuration {diagnostics.suppress=[LIFE002];};", "CFG001"),
+            ("configuration {compilation.modules=true;};", "CFG002"),
+            ('[[static_id("a")]] i32 x; [[static_id("a")]] i32 y;', "STAT001"),
+            ("[[init_after(b)]] i32 a; i32 b;", "cyclic static initialization"),
+            ("[[init_after(missing)]] i32 a;", "unknown static dependency"),
+            ("generic<type T> void f(T a){auto bad('ab');}", "one Unicode scalar"),
+            ("generic<const void* P> struct B {};", "invalid generic constant"),
+            ("generic<const i32 N = missing> struct B {};", "unknown name"),
+            ("struct S{i32 x;}; void f(){ S[2] a; S[2] b(a); }", "copy constructor"),
+            (
+                "enum E:i32{case A(1)}; void f(){ E[2] xs(E::A); }",
+                "zero-valued default",
+            ),
+            ("generic<const i32 N> struct B{}; void f(){ B<1>=v; }", "expected"),
+            ("enum E:u8 {case A(0),case B(0)};", "duplicate enum"),
+            (
+                "i32 f(){ i32 x; if (true) { destroy(x); } return x; }",
+                "ended object generation",
+            ),
+            ("i32 f(){ int x = 0; return x; }", "expected"),
+            ("i32 f(){ for(int i=0;i<2;i++){ } return 1;}", "expected"),
+            ("i32 f(){ i32 a; destroy(a); return a; }", "ended object generation"),
+            (
+                "i32 f(){ i32 a; auto p(&a); destroy(a); return *p; }",
+                "ended object generation",
+            ),
+            (
+                "i32 f(){ i32 x; auto s(storage_of(x)); construct_at<i32>(s,4); return 0; }",
+                "live generation",
+            ),
+            (
+                "i32 f(){ i8 x; auto s(storage_of(x)); destroy(x); construct_at<i64>(s,4); return 0; }",
+                "insufficient storage",
+            ),
+            ("i32 f(){ i32[2] a; return a[2]; }", "outside extent"),
+            ("i32 f(){ i32 x[2]; return 0; }", "expected ';'"),
+            ("i32 f(){ if (true) return 2; return 0; }", "expected '{'"),
+            ("i32 f(void){return 1;}", "void parameter"),
+            ("i32 f(){ i32 x(1); i32 x(2); return x; }", "duplicate declaration"),
+            ("#define N 42\ni32 f(){return N;}", "unsupported or unknown type"),
+            ("i32 f(){ return 42UL; }", "malformed"),
+            ("i32 f(){ char c('ab'); return 1; }", "one Unicode scalar"),
+            ("i32 f(){ auto c('\\u{D800}'); return 1; }", "Unicode scalar"),
+            (
+                "class Locked { i32 n; }; i32 f(){ Locked v; return v.n; }",
+                "inaccessible member",
+            ),
+        ]
+        for source, msg in bad:
+            with self.subTest(source=source):
+                r = self.compile(source, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertRegex(r.stderr, r"example\.cpn:\d+:\d+: ERROR:")
+                self.assertIn(msg, r.stderr)
+
+    def test_edition_and_output_integrity(self):
+        for args in ([], ["--std=CPN25"]):
+            r = self.compile("i32 main(){ return 42; }", *args, edition=False)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("--std", r.stderr)
+        output = self.dir / "kept.o"
+        output.write_bytes(b"kept")
+        r = self.compile("i32 main(){ return invalid; }", "-o", output)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(output.read_bytes(), b"kept")
+        r = self.compile(
+            "i32 main(){ return 42; }", "-o", output, "--llc", self.dir / "missing"
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(output.read_bytes(), b"kept")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -24,6 +24,10 @@ Other components include:
 the [libc++ C++ standard library](https://libcxx.llvm.org),
 the [LLD linker](https://lld.llvm.org), and more.
 
+## CPN26 compiler
+
+This fork includes a CPN26 frontend. See the [cpnc build instructions, example and language coverage](llvm/tools/cpnc/README.md).
+
 ## Getting the Source Code and Building LLVM
 
 Consult the
