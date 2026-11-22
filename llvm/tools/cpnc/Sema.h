@@ -98,6 +98,7 @@ struct Context {
   void chargeInstance(const Token &);
   void chargeSolver(const Token &);
   void checkNormalForm(const Node &);
+  void checkDomain(const Node &, const std::string &);
 
   std::map<std::string, Family> Families;
   std::map<std::string, std::deque<Family>> FunctionFamilies;

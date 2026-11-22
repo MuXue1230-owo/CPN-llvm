@@ -12,6 +12,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Closure.cpp
     Construction.cpp
     Dispatch.cpp
+    Domain.cpp
     Driver.cpp
     Emit.cpp
     Floating.cpp

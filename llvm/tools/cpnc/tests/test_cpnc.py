@@ -200,9 +200,9 @@ class CompilerTests(unittest.TestCase):
             i32 choose(i8 n) {return 2;}
             i32 defaulted(i32 n){return n;}
             configured(numeric.integer.overflow=saturating)
-            generic<type T> T increment(T n){return n+1;}
+            generic<type T> requires(SameType<T,i8>) T increment(T n){return n+1;}
             configured(numeric.integer.overflow=saturating)
-            generic<type T> struct Counter {T increment(T n){return n+1;}};
+            generic<type T> requires(SameType<T,i8>) struct Counter {T increment(T n){return n+1;}};
             i32 main(){
                 Counter<i8> c;
                 if(increment(i8(127))==127 && c.increment(i8(127))==127 &&
@@ -304,6 +304,30 @@ class CompilerTests(unittest.TestCase):
                 return 0;
             }
             """),
+            42,
+        )
+
+    def test_uninstantiated_dependent_arithmetic_requires_evidence(self):
+        for definition in (
+            "generic<type T> T plus(T a, T b){return a+b;}",
+            "generic<type T> requires(ObjectType<T>) T plus(T a,T b){return a+b;}",
+            "generic<type T> T bad(T n){if constexpr(SameType<T,i32>){return n;}"
+            "else{return n+1;}}",
+        ):
+            with self.subTest(definition=definition):
+                r = self.compile(definition, "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("not established", r.stderr)
+        self.assertEqual(
+            self.program("""
+            constraint Sum<type T>{expression(const<T>& a,const<T>& b){a+b->T;}};
+            generic<type X> requires(Sum<X>) X plus(X a,X b){return a+b;}
+            generic<type T> i32 guarded(T x){
+                if constexpr(SameType<T,i32> || SameType<T,i16>){return x+2;}
+                else{return 0;}
+            }
+            i32 main(){return guarded(plus(20,20));}
+        """),
             42,
         )
 
@@ -1012,7 +1036,8 @@ class CompilerTests(unittest.TestCase):
             constexpr usize count(3);
             generic<type T = i32, const usize N = count, const usize M = N + 1>
             struct Buffer { T[M] data; };
-            generic<type A, type B = A, const B N = B(2)> B add(A x) { return x + N; }
+            generic<type A, type B = A, const B N = B(2)>
+            requires(SameType<A,i32> && SameType<B,i32>) B add(A x) { return x + N; }
             i32 main() {
                 constexpr usize count(20);
                 Buffer<> buf;

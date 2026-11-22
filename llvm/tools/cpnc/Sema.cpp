@@ -531,6 +531,7 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       for (auto &Req : D.TemplateArgs)
         checkNormalForm(Req);
       validate(D, P);
+      checkDomain(D, P);
       auto [It, New] = Families.emplace(Name, Family{D, P, site()});
       if (!New &&
           (D.K != Node::Function || It->second.Decl.K != Node::Function))
