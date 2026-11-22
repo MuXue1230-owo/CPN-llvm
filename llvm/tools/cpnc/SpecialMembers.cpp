@@ -64,7 +64,7 @@ bool Frame::constructible(const std::string &T, SpecialOperation Op,
   });
 }
 void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
-                     const Token &At, bool AsBase) {
+                     const Token &At, bool AsBase, bool CheckInvariant) {
   if (auto Mutable = unconst(Source.Type); Mutable != Source.Type) {
     if (assignment(Op))
       fail(At, "assignment to a const subobject");
@@ -113,12 +113,19 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   auto &R = It->second;
   Value Result{Source.Type, nullptr, Dest};
   Result.BaseView = AsBase;
+  auto *Previous = assignment(Op) ? nullptr : pushInvariantLifetime(Result);
   if (!assignment(Op) && !AsBase)
     bindVirtualLayout(Result);
   if (!assignment(Op))
     enterOwnerLayer(Result);
   if (moving(Op) && Source.Readonly)
     fail(At, "moving requires a mutable source");
+  bool PublicAssignment = false;
+  auto Complete = [&] {
+    popInvariantLifetime(Previous);
+    if (CheckInvariant && (!assignment(Op) || PublicAssignment))
+      checkInvariants(Result);
+  };
   if (R.Decl.K != Node::Lambda) {
     auto I = R.Special.find(Op);
     if (I == R.Special.end())
@@ -126,17 +133,26 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
                    Source.Type);
     auto &Member = I->second;
     checkAccess(Member.Decl, Source.Type, At);
+    auto Access = Member.Decl.Settings.find("access");
+    PublicAssignment =
+        assignment(Op) &&
+        (Access == Member.Decl.Settings.end() || Access->second == "public");
     if (Member.Decl.Settings.count("control") &&
         Member.Decl.Settings.at("control") == "delete")
       fail(At, std::string("selected ") + operationName(Op) + " is deleted");
     if (Member.Body) {
       Source.Expiring = moving(Op);
       invoke(*Member.Body, {Source}, At, Result);
+      if (!assignment(Op))
+        Complete();
       return;
     }
   }
+  if (PublicAssignment)
+    checkInvariants(Result);
   if (R.Decl.K == Node::Union) {
     transferPayload(Source, Dest, Op, At);
+    Complete();
     return;
   }
   if (!assignment(Op) && R.Fields.empty())
@@ -152,15 +168,17 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   }
   if (!assignment(Op))
     installTables(Result);
+  Complete();
 }
 
-Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
+Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest,
+                         bool CheckInvariant) {
   if (!IR) {
     Source = load(Source);
     if (Source.Prvalue)
       consume(Source);
     if (!Source.Prvalue && U.aggregate(Source.Type))
-      return constantCopy(Source, At);
+      return constantCopy(Source, At, CheckInvariant);
     Source.Location.reset();
     Source.ConstantTemporary.reset();
     Source.Address = nullptr;
@@ -199,7 +217,7 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest) {
   transfer(Source, Dest,
            Source.Expiring ? SpecialOperation::MoveConstruct
                            : SpecialOperation::CopyConstruct,
-           At);
+           At, false, CheckInvariant);
   return load({Source.Type, nullptr, Dest});
 }
 

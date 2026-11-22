@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SetVector.h"
 using namespace cpn;
 namespace {
@@ -183,6 +184,12 @@ void Construction::enter(Frame &Em, size_t Depth) {
   Activations.erase(D);
 }
 void Construction::run(Frame &Root) {
+  if (!Root.IR)
+    Root.U.ConstantInvariantLifetimes.push_back(&Object);
+  auto End = llvm::scope_exit([&] {
+    if (!Root.IR)
+      Root.U.ConstantInvariantLifetimes.pop_back();
+  });
   enter(Root, 0);
   if (positions() != Positions{Order.size()})
     fail(Root.F->Decl.At, "incomplete construction plan");
@@ -200,6 +207,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
   Frame Next(Em.U, D, Em.IR);
   if (!Em.IR) {
     Next.bindInlineParams(Args);
+    Next.checkContracts(true);
     enter(Next, I + 1);
     Em.HasDelegated = true;
     return;
@@ -209,10 +217,13 @@ void Construction::delegate(Frame &Em, const Node &N) {
   Next.Self = Object;
   Next.Scopes[0].Names["this"] = {Object.Type + "*", Object.Address};
   Next.bindInlineParams(Args);
+  Next.checkContracts(true);
   Next.InlineReturn = Em.block("delegate.done");
   enter(Next, I + 1);
-  if (Next.Live)
+  if (Next.Live) {
+    Next.checkContracts(false);
     Next.cleanup(0);
+  }
   Next.branch(Next.InlineReturn);
   Em.B.SetInsertPoint(Next.InlineReturn);
   Em.HasDelegated = true;

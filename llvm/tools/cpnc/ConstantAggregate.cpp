@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/ConstantFold.h"
 using namespace cpn;
 using llvm::StringRef;
@@ -62,6 +63,7 @@ bool Frame::containsPointerField(const std::string &Type) const {
 }
 Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
                                  const Token &At, const Node *Tail) {
+  requireObserver(D.Effects, At, &D);
   if (D.Decl.Prototype || D.Decl.Children.empty())
     fail(At, "constant construction requires a constructor definition");
   Frame Root(U, &D, nullptr);
@@ -69,13 +71,18 @@ Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
     if (!StringRef(D.Params[I]).ends_with("&") && Args[I].Prvalue)
       consume(Args[I]);
   Root.bindInlineParams(Args);
+  Root.checkContracts(true);
   Value Object{D.Owner, llvm::Constant::getNullValue(U.ir(D.Owner))};
   if (U.Variants.count(D.Owner)) {
     auto Default = U.DefaultCase.find(D.Owner);
     if (Default == U.DefaultCase.end())
       fail(At, "union construction requires a selected case");
-    Object = Root.variant(U.Cases.at(Default->second), {}, At, nullptr, true);
+    Object =
+        Root.variant(U.Cases.at(Default->second), {}, At, nullptr, true, false);
     Root.ConstantReceiver = &Object;
+    U.ConstantInvariantLifetimes.push_back(&Object);
+    auto End =
+        llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
     Root.constructorBody(D.Decl.Children.front());
     return Object;
   }
@@ -84,7 +91,7 @@ Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
   return Plan.constantResult();
 }
 
-Value Frame::constantCopy(Value Source, const Token &At) {
+Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
   ConstantActivation Activation(U, At);
   const auto Type = unconst(Source.Type);
   if (Source.Expiring && Source.Readonly && U.Records.count(Type))
@@ -132,8 +139,12 @@ Value Frame::constantCopy(Value Source, const Token &At) {
       if (S != R->second.Special.end() && S->second.Body) {
         Frame Body(U, S->second.Body, nullptr);
         Body.bindInlineParams({Source});
+        Body.checkContracts(true);
         Value Dest{Type, C};
         Body.ConstantReceiver = &Dest;
+        U.ConstantInvariantLifetimes.push_back(&Dest);
+        auto End =
+            llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
         Body.constructorBody(S->second.Body->Decl.Children.front());
         C = llvm::cast<llvm::Constant>(Dest.IR);
       }
@@ -158,6 +169,8 @@ Value Frame::constantCopy(Value Source, const Token &At) {
   Source.ConstantTemporary.reset();
   Source.Prvalue = Source.Expiring = true;
   Source.Readonly = false;
+  if (CheckInvariant)
+    checkInvariants(Source);
   return Source;
 }
 Value Frame::constantAggregate(const std::string &T,
@@ -174,8 +187,12 @@ Value Frame::constantAggregate(const std::string &T,
     if (Tail) {
       llvm::SaveAndRestore<Construction *> Outer(Transaction, nullptr);
       llvm::SaveAndRestore Receiver(ConstantReceiver, &V);
+      U.ConstantInvariantLifetimes.push_back(&V);
+      auto End =
+          llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
       stmt(*Tail);
     }
+    checkInvariants(V);
     V.Expiring = V.Prvalue = true;
     return V;
   };
@@ -199,7 +216,7 @@ Value Frame::constantAggregate(const std::string &T,
   if (Input.size() == 1 && Input.front().Type == T) {
     auto V = Input.front();
     if (!V.Prvalue)
-      V = constantCopy(V, At);
+      V = constantCopy(V, At, false);
     else {
       consume(V);
       V.Location.reset();
@@ -225,7 +242,7 @@ Value Frame::constantAggregate(const std::string &T,
     if (!U.DefaultCase.count(T))
       fail(At, "union construction requires a selected case");
     return finishTail(
-        variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, nullptr, true));
+        variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, nullptr, true, false));
   }
   if (Record && U.Overloads.count(T + "::$ctor")) {
     Function Aggregate;

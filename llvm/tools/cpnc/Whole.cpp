@@ -214,6 +214,7 @@ llvm::Value *Frame::wholeEpoch() {
 void Frame::exitWhole() {
   endExpression();
   cleanup(0);
+  exitInvariantConstructionLifetimes();
   if (InlineReturn)
     branch(InlineReturn);
   else if (IR->getReturnType()->isVoidTy())
@@ -304,8 +305,11 @@ Value Frame::baseRequest(const Node &C, const Node &Operand) {
   store(3, U.typeID(Authority.Type));
   store(4, B.getInt1(C.Text == "destroy_base"));
   auto *Current = block("whole.current"), *External = block("whole.external");
-  B.CreateCondBr(B.CreateCall(U.M.getFunction("cpn.whole.request"), {Request}),
-                 Current, External);
+  auto *RequestWhole =
+      B.CreateCall(U.M.getFunction("cpn.whole.request"), {Request});
+  RequestWhole->setMetadata(
+      "cpn.effect", llvm::MDNode::get(U.C, llvm::MDString::get(U.C, "whole")));
+  B.CreateCondBr(RequestWhole, Current, External);
   B.SetInsertPoint(Current);
   {
     llvm::SaveAndRestore TempsScope(Temps);

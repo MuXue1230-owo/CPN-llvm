@@ -142,6 +142,12 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
         D.Settings.count("lifecycle_effect") !=
             Member.Settings.count("lifecycle_effect"))
       fail(D.At, "incompatible qualified member definition");
+    auto HasReceiver = !Member.Settings.count("static");
+    if (auto Bound = genericEffectBound(D, HasReceiver);
+        Bound && Bound != genericEffectBound(Member, HasReceiver))
+      fail(D.At, "incompatible qualified member effect contract");
+    if (!D.Contracts.empty() && !sameGenericValueContracts(Public, D))
+      fail(D.At, "incompatible qualified member value contract");
     for (StringRef Effect : {"consumes", "noescape", "returns_borrowed_from"})
       if (effectPositions(Member, Effect) != effectPositions(D, Effect))
         fail(D.At, "incompatible qualified member effect contract");
@@ -169,7 +175,7 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
       Domain.Children.push_back(std::move(Field));
     }
   Domain.Children.push_back(D);
-  checkDomain(Domain, Families.at(Key).Prefix);
+  checkDomain(Domain, Families.at(Key).Prefix, &Owner);
   auto &Definitions = OwnerBodies[position(Owner)];
   auto [Bound, New] = Definitions.emplace(position(*Selected),
                                           MemberBody{GenericOwners, D, site()});
@@ -219,6 +225,9 @@ void Context::bindFamilyMember(const std::string &Name,
     }
   D.Generics.clear();
   D.TemplateArgs.clear();
+  // The selected member declaration owns its value predicates. Any repeated
+  // clauses have already been compared in the correct binder environments.
+  D.Contracts.clear();
   D.Settings["qualifier"] = "::" + Name + "::";
   EnterDefinition Site(*this, Saved.Site);
   defineQualified(D, "", &Env);

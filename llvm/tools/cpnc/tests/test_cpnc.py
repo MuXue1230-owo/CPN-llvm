@@ -1,6 +1,7 @@
 """Exercise the command line, LLVM verifier, native linker, and generated programs."""
 
 import os
+import signal
 from pathlib import Path
 import subprocess
 import shutil
@@ -166,6 +167,70 @@ class CompilerTests(unittest.TestCase):
             "struct S{generic<type T> declare T f(T n);};generic<type T> T S::f(T n(4)){return n;}",
         ):
             self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_generic_contracts_keep_declaration_parameter_positions(self):
+        self.assertEqual(
+            self.program("""
+            [[ensures(return_value==limit)]]
+            generic<const i32 limit> declare i32 pick(const<i32>& data)
+                [[effects(read(data))]];
+            i32 early_pick(const<i32>& n) {return pick<20>(n);}
+            [[ensures(return_value==bound)]]
+            generic<const i32 bound> i32 pick(const<i32>& source)
+                [[effects(read(source))]] {return source;}
+
+            generic<const i32 limit> struct Box {
+                i32 data;
+                [[ensures(return_value==limit)]]
+                declare i32 get() const [[effects(read(this))]];
+            };
+            [[ensures(return_value==bound)]]
+            generic<const i32 bound> i32 Box<bound>::get() const
+                [[effects(read(this))]] {return data;}
+
+            generic<type... Ts> i32 pack(Ts... args)
+                [[effects(read(args))]] {return 1;}
+            i32 main() {
+                Box<20> box(20);
+                i32 n(20);
+                return box.get()+early_pick(n)+pack()+pack(n,42);
+            }
+            """),
+            42,
+        )
+        for source, diagnostic in (
+            (
+                "[[requires(missing)]] generic<type T> T id(T x) {return x;}",
+                "unknown name 'missing' in contract predicate",
+            ),
+            (
+                "[[requires(late())]] generic<const i32 N> i32 f() {return N;} "
+                "[[effects(none)]] bool late() {return true;}",
+                "unknown name 'late' in contract predicate",
+            ),
+            (
+                "[[requires(x>0)]] generic<type T> void f(T x) {}",
+                "dependent operation '>' is not established",
+            ),
+            (
+                "generic<type T> i32 f(T x) [[effects(read(missing))]] {return 0;}",
+                "unknown effect region",
+            ),
+            (
+                "generic<type T> declare i32 f(T x,T y) [[effects(read(x))]]; "
+                "generic<type U> i32 f(U a,U b) [[effects(read(b))]] {return 0;}",
+                "incompatible generic effect contract",
+            ),
+            (
+                "[[ensures(return_value==N)]] generic<const i32 N> declare i32 f(); "
+                "[[ensures(return_value!=M)]] generic<const i32 M> i32 f(){return 0;}",
+                "incompatible generic value contract",
+            ),
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(diagnostic, result.stderr)
 
     def test_nested_types_of_applied_families(self):
         self.assertEqual(
@@ -1163,6 +1228,166 @@ class CompilerTests(unittest.TestCase):
             }"""),
             42,
         )
+
+    def test_effect_bounds_bind_canonical_callable_regions(self):
+        self.assertEqual(
+            self.program("""
+            [[effects(read(source))]] declare i32 inspect(const<i32>& source);
+            i32 inspect(const<i32>& item) [[effects(read(item))]] { return item; }
+            alias Reader = function<i32(const<i32>& observed) [[effects(read(observed))]]>*;
+            alias Broad = function<i32(const<i32>& observed) [[effects(read(any))]]>*;
+            [[effects(none)]] i32 local(Reader read) {
+                i32 object(42);
+                return read(object);
+            }
+            i32 main() {
+                Reader read(&inspect);
+                Broad broad(read);
+                i32 object(42);
+                if (!SameType<Reader,decltype(&inspect)> || broad(object)!=42) {return 1;}
+                return local(read);
+            }
+            """),
+            42,
+        )
+
+    def test_effect_bounds_include_direct_calls_arguments_and_cleanup(self):
+        self.assertEqual(
+            self.program("""
+            i32 trace(0);
+            [[effects(write(global))]] void publish(i32 input){trace=input;}
+            struct Guard {
+                ~Guard() [[effects(write(global))]] {publish(42);}
+            };
+            [[effects(none)]] i32 identity(i32 input){return input;}
+            [[effects(write(global))]] void run(){Guard local;identity(0);}
+            i32 main(){run();return trace;}
+            """),
+            42,
+        )
+        for body in ("Guard local;", "identity(update());"):
+            with self.subTest(body=body):
+                result = self.compile(
+                    """
+                    i32 trace;
+                    [[effects(write(global))]] i32 update(){trace=1;return 1;}
+                    [[effects(none)]] i32 identity(i32 input){return input;}
+                    struct Guard{~Guard() [[effects(write(global))]] {update();}};
+                    [[effects(none)]] void run(){"""
+                    + body
+                    + "}",
+                    "--check",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("effect", result.stderr)
+
+    def test_effect_bounds_track_selected_integer_failure_policy(self):
+        self.assertEqual(
+            self.program("""
+            [[effects(trap(any))]] i32 checked_increment(i32 n){return n+1;}
+            configured(numeric.integer.overflow=wrapping)
+            [[effects(none)]] i32 wrapped_increment(i32 n){return n+1;}
+            i32 main(){return checked_increment(wrapped_increment(40));}
+            """),
+            42,
+        )
+        result = self.compile(
+            "[[effects(none)]] i32 unchecked_bound(i32 n){return n+1;}", "--check"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("effect", result.stderr)
+
+    def test_effect_bounds_reject_invalid_regions_and_callable_substitution(self):
+        cases = {
+            "unknown parameter": "[[effects(read(missing))]] declare i32 f(i32& actual);",
+            "receiver without instance": "[[effects(read(this))]] declare i32 f();",
+            "noexcept contradiction": "[[effects(throw)]] declare void f() noexcept;",
+            "mixed empty bound": "[[effects(none,io)]] declare void f();",
+            "unknown trap kind": "[[effects(trap(memory))]] declare void f();",
+            "write does not cover independent read": (
+                "[[effects(write(x))]] i32 f(i32& x){return x;}"
+            ),
+            "wrong parameter region": (
+                "[[effects(read(x))]] i32 f(i32& x,i32& y){return y;}"
+            ),
+            "unbounded target": (
+                "i32 f(i32 x){return x;}void g(){"
+                "function<i32(i32) [[effects(none)]]>* p(&f);}"
+            ),
+            "incompatible redeclaration": (
+                "[[effects(read(x))]] declare i32 f(i32& x);"
+                "[[effects(none)]] i32 f(i32& y){return y;}"
+            ),
+            "incompatible override": (
+                "i32 global_state;"
+                "struct B{virtual i32 f() [[effects(none)]] {return 0;}};"
+                "struct D:B{i32 f() [[effects(read(global))]] override{return global_state;}};"
+            ),
+        }
+        for case, source in cases.items():
+            with self.subTest(case=case):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_effect_inference_and_opaque_diagnostics_follow_configuration(self):
+        body = """
+        i32 state;
+        void leaf(){state=42;}
+        [[effects(none)]] void entry(){leaf();}
+        """
+        inferred = self.compile(body, "--check")
+        self.assertNotEqual(inferred.returncode, 0)
+        self.assertIn("write(global)", inferred.stderr)
+        unresolved = self.compile(
+            "configuration {effects.inference=local;};" + body, "--check"
+        )
+        self.assertEqual(unresolved.returncode, 0, unresolved.stderr)
+        self.assertIn("ANOMALY", unresolved.stderr)
+        strict = self.compile(
+            """
+            configuration {
+                effects.inference=local;
+                effects.opaque_default=conservative;
+                effects.diagnostics=strict;
+            };
+            void leaf(){}
+            void entry(){leaf();}
+            """,
+            "--check",
+        )
+        self.assertEqual(strict.returncode, 0, strict.stderr)
+        self.assertIn("ANOMALY", strict.stderr)
+
+    def test_effect_regions_follow_pointers_in_value_parameters(self):
+        declarations = """
+        struct Holder {i32* ptr;};
+        [[effects(write(box))]] void set(Holder box){*box.ptr=42;}
+        alias Setter = function<void(Holder box) [[effects(write(box))]]>*;
+        """
+        self.assertEqual(
+            self.program(
+                declarations
+                + """
+                [[effects(none)]] i32 invoke(Setter setter){
+                    i32 local(0);
+                    setter(Holder(&local));
+                    return local;
+                }
+                i32 main(){return invoke(&set);}
+                """
+            ),
+            42,
+        )
+        for callee in ("set", "setter"):
+            result = self.compile(
+                declarations
+                + "i32 state;"
+                + "[[effects(none)]] void invoke(Setter setter){"
+                + callee
+                + "(Holder(&state));}",
+                "--check",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("write(global)", result.stderr)
 
     def test_callable_type_queries_preserve_parameter_contracts(self):
         src = """
@@ -2237,6 +2462,53 @@ class CompilerTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn(message, r.stderr)
 
+    def test_contract_predicate_type_binding(self):
+        self.assertEqual(
+            self.program("""
+            alias item=i64;
+            [[requires(sizeof(item)==sizeof(i32))]]
+            i32 identity(i32 item){return item;}
+            [[requires(sizeof(T)==alignof(T))]]
+            generic<type T> i32 answer(T item)
+                [[ensures(sizeof(item)==sizeof(T))]] {return 42;}
+            i32 main(){return identity(answer(i32(0)));}
+            """),
+            42,
+        )
+        for source in (
+            "alias F=function<void() [[requires(true)]]>*;",
+            "[[requires(true,false)]] void f(){}",
+            "struct S {[[invariant(true)]] Complete;};",
+        ):
+            with self.subTest(source=source):
+                self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_closure_trailing_contract_attributes(self):
+        source = """
+            alias Identity=function<i32(i32) noexcept [[effects(none)]]>*;
+            i32 main(){
+                i32 captured(41);
+                auto f([captured] i32(i32 n) mutable
+                    [[effects(read(this),write(this)),requires(n!=captured),
+                      ensures(return_value==captured)]] {
+                    captured=n;
+                    return captured;
+                });
+                Identity identity([] i32(i32 n) noexcept
+                    [[effects(none),requires(true),ensures(true)]] {return n;});
+                return identity(f(42));
+            }"""
+        self.assertEqual(self.program(source), 42)
+        self.assertEqual(self.program(source.replace("f(42)", "f(41)")), -signal.SIGILL)
+        for body, message in (
+            ("auto f([] void() [[requires(missing)]] {});", "unknown name"),
+            ("auto f([] i32() [[effects(none)]] {return trace;});", "effect"),
+        ):
+            with self.subTest(body=body):
+                result = self.compile("i32 trace;void test(){" + body + "}", "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
     def test_captureless_closure_explicit_function_pointer(self):
         self.assertEqual(
             self.program("""
@@ -3297,6 +3569,20 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_destructor_abandon_ends_aliased_member_generation(self):
+        self.assertEqual(
+            self.program("""
+            i32 observed;
+            void read(i32* p) { observed=*p; }
+            struct Owner {
+                i32 item(42);
+                ~Owner() { auto saved(&item); abandon(item); read(saved); }
+            };
+            i32 main() { { Owner owner; } return observed; }
+            """),
+            -signal.SIGILL,
+        )
+
     def test_member_replacement_in_aggregate_and_authored_destructor(self):
         self.assertEqual(
             self.program("""
@@ -3973,6 +4259,210 @@ class CompilerTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(output.read_bytes()[:4], b"\x7fELF")
+
+    def test_value_contracts_bind_at_declaration_and_check_at_completion(self):
+        self.assertEqual(
+            self.program("""
+                i32 destroyed;
+                struct Guard { ~Guard() { destroyed = 1; } };
+                [[requires(value > 0), ensures(destroyed == 1),
+                  ensures(return_value == value)]]
+                declare i32 echo(i32 value);
+                i32 echo(i32 renamed) { Guard local; return renamed; }
+                i32 main() { return echo(42); }
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                [[ensures(return_value > 0)]] i32 f() { return 0; }
+                i32 main() { return f(); }
+            """),
+            -signal.SIGILL,
+        )
+        self.assertEqual(
+            self.program(
+                """
+                [[requires(false), ensures(false)]] i32 f() { return 42; }
+                i32 main() { return f(); }
+                """,
+                "--preset",
+                "Release",
+            ),
+            42,
+        )
+
+    def test_contract_predicates_require_bool_and_admitted_operations(self):
+        for source, message in [
+            ("[[requires(n)]] declare i32 f(i32 n);", "requires bool"),
+            ("[[requires((n = 1) == 1)]] declare i32 f(i32 n);", "mutate"),
+            ("[[requires(return_value > 0)]] declare i32 f();", "return_value"),
+            ("[[requires(n + 1 > 0)]] declare i32 f(i32 n);", "numeric"),
+            (
+                "[[ensures(false)]] consteval i32 f() { return 1; } "
+                "constexpr i32 n(f());",
+                "ensures #1",
+            ),
+        ]:
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+
+    def test_nonraising_float_contract_predicate(self):
+        source = """
+            [[requires(n == -0.0)]] f64 same(f64 n) { return n; }
+            i32 main() { return same(0.0) == 0.0 ? 42 : 0; }
+        """
+        self.assertEqual(self.program(source), 42)
+        result = self.compile(source, "-S")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        module = self.src.with_suffix(".ll").read_text()
+        body = module.split("@cpn.0.same", 1)[1].split("}", 1)[0]
+        self.assertNotIn("fcmp", body)
+
+    def test_record_invariant_checks_stable_exposure(self):
+        record = """
+            [[invariant(amount >= 0)]]
+            class Balance {
+                i32 amount;
+              public:
+                Balance(i32 initial) { init amount(initial); }
+                i32 read() const { return amount; }
+                void set(i32 n) { amount = n; }
+            };
+        """
+        for body, code in (
+            ("Balance b(42); return b.read();", 42),
+            ("Balance b(-1); return 43;", -signal.SIGILL),
+            ("Balance b(42); b.set(-1); return 43;", -signal.SIGILL),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    self.program(record + "i32 main(){" + body + "}"), code
+                )
+        self.assertEqual(
+            self.program(
+                record + "i32 main(){Balance b(42); b.set(-1); return 42;}",
+                "--preset=Release",
+            ),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                [[invariant(n>0)]] struct Positive {
+                    i32 n;
+                    Positive(i32 value) { init n(value); }
+                };
+                i32 main(){Positive p(-1) -> {n=42;};return p.n;}
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                [[invariant(n>0)]] struct Positive {
+                    i32 n;
+                    static Positive invalid(0);
+                };
+                i32 main(){return 42;}
+            """),
+            -signal.SIGILL,
+        )
+
+    def test_invariants_for_inherited_and_tagged_objects(self):
+        self.assertEqual(
+            self.program("""
+                [[invariant(n>0)]] struct Base { i32 n(42); };
+                struct Derived : Base { i32 read() const { return n; } };
+                i32 main(){Derived d;d.n=0;return d.read();}
+            """),
+            -signal.SIGILL,
+        )
+        self.assertEqual(
+            self.program("""
+                bool valid(true);
+                [[invariant(valid)]] union Payload {default case Empty;};
+                i32 main(){valid=false;Payload v(Payload::Empty());return 42;}
+            """),
+            -signal.SIGILL,
+        )
+
+    def test_invariants_wait_for_the_receivers_stable_lifetime(self):
+        record = """
+            [[invariant(n>0)]] struct Positive {
+                i32 n;
+                constexpr i32 read() const { return n; }
+                Positive(i32 value) {
+                    init n(value);
+                    if (read() < 0) { n=42; }
+                }
+                Positive(i32 value, const<Positive>& witness) {
+                    init n(value);
+                    i32 observed(witness.read());
+                    n=42;
+                }
+                ~Positive() { n=-1; i32 during(read()); }
+            };
+            constexpr i32 compute(){Positive p(-1);return p.read();}
+            constexpr i32 result(compute());
+        """
+        for body, expected in (
+            ("Positive p(-1);return p.read()==result ? result : 1;", 42),
+            ("Positive p(42);p.n=-1;Positive q(42,p);return q.n;", -signal.SIGILL),
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    self.program(record + "i32 main(){" + body + "}"), expected
+                )
+
+    def test_invariants_bind_in_document_mode_and_validate_constant_values(self):
+        for source, message in (
+            ("[[invariant(1)]] struct Bad {};", "contract predicate requires bool"),
+            ("[[invariant(unknown)]] class Bad {};", "unknown name 'unknown'"),
+            ("[[invariant(true)]] declare struct Bad;", "inapplicable value contract"),
+        ):
+            with self.subTest(source=source):
+                r = self.compile(source, "--preset=Release", "--check")
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(message, r.stderr)
+        r = self.compile(
+            "[[invariant(n>0)]] struct Positive{i32 n;};constexpr Positive p(0);",
+            "--check",
+        )
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Positive invariant #1", r.stderr)
+
+    def test_invariant_lifetime_is_restored_across_whole_and_return(self):
+        self.assertEqual(
+            self.program("""
+                [[invariant(n>0)]] struct Positive {
+                    i32 n;
+                    i32 read() const { return n; }
+                };
+                struct Base {};
+                declare struct Derived;
+                declare void release(Derived& d);
+                struct Derived:Base {
+                    Complete base<Base>;
+                    ~Derived(){release(*this);}
+                };
+                void release(Derived& d) {
+                    Positive pending(42) -> {destroy_base<Base>(d);};
+                }
+                void early(){Positive pending(42) -> {return;};}
+                void leave_tail() {
+                    for(i32 i(0);i<2;++i) {Positive pending(42) -> {continue;};}
+                    while(true) {Positive pending(42) -> {break;};}
+                    Positive pending(42) -> {goto done;};
+                    done: return;
+                }
+                i32 main(){
+                    {Derived d;}early();leave_tail();
+                    Positive p(42);return p.read();
+                }
+            """),
+            42,
+        )
 
 
 if __name__ == "__main__":

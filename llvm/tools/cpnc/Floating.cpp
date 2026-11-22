@@ -88,7 +88,7 @@ public:
     auto *Local = F.B.CreateAnd(read(), Flags);
     write(F.B.CreateOr(Saved, Local));
     if (Traps)
-      F.guard(F.B.CreateIsNotNull(F.B.CreateAnd(Local, Traps)));
+      F.guard(F.B.CreateIsNotNull(F.B.CreateAnd(Local, Traps)), "numeric");
   }
   void check(llvm::APFloat::opStatus Status, const Token &At) const {
     unsigned IEEE = unsigned(Status);
@@ -145,6 +145,40 @@ llvm::Value *strictCast(llvm::IRBuilder<> &B, llvm::Value *Out,
   return B.CreateBitCast(
       B.CreateSelect(X.IsNaN, B.CreateOr(Sign, Body), R.Bits), Out->getType());
 }
+
+llvm::Value *nonraisingCompare(llvm::IRBuilder<> &B, llvm::CmpInst::Predicate P,
+                               llvm::Value *Left, llvm::Value *Right) {
+  NaNBits X(B, Left), Y(B, Right);
+  auto *Ty = X.Bits->getType();
+  auto *Sign = llvm::ConstantInt::get(
+      Ty, llvm::APInt::getSignMask(Ty->getIntegerBitWidth()));
+  auto OrderedKey = [&](llvm::Value *Bits) {
+    // Use a common encoding for both zeros and reverse the ordering of the
+    // negative encodings. The integer comparisons never update FP status.
+    auto *Zero = B.CreateIsNull(B.CreateAnd(Bits, B.CreateNot(Sign)));
+    auto *Key = B.CreateSelect(B.CreateIsNeg(Bits), B.CreateNot(Bits),
+                               B.CreateXor(Bits, Sign));
+    return B.CreateSelect(Zero, Sign, Key);
+  };
+  auto *Ordered = B.CreateNot(B.CreateOr(X.IsNaN, Y.IsNaN));
+  auto *A = OrderedKey(X.Bits), *D = OrderedKey(Y.Bits);
+  switch (P) {
+  case llvm::CmpInst::FCMP_OEQ:
+    return B.CreateAnd(Ordered, B.CreateICmpEQ(A, D));
+  case llvm::CmpInst::FCMP_UNE:
+    return B.CreateOr(B.CreateNot(Ordered), B.CreateICmpNE(A, D));
+  case llvm::CmpInst::FCMP_OLT:
+    return B.CreateAnd(Ordered, B.CreateICmpULT(A, D));
+  case llvm::CmpInst::FCMP_OLE:
+    return B.CreateAnd(Ordered, B.CreateICmpULE(A, D));
+  case llvm::CmpInst::FCMP_OGT:
+    return B.CreateAnd(Ordered, B.CreateICmpUGT(A, D));
+  case llvm::CmpInst::FCMP_OGE:
+    return B.CreateAnd(Ordered, B.CreateICmpUGE(A, D));
+  default:
+    llvm_unreachable("invalid predicate comparison");
+  }
+}
 } // namespace
 Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
                              bool Explicit) {
@@ -176,6 +210,8 @@ Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
       fail(At, "floating literal overflows " + T);
     return {T, llvm::ConstantFP::get(U.C, Number)};
   }
+  if (InPredicate)
+    fail(At, "contract predicate requires a nonraising floating conversion");
   if (!floating(V.Type)) {
     if (!Explicit || !integer(V.Type))
       fail(At, "cannot implicitly convert " + V.Type + " to " + T);
@@ -223,8 +259,10 @@ Value Frame::floatingBinary(const Node &N, Value L, Value R,
   R = floatingConvert(R, T, N.At);
   auto *X = L.IR, *Y = R.IR;
   auto &Op = N.Text;
-  FloatingOperation Policy(*this);
   if (Op == "+" || Op == "-" || Op == "*" || Op == "/") {
+    if (InPredicate)
+      fail(N.At, "contract predicate cannot perform floating arithmetic");
+    FloatingOperation Policy(*this);
     llvm::Value *Out;
     if (!IR) {
       auto Result = llvm::cast<llvm::ConstantFP>(X)->getValueAPF();
@@ -260,5 +298,8 @@ Value Frame::floatingBinary(const Node &N, Value L, Value R,
     P = llvm::CmpInst::FCMP_OGE;
   else
     fail(N.At, "unavailable floating operator '" + Op + "'");
+  if (InPredicate)
+    return {"bool", nonraisingCompare(B, P, X, Y)};
+  FloatingOperation Policy(*this);
   return {"bool", B.CreateFCmp(P, X, Y)};
 }

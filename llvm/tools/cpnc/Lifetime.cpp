@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 using namespace cpn;
 std::string Frame::directField(const Node &N) const {
   if (N.K == Node::Name) {
@@ -29,8 +30,13 @@ void Frame::endField(const std::string &Slot, const Token &At,
   B.CreateStore(B.getFalse(), It->second);
   Token Name = At;
   Name.Text = Slot;
-  if (!RunDestructor && Explicit)
-    checkAbandon(member(Self, Name).Type, At);
+  if (!RunDestructor && Explicit) {
+    auto Field = member(Self, Name);
+    checkAbandon(Field.Type, At);
+    ensureLive(Field, At);
+    if (Field.Slot)
+      retireStorage(Field, false);
+  }
   if (RunDestructor)
     dropChild(Self, member(Self, Name),
               llvm::StringRef(Slot).starts_with("$base:") ||
@@ -84,6 +90,7 @@ void Frame::endConstantField(const std::string &Slot, bool Run,
 }
 
 void Frame::constantDrop(Value Object, const Token &At) {
+  requirePredicateCleanup(Object.Type, At);
   auto Type = unconst(Object.Type);
   if (!U.aggregate(Type))
     return;
@@ -109,6 +116,8 @@ void Frame::constantDrop(Value Object, const Token &At) {
   Frame Body(U, Destructor, nullptr, Type + "::");
   Object.Readonly = false;
   Body.ConstantReceiver = &Object;
+  U.ConstantInvariantLifetimes.push_back(&Object);
+  auto End = llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
   std::set<std::string> Manual;
   for (size_t I = 0; I < R.Fields.size(); ++I) {
     auto &Name = R.Fields[I].Decl.Text;
@@ -127,6 +136,7 @@ void Frame::constantDrop(Value Object, const Token &At) {
   if (Destructor) {
     if (Destructor->Decl.Prototype || Destructor->Decl.Children.empty())
       fail(At, "constant destruction requires a destructor definition");
+    Body.checkContracts(true);
     Body.constructorBody(Destructor->Decl.Children.front());
   }
   if (U.Variants.count(Type)) {
@@ -152,9 +162,13 @@ void Frame::constantDrop(Value Object, const Token &At) {
   for (auto &Field : llvm::reverse(R.Fields))
     if (Body.ConstantMembersAlive.at(Field.Decl.Text))
       Body.endConstantField(Field.Decl.Text, true, At);
+  if (Destructor)
+    Body.checkContracts(false);
 }
 void Frame::retirement() {
   auto &R = U.Records.at(Self.Type);
+  auto *Previous =
+      pushInvariantLifetime(Self, nullptr, /*IsConstruction=*/false);
   installTables(Self);
   std::set<std::string> Manual;
   for (unsigned I = 0; I < R.Fields.size(); ++I) {
@@ -221,4 +235,5 @@ void Frame::retirement() {
   Live = true;
   for (auto I = R.Fields.rbegin(); I != R.Fields.rend(); ++I)
     endField(I->Decl.Text, I->Decl.At, true, false);
+  popInvariantLifetime(Previous, /*IsConstruction=*/false);
 }

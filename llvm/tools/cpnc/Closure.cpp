@@ -104,7 +104,7 @@ void Frame::bindCaptures() {
       Captures.Names[Name] = {Type, nullptr, Cell, F->Decl.Const};
   }
   Scopes[0].Names.erase("this");
-  Scopes.insert(Scopes.begin(), std::move(Captures));
+  Scopes.push_back(std::move(Captures));
 }
 Value Frame::callClosure(Value Receiver, const std::vector<Node> &Args,
                          const Token &At) {
@@ -141,7 +141,7 @@ Value Frame::closurePointer(const Value &Source, const std::string &T,
   if (!U.compatibleCallable(U.callableType(Op), Contract))
     fail(At, Op.MayWhole && !callableFlag(Contract, " whole")
                  ? "function pointer must preserve lifecycle_effect(whole)"
-                 : "incompatible closure borrow contract");
+                 : "incompatible closure callable contract");
   if (!R.ClosureEntry) {
     // The native entry omits the receiver. Preserve the result slot and
     // parameter objects supplied by the indirect caller.

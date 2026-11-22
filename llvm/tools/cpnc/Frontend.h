@@ -39,8 +39,11 @@ struct Options {
   std::set<unsigned> IntegerWidths{8, 16, 32, 64};
   std::set<std::string> FloatFormats{"f32", "f64"};
   std::string Overflow = "checked", DefaultInt = "i32";
+  bool ContractsEnabled = true, TrustedAssumptions = false;
+  std::string ContractValidation = "check", InvariantValidation = "check";
   bool ASCII = false, Check = false, IR = false;
   bool InterproceduralConstruction = true, InterproceduralEffects = true;
+  bool StrictEffectDiagnostics = false;
   Severity Minimum = Severity::Warning;
   std::set<std::string> Promote, Suppress;
   void diagnose(const Token &, Severity, llvm::StringRef Code,
@@ -112,6 +115,7 @@ struct Node {
     Linkage,
     Constraint,
     Requirement,
+    Contract,
     Union,
     Variant,
     Match,
@@ -119,7 +123,8 @@ struct Node {
   } K = Empty;
   Token At;
   std::string Text, Type;
-  std::vector<Node> Children, Params, Generics, TemplateArgs, Policies, Pattern;
+  std::vector<Node> Children, Params, Generics, TemplateArgs, Policies, Pattern,
+      Contracts;
   std::map<std::string, std::string> Settings;
   bool HasInitializer = false, ExplicitApplication = false, Grouped = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,
@@ -127,6 +132,12 @@ struct Node {
   Node() = default;
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
+using EffectSet = std::set<std::string>;
+using EffectBound = std::optional<EffectSet>;
+EffectSet bindEffectNames(llvm::StringRef, const std::vector<Node> &,
+                          bool HasReceiver, const Token &);
+std::string effectFlags(const EffectBound &);
+bool effectsFit(const EffectBound &Source, const EffectBound &Target);
 std::string parameterEffects(const std::set<unsigned> &NoEscape,
                              const std::set<unsigned> &Borrowed,
                              const std::set<unsigned> &Consumes);

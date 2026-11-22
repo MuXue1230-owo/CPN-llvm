@@ -215,9 +215,9 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
     if (S.K == Node::Goto)
       Flow.Jumps.emplace_back(&S, Live);
     if (S.K == Node::Block || S.K == Node::For || S.K == Node::Match ||
-        S.K == Node::Arm) {
+        S.K == Node::Arm || S.K == Node::Tail) {
       auto Nested = Live;
-      if (S.K == Node::Match || S.K == Node::Arm)
+      if (S.K == Node::Match || S.K == Node::Arm || S.K == Node::Tail)
         Nested.push_back(&S);
       for (auto &C : S.Children)
         walk(C, Nested);

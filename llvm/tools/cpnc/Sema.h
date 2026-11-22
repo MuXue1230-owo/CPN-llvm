@@ -66,6 +66,7 @@ class Frame;
 struct Family;
 struct Function {
   Node Decl;
+  EffectBound Effects;
   std::string Name, Result, Owner, Prefix, DefaultPrefix;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
@@ -75,6 +76,7 @@ struct Function {
   const Family *Origin = nullptr;
   llvm::Function *IR = nullptr, *BaseIR = nullptr;
   bool Emitting = false, Emitted = false;
+  bool ContractsBound = false;
   int Slot = -1;
   JumpCleanups ExitedLifetimes;
   bool MayWhole = false;
@@ -131,6 +133,7 @@ struct Record {
   unsigned layerEnteredSlot() const { return layerIndexSlot() + 1; }
   unsigned obligationsSlot() const { return tailSlot(VirtualCount); }
   Substitution Env;
+  std::optional<DefinitionSite> InvariantSite;
   bool Complete = false, Polymorphic = false, VirtualDestructor = false;
   std::vector<Function *> Virtuals;
   std::vector<DispatchTable> Tables;
@@ -202,13 +205,15 @@ struct Context {
   std::set<llvm::GlobalVariable *> ConstantObjects;
   std::vector<std::pair<std::string, Node>> Statics;
   std::map<llvm::Constant *, llvm::Constant *> ConstantPayloads;
+  std::vector<const Value *> ConstantInvariantLifetimes;
   void chargeConstant(const Token &, uint64_t Steps = 1);
   unsigned ConstantSteps = 0, ConstantDepth = 0, SpecializationDepth = 0;
   uint64_t Instantiations = 0, SolverSteps = 0;
   void chargeInstance(const Token &);
   void chargeSolver(const Token &);
   void checkNormalForm(const Node &);
-  void checkDomain(const Node &, const std::string &);
+  void checkDomain(const Node &, const std::string &,
+                   const Node *SymbolOwner = nullptr);
 
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, Family> Families;
@@ -239,9 +244,12 @@ struct Context {
   void defineFamilyMember(const Node &, const std::string &);
   void bindFamilyMember(const std::string &, const MemberBody &);
   void declareMembers(const std::string &, const std::string &);
+  void validateInvariants(const std::string &);
+  bool hasCheckedInvariant(const Function &) const;
   bool Whole = false;
   std::vector<std::pair<Function *, Token>> RestrictedPointers;
   void checkWholeContracts();
+  void checkEffects();
   void checkBorrowEscapes();
   std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
   llvm::Function *coordinator(const std::string &);
@@ -265,6 +273,7 @@ struct Context {
   void unit(const std::vector<Node> &, std::string Prefix = "");
   void emit(Function &);
   void emitBody(Function &, llvm::Function *, bool);
+  void bindContracts(Function &);
   JumpCleanups validate(const Node &, const std::string &,
                         const std::string &Owner = "",
                         const Node *FamilyOwner = nullptr);
@@ -285,7 +294,18 @@ std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
+bool sameGenericValueContracts(const Node &, const Node &);
+EffectBound genericEffectBound(const Node &, bool HasReceiver);
 std::set<llvm::StringRef> callableFlags(llvm::StringRef);
+EffectBound callableEffects(llvm::StringRef);
+void describeEffectCall(llvm::CallBase &, const EffectBound &, unsigned Headers,
+                        bool Receiver = false,
+                        llvm::Function *Contract = nullptr,
+                        llvm::ArrayRef<unsigned> ValueAggregates = {});
+std::string parameterBinding(const Node &, size_t);
+void normalizeContracts(Node &);
+bool sameContracts(const Node &, const Node &);
+bool compatibleValueOverride(const Node &Derived, const Node &Base);
 std::vector<std::string> splitArguments(llvm::StringRef);
 bool betterTypePattern(const Node &, const Node &);
 bool betterPattern(const Node &, const Node &);
@@ -372,13 +392,15 @@ public:
   llvm::Value *resultAddress(const std::string &, const Token &);
   bool Live = true, RequireNoexcept = false, BaseLayer = false;
   bool TypeQuery = false;
+  bool InPredicate = false;
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
   Value load(Value);
-  Value materialize(Value, const Token &, llvm::Value *Dest = nullptr);
+  Value materialize(Value, const Token &, llvm::Value *Dest = nullptr,
+                    bool CheckInvariant = true);
   void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &,
-                bool AsBase = false);
+                bool AsBase = false, bool CheckInvariant = true);
   Value bindReference(Value, const std::string &, const Token &);
   Value callResult(const std::string &, llvm::Value *, const Token &,
                    llvm::Value *Storage);
@@ -409,6 +431,13 @@ public:
                           const Token &);
   Value binary(const Node &, Value, Value);
   Value boolean(const Node &);
+  void evaluatePredicate(const Node &, llvm::StringRef Declaration,
+                         unsigned Ordinal, llvm::StringRef Mode,
+                         bool ValidateOnly, bool OwnBoundary = true);
+  void checkContracts(bool Entry, Value Result = {}, bool ValidateOnly = false);
+  void requireObserver(const EffectBound &, const Token &,
+                       const Function * = nullptr);
+  void requirePredicateCleanup(const std::string &Type, const Token &);
   Value eval(const Node &, std::string Expected = "",
              llvm::Value *Dest = nullptr);
   Value constantEval(const Node &);
@@ -453,6 +482,21 @@ public:
   void localType(const Node &);
   void runConstructionTail(Value, const Node *, bool BoundSlots = false);
   void checkAccess(const Node &, const std::string &Owner, const Token &);
+  void evaluateInvariants(Value, bool ValidateOnly, bool OwnBoundary = false);
+  void checkInvariants(Value, bool IncludeBases = false,
+                       bool OwnBoundary = false);
+  void checkMethodInvariant(bool Entry);
+  struct PendingInvariantLifetime {
+    llvm::Value *Previous;
+    size_t Depth;
+    std::optional<SourcePosition> Tail;
+  };
+  std::vector<PendingInvariantLifetime> InvariantConstructionLifetimes;
+  llvm::Value *pushInvariantLifetime(const Value &, const Node *Tail = nullptr,
+                                     bool IsConstruction = true);
+  void popInvariantLifetime(llvm::Value *, bool IsConstruction = true);
+  void exitInvariantConstructionLifetimes(
+      size_t Depth = 0, const std::set<SourcePosition> *Exited = nullptr);
   Function *checkSelected(Function *, const Token &);
   Value member(Value, const Token &);
   void stmt(const Node &);
@@ -478,6 +522,7 @@ public:
   void joinStorage(const std::map<std::string, int> &);
   static bool usesStorage(const Node &);
   void cleanup(size_t, const std::set<SourcePosition> *Exited = nullptr);
+  void cleanupScope(size_t, const std::set<SourcePosition> *Exited = nullptr);
   void endExpression(size_t From = 0);
   void consume(Value);
   bool adjust(Value &, const std::string &, const Token &, bool Emit = true);
@@ -487,7 +532,7 @@ public:
   void bindCaptures();
   Value indirect(Value, const std::vector<Node> &, const Token &);
   Value endDivergentCall();
-  void guard(llvm::Value *);
+  void guard(llvm::Value *, llvm::StringRef Kind = {});
   void branch(llvm::BasicBlock *);
   const Family *constraint(const std::string &) const;
   bool predicate(const Node &);
@@ -497,7 +542,8 @@ public:
                                              std::string &);
   const Case *findCase(const std::string &, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &,
-                llvm::Value *Dest = nullptr, bool Default = false);
+                llvm::Value *Dest = nullptr, bool Default = false,
+                bool CheckInvariant = true);
   void visitPayload(Value, llvm::function_ref<void(const Case &)>);
   void dropPayload(Value);
   void transferPayload(Value, llvm::Value *, SpecialOperation, const Token &);
@@ -520,7 +566,7 @@ public:
                              const std::vector<Node> &, Value, Function *);
   Value constantTemporary(Value);
   Value constantSelf(const Token &);
-  Value constantCopy(Value, const Token &);
+  Value constantCopy(Value, const Token &, bool CheckInvariant = true);
   Value constantConstructor(Function &, const std::vector<Value> &,
                             const Token &, const Node *);
   Value constantAggregate(const std::string &, const std::vector<Node> &,

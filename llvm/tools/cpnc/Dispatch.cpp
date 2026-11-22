@@ -107,6 +107,7 @@ void Context::buildTables(const std::string &Name,
           D->Initializes != (*It)->Initializes ||
           D->RequiresAlive != (*It)->RequiresAlive ||
           ((*It)->Decl.Noexcept && !D->Decl.Noexcept) ||
+          !compatibleValueOverride(D->Decl, (*It)->Decl) ||
           !compatibleCallable(callableType(*D), callableType(**It)))
         fail(D->Decl.At, "invalid override of inherited virtual slot");
       D->Slot = It - R.Virtuals.begin();
@@ -335,6 +336,7 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto T = element(Ptr.Type);
   if (!U.Signatures.count(T))
     fail(At, "function-pointer contract required");
+  requireObserver(callableEffects(T), At);
   if (F && callableFlag(T, " whole"))
     F->MayWhole = true;
   if (RequireNoexcept && !callableFlag(T, " noexcept"))
@@ -388,6 +390,12 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto Metadata = openPointerCall(Ptr.IR, Sig.front(),
                                   llvm::ArrayRef(Sig).drop_front(), Actual);
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  llvm::SmallVector<unsigned> ValueAggregates;
+  for (unsigned I = 0; I < Args.size(); ++I)
+    if (U.aggregate(Sig[I + 1]))
+      ValueAggregates.push_back(I);
+  describeEffectCall(*Call, callableEffects(T), Storage ? 1 : 0, false, nullptr,
+                     ValueAggregates);
   if (Sig[0] == "never") {
     Call->setDoesNotReturn();
     return endDivergentCall();

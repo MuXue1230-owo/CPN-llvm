@@ -2,6 +2,7 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
+#include <iterator>
 
 using namespace cpn;
 using llvm::StringRef;
@@ -345,10 +346,21 @@ class Parser {
           S += "...";
       }
       S += ")";
-      if (eat("noexcept"))
+      bool Noexcept = eat("noexcept");
+      if (Noexcept)
         S += " noexcept";
       std::set<unsigned> NoEscape, Borrowed, Consumes;
-      for (const auto &[Key, Value] : attributes()) {
+      auto Attrs = attributes();
+      if (!Attrs.Contracts.empty())
+        fail(T, "value predicates require an owning declaration");
+      EffectBound Effects;
+      for (const auto &[Key, Value] : Attrs) {
+        if (Key == "effects") {
+          Effects = bindEffectNames(Value, Parameters, false, T);
+          if (Effects->count("throw") && Noexcept)
+            fail(T, "noexcept contradicts a throw effect");
+          continue;
+        }
         if (Key == "lifecycle_effect") {
           S += " whole";
           continue;
@@ -368,7 +380,8 @@ class Parser {
           Positions.insert(It->second);
         }
       }
-      S += parameterEffects(NoEscape, Borrowed, Consumes);
+      S +=
+          parameterEffects(NoEscape, Borrowed, Consumes) + effectFlags(Effects);
       closeAngle();
       S += ">";
     } else {
@@ -447,6 +460,7 @@ class Parser {
       N.Params = params();
       N.Const = !eat("mutable");
       N.Noexcept = eat("noexcept");
+      applyAttributes(N, attributes());
       N.Children = {block()};
     } else if (eat("configured")) {
       N = Node(Node::Configured, T);
@@ -891,12 +905,13 @@ class Parser {
       ++I;
     while (peek(I).Text == "[" && peek(I + 1).Text == "[") {
       I += 2;
-      while (!peek(I).Text.empty() &&
-             !(peek(I).Text == "]" && peek(I + 1).Text == "]"))
-        ++I;
-      if (peek(I).Text.empty())
-        return false;
-      I += 2;
+      unsigned Brackets = 2;
+      do {
+        const auto &Text = peek(I++).Text;
+        if (Text.empty())
+          return false;
+        Brackets += (Text == "[") - (Text == "]");
+      } while (Brackets);
     }
     if (peek(I).Text == "override")
       ++I;
@@ -1012,17 +1027,67 @@ class Parser {
         D.Children.push_back(block());
     }
   }
-  using Attributes = std::map<std::string, std::string>;
+  struct Attributes : std::map<std::string, std::string> {
+    struct Predicate {
+      Token Name;
+      size_t Begin, End;
+    };
+    std::vector<Predicate> Contracts;
+  };
+  std::string effectBound() {
+    if (eat("none"))
+      return "none";
+    std::string Bound;
+    do {
+      auto Item = take();
+      auto K = Item.Text;
+      std::string Effect = K;
+      if (K == "read" || K == "write" || K == "allocate" || K == "deallocate" ||
+          K == "trap") {
+        expect("(");
+        auto Region = is("this") ? take() : name();
+        if (K == "trap" && Region.Text != "any" && Region.Text != "contract" &&
+            Region.Text != "numeric")
+          fail(Region, "unknown trap kind");
+        Effect += ":" + Region.Text;
+        expect(")");
+      } else if (!std::set<std::string>{"volatile", "atomic", "synchronize",
+                                        "io", "block", "spawn", "suspend",
+                                        "cancel_point", "throw", "fp_status",
+                                        "fp_control", "whole", "foreign"}
+                      .count(K))
+        fail(Item, "unknown effect '" + K + "'");
+      if (!Bound.empty())
+        Bound += ",";
+      Bound += Effect;
+    } while (eat(","));
+    return Bound;
+  }
   Attributes attributes() {
     Attributes Result;
     while (is("[") && peek(1).Text == "[") {
       take();
       take();
       do {
-        auto Key = name();
+        auto Key = is("requires") ? take() : name();
         expect("(");
+        if (Key.Text == "requires" || Key.Text == "ensures" ||
+            Key.Text == "invariant") {
+          size_t Begin = Pos;
+          unsigned Parentheses = 1;
+          do {
+            auto Text = take().Text;
+            Parentheses += (Text == "(") - (Text == ")");
+          } while (Parentheses);
+          Result.Contracts.push_back({std::move(Key), Begin, Pos - 1});
+          continue;
+        }
         std::string Value;
-        if (Key.Text == "static_id") {
+        if (Key.Text == "effects")
+          Value = effectBound();
+        else if (Key.Text == "admission_effects")
+          fail(Key, "admission_effects requires an asynchronous callable");
+        else if (Key.Text == "static_id") {
           auto ID = take();
           if (!StringRef(ID.Text).starts_with("\""))
             fail(ID, "static_id requires a string literal");
@@ -1068,18 +1133,64 @@ class Parser {
     return Result;
   }
   void applyAttributes(Node &D, const Attributes &Attrs) {
+    if (!Attrs.Contracts.empty()) {
+      // Leading attributes precede generic and parameter declarations.
+      // Parse their expressions with the type names of the owning declaration.
+      llvm::SaveAndRestore Cursor(Pos);
+      llvm::SaveAndRestore SavedTypes(Types);
+      llvm::SaveAndRestore SavedParameters(TypeParameters);
+      llvm::SaveAndRestore SavedHidden(HiddenTypes);
+      for (const auto &G : D.Generics) {
+        if (G.K == Node::TypeParam) {
+          Types.insert(G.Text);
+          TypeParameters.insert(G.Text);
+          HiddenTypes.erase(G.Text);
+        } else {
+          HiddenTypes.insert(G.Text);
+        }
+      }
+      for (const auto &Param : D.Params)
+        if (!Param.Text.empty())
+          HiddenTypes.insert(Param.Text);
+      if (D.K == Node::Lambda)
+        for (const auto &Capture : D.TemplateArgs)
+          HiddenTypes.insert(Capture.Text);
+      const bool Record =
+          !D.Prototype && (D.K == Node::Record || D.K == Node::Union);
+      const bool Callable = D.K == Node::Function || D.K == Node::Constructor ||
+                            D.K == Node::Destructor || D.K == Node::Lambda;
+      std::vector<Node> Clauses;
+      for (const auto &Predicate : Attrs.Contracts) {
+        const auto &Name = Predicate.Name;
+        if (Name.Text == "invariant" ? !Record : !Callable)
+          fail(Name, "inapplicable value contract");
+        bool HideResult =
+            Name.Text == "ensures" && HiddenTypes.insert("return_value").second;
+        Pos = Predicate.Begin;
+        Node Clause(Node::Contract, Name);
+        Clause.Children.push_back(expr());
+        if (Pos != Predicate.End)
+          fail(peek(), "unexpected token in contract predicate");
+        if (HideResult)
+          HiddenTypes.erase("return_value");
+        Clauses.push_back(std::move(Clause));
+      }
+      D.Contracts.insert(D.Contracts.begin(),
+                         std::make_move_iterator(Clauses.begin()),
+                         std::make_move_iterator(Clauses.end()));
+    }
     for (const auto &[Key, Value] : Attrs) {
       if (Key == "noescape" || Key == "returns_borrowed_from" ||
           Key == "consumes") {
-        if (D.K != Node::Function)
+        if (D.K != Node::Function && D.K != Node::Lambda)
           fail(D.At, "borrow contract requires a function");
       } else if (Key == "initializes" || Key == "requires_initialized") {
         if (D.K != Node::Function)
           fail(D.At, "construction-state contract requires an instance method");
-      } else if (Key == "lifecycle_effect") {
+      } else if (Key == "effects" || Key == "lifecycle_effect") {
         if (D.K != Node::Function && D.K != Node::Destructor &&
-            D.K != Node::Constructor)
-          fail(D.At, "lifecycle_effect requires a callable");
+            D.K != Node::Constructor && D.K != Node::Lambda)
+          fail(D.At, Key + " requires a callable");
       } else if (D.K != Node::Object)
         fail(D.At, "static attribute requires an object");
       if (!D.Settings.emplace(Key, Value).second)
@@ -1294,7 +1405,8 @@ class Parser {
         // Leading attributes belong to special members as well as ordinary
         // member declarations. The latter keep the same decoration order.
         auto Leading = attributes();
-        if (!Leading.empty() && is("configured"))
+        const bool HasLeading = !Leading.empty() || !Leading.Contracts.empty();
+        if (HasLeading && is("configured"))
           fail(peek(), "configuration wrappers must precede attributes");
         bool SpecialProto =
             is("declare") &&
@@ -1306,6 +1418,8 @@ class Parser {
         bool Virt = is("virtual") && peek(1).Text == "~" && eat("virtual");
         Node D;
         if (is("Complete")) {
+          if (HasLeading)
+            fail(peek(), "attributes are unavailable on destruction markers");
           take();
           Node I(Node::Init, peek());
           I.Type = "Complete";
@@ -1499,8 +1613,14 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (V != "Debug" && V != "Release" && V != "MinimalDebug" &&
         V != "MinimalRelease")
       fail(N.At, "unknown preset");
+    O.ContractsEnabled = !StringRef(V).starts_with("Minimal");
+    O.ContractValidation = V == "Debug" ? "check" : "document";
+    O.InvariantValidation =
+        !O.ContractsEnabled ? "disabled" : O.ContractValidation;
+    O.TrustedAssumptions = false;
     O.InterproceduralConstruction = O.InterproceduralEffects =
         StringRef(V).ends_with("Debug");
+    O.StrictEffectDiagnostics = false;
     O.FPProfile = StringRef(V).ends_with("Debug") ? "strict" : "native";
     O.Overflow = StringRef(V).ends_with("Debug") ? "checked" : "native";
   }
@@ -1529,6 +1649,25 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (K == "compilation.modules" || K == "compilation.separate" ||
         K == "tooling.contract_export")
       continue;
+    if (StringRef(K).starts_with("contracts.")) {
+      if (Scope > ConfigScope::Declaration)
+        fail(N.At, "CFG001: contract policy binds at declaration scope");
+      if (K == "contracts.enabled" || K == "contracts.trusted_assumptions") {
+        if (V != "true" && V != "false")
+          fail(N.At, "CFG001: expected Boolean contract setting");
+        (K == "contracts.enabled" ? O.ContractsEnabled : O.TrustedAssumptions) =
+            V == "true";
+      } else if (K == "contracts.validation" &&
+                 (V == "check" || V == "prove" || V == "document" ||
+                  V == "trusted"))
+        O.ContractValidation = V;
+      else if (K == "contracts.invariants" &&
+               (V == "check" || V == "document" || V == "disabled"))
+        O.InvariantValidation = V;
+      else
+        fail(N.At, "CFG001: invalid contract policy");
+      continue;
+    }
     if (K == "construction.analysis" || K == "effects.inference") {
       if (Scope > ConfigScope::Declaration)
         fail(N.At,
@@ -1538,6 +1677,19 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       (K == "construction.analysis" ? O.InterproceduralConstruction
                                     : O.InterproceduralEffects) =
           V == "interprocedural";
+      continue;
+    }
+    if (K == "effects.opaque_default" || K == "effects.diagnostics") {
+      if (Scope > ConfigScope::Declaration)
+        fail(N.At,
+             "CFG001: " + K + " cannot be overridden below declaration scope");
+      if (K == "effects.opaque_default" && V != "conservative")
+        fail(N.At, "CFG001: invalid opaque effect policy");
+      if (K == "effects.diagnostics") {
+        if (V != "default" && V != "strict")
+          fail(N.At, "CFG001: invalid effect diagnostic policy");
+        O.StrictEffectDiagnostics = V == "strict";
+      }
       continue;
     }
     if (K == "source.unicode_version") {

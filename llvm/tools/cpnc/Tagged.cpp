@@ -88,7 +88,7 @@ void Context::tagged(const Node &D, const std::string &Name,
       Frame Check(*this, nullptr, Probe, Name + "::");
       Check.B.SetInsertPoint(Check.block("entry"));
       Check.variant(Case, {}, Case.Decl.At, Check.allocate(Name, Case.Decl.At),
-                    true);
+                    true, false);
       Probe->eraseFromParent();
     }
   }
@@ -109,7 +109,8 @@ llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
 }
 
 Value Frame::variant(const Case &C, const std::vector<Node> &Args,
-                     const Token &At, llvm::Value *Dest, bool Default) {
+                     const Token &At, llvm::Value *Dest, bool Default,
+                     bool CheckInvariant) {
   if (!Default && Args.size() != C.Types.size())
     fail(At, "wrong union payload arity");
   if (!IR) {
@@ -123,6 +124,8 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     }
     Value V{C.Owner,
             packVariant(C, llvm::ConstantStruct::get(C.Payload, Fields), At)};
+    if (CheckInvariant)
+      checkInvariants(V);
     V.Prvalue = V.Expiring = true;
     return V;
   }
@@ -138,6 +141,8 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
   }
   B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(U.ir(C.Owner), Ptr, 0));
   Value V{C.Owner, B.CreateLoad(U.ir(C.Owner), Ptr), Ptr};
+  if (CheckInvariant)
+    checkInvariants(V);
   if (!Dest) {
     V.Prvalue = V.Expiring = true;
     Temps.push_back(V);
@@ -318,7 +323,8 @@ void Frame::beginUnionConstructor() {
   auto Default = U.DefaultCase.find(F->Owner);
   if (Default == U.DefaultCase.end())
     fail(F->Decl.At, "union construction requires a selected case");
-  variant(U.Cases.at(Default->second), {}, F->Decl.At, Self.Address, true);
+  variant(U.Cases.at(Default->second), {}, F->Decl.At, Self.Address, true,
+          false);
 }
 void Frame::dropPayload(Value Object) {
   visitPayload(Object, [&](const Case &C) {

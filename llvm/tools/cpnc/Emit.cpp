@@ -182,8 +182,8 @@ void Frame::bindParams() {
       readReferent(V, incomingPointerCell(J + 1));
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
-    if (!P.Text.empty())
-      Scopes[0].Names[P.Text] = V;
+    if (!P.Text.empty() || !F->Decl.Contracts.empty())
+      Scopes[0].Names[parameterBinding(F->Decl, J)] = V;
   }
 }
 void Frame::bindInlineParams(const std::vector<Value> &Actual) {
@@ -247,8 +247,8 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual) {
     }
     if (IR)
       V.IR = nullptr;
-    if (!Param.Text.empty())
-      Scopes.front().Names[Param.Text] = V;
+    if (!Param.Text.empty() || !F->Decl.Contracts.empty())
+      Scopes.front().Names[parameterBinding(F->Decl, I)] = V;
     if (!Default.Text.empty())
       Defaults.Names[Default.Text] = V;
   }
@@ -428,6 +428,11 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
                                    Value{Expected, nullptr, Dest});
   auto &A = N.Children;
   auto Op = N.Text;
+  if (InPredicate && (N.K == Node::Lambda ||
+                      (N.K == Node::Unary && (Op == "++" || Op == "--")) ||
+                      (N.K == Node::Binary && assignment(Op))))
+    fail(N.At,
+         "contract predicate cannot mutate objects or construct closures");
   if (!IR && U.ConstantDepth)
     U.chargeConstant(N.At);
   if (!IR && ((N.K == Node::Unary && (Op == "++" || Op == "--")) ||
@@ -1263,7 +1268,8 @@ void Frame::admitArguments(CallArguments &A, Function *D, const Token &At) {
 }
 Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
                     Value Receiver, bool Prepared) {
-  if (F && IR)
+  requireObserver(D.Effects, T, &D);
+  if (F && IR && !TypeQuery)
     F->Calls.insert(&D);
   if (RequireNoexcept && !D.Decl.Noexcept)
     fail(T, "expression requires a nonthrowing call");
@@ -1291,16 +1297,22 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       CF.ConstantReceiver = &Receiver;
     }
     CF.bindInlineParams(Actual);
+    CF.checkMethodInvariant(true);
+    CF.checkContracts(true);
     try {
       CF.stmt(D.Decl.Children.front());
     } catch (const ConstantTransfer &R) {
       if (R.Kind != Node::Return)
         throw;
+      CF.checkContracts(false, R.Result);
       CF.endConstantScope();
+      CF.checkMethodInvariant(false);
       return R.Result;
     }
     if (D.Result == "void") {
+      CF.checkContracts(false);
       CF.endConstantScope();
+      CF.checkMethodInvariant(false);
       return {"void"};
     }
     fail(T, "constant invocation completed without a result");
@@ -1386,6 +1398,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   }
   auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
   auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values);
+  if (D.Slot >= 0)
+    describeEffectCall(*Call, D.Effects, ResultStorage ? 1 : 0, true, D.IR);
   Call->setAttributes(D.IR->getAttributes());
   if (D.Result == "never")
     return endDivergentCall();
@@ -1533,6 +1547,11 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
   auto Name = C.Text;
+  if (InPredicate &&
+      (Name == "destroy" || Name == "abandon" || Name == "construct_at" ||
+       Name == "storage_of" || Name == "destroy_base" ||
+       Name == "abandon_base" || Name == "transfer_destruction"))
+    fail(C.At, "lifecycle operations are unavailable in contract predicates");
   if (const auto *Case = findCase(Name, C.At))
     return variant(*Case, Args, C.At,
                    (Case->Owner == ExpressionDestination.Type ||
@@ -1717,6 +1736,8 @@ void Frame::runConstructionTail(Value Object, const Node *Tail,
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
+  if (InPredicate && U.aggregate(T))
+    fail(At, "contract predicates cannot construct aggregate temporaries");
   if (!Args.empty() && Args.back().K == Node::Tail)
     return construct(T, {Args.begin(), Args.end() - 1}, At, Dest, &Args.back(),
                      AsBase);
@@ -1812,11 +1833,13 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (!IR)
       fail(At, "union construction requires object storage");
     auto *Ptr = Dest ? Dest : allocate(T, At);
+    Value Result{T, nullptr, Ptr};
+    auto *Previous = pushInvariantLifetime(Result, Tail);
     auto Group = visibleOverloads(T + "::$ctor");
     auto A = evaluateArguments(
         Args, Group.size() == 1 ? Group.front() : nullptr, {T, nullptr, Ptr});
     if (A.Values.size() == 1 && A.Values[0].Type == T) {
-      materialize(A.Values.front(), At, Ptr);
+      materialize(A.Values.front(), At, Ptr, false);
     } else if (Args.empty() &&
                !llvm::any_of(Group,
                              [](const Function *D) {
@@ -1824,7 +1847,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                                       !D->Decl.Params.front().Children.empty();
                              }) &&
                U.DefaultCase.count(T)) {
-      variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Ptr, true);
+      variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, Ptr, true, false);
     } else {
       if (Group.empty())
         fail(At, "union construction requires a selected case");
@@ -1833,8 +1856,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       admitArguments(A, D, At);
       invoke(*D, std::move(A.Values), At, Receiver, true);
     }
-    Value Result{T, nullptr, Ptr};
     runConstructionTail(Result, Tail);
+    popInvariantLifetime(Previous);
+    checkInvariants(Result);
     Result.IR = B.CreateLoad(Ty, Ptr);
     if (!Dest) {
       Result.Prvalue = Result.Expiring = true;
@@ -1847,6 +1871,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     Value Obj{T, nullptr, Ptr};
     auto &R = U.Records.at(T);
     Obj.BaseView = AsBase;
+    auto *Previous = pushInvariantLifetime(Obj, Tail);
     if (!AsBase)
       bindVirtualLayout(Obj);
     enterOwnerLayer(Obj);
@@ -1878,9 +1903,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         transfer(Actual[0], Ptr,
                  Actual[0].Expiring ? SpecialOperation::MoveConstruct
                                     : SpecialOperation::CopyConstruct,
-                 At, true);
+                 At, true, false);
       else
-        materialize(Actual[0], At, Ptr);
+        materialize(Actual[0], At, Ptr, false);
     } else {
       Function Aggregate;
       Aggregate.Owner = T;
@@ -1911,11 +1936,14 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Root.Self = Obj;
           Root.Scopes[0].Names["this"] = {T + "*", Ptr};
           Root.bindInlineParams(Actual);
+          Root.checkContracts(true);
           Root.InlineReturn = block("ctor.done");
           Construction Plan(Root, *D, Obj, Tail, this);
           Plan.run(Root);
-          if (Root.Live)
+          if (Root.Live) {
+            Root.checkContracts(false);
             Root.cleanup(0);
+          }
           Root.branch(Root.InlineReturn);
           B.SetInsertPoint(Root.InlineReturn);
           Producers.clear();
@@ -1973,6 +2001,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (!Producers.empty())
       fail(At, "unknown initialization target");
     runConstructionTail(Obj, Tail, true);
+    popInvariantLifetime(Previous);
+    checkInvariants(Obj);
     if (!Dest)
       Temps.push_back(Obj);
     if (!AsBase)
@@ -2010,6 +2040,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
 void Frame::drop(Value V, bool AsBase) {
   if (!IR || !V.Address)
     return;
+  requirePredicateCleanup(V.Type, F ? F->Decl.At : Token{});
   if (!V.Storage.empty() && Extents.count(V.Storage) &&
       Extents.at(V.Storage).Address == V.Address &&
       Registrations.count(V.Storage)) {
@@ -2067,15 +2098,17 @@ void Frame::dropLayer(Value V, bool AsBase) {
 }
 void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
   for (size_t I = Scopes.size(); I > From; --I)
-    for (auto V = Scopes[I - 1].Drops.rbegin(); V != Scopes[I - 1].Drops.rend();
-         ++V) {
-      if (Exited && !Exited->count(V->DeclaredAt))
-        continue;
-      drop(*V);
-      if (V->Slot && !V->Subobject && Extents.count(V->Storage) &&
-          Extents.at(V->Storage).Address == V->Address)
-        B.CreateCall(U.M.getFunction("cpn.slot.release"), {V->Slot});
-    }
+    cleanupScope(I - 1, Exited);
+}
+void Frame::cleanupScope(size_t I, const std::set<SourcePosition> *Exited) {
+  for (const auto &V : llvm::reverse(Scopes[I].Drops)) {
+    if (Exited && !Exited->count(V.DeclaredAt))
+      continue;
+    drop(V);
+    if (V.Slot && !V.Subobject && Extents.count(V.Storage) &&
+        Extents.at(V.Storage).Address == V.Address)
+      B.CreateCall(U.M.getFunction("cpn.slot.release"), {V.Slot});
+  }
 }
 void Frame::consume(Value V) {
   if (!IR && V.ConstantTemporary) {
@@ -2406,8 +2439,11 @@ void Frame::constructorBody(const Node &Body) {
     if (T.Kind != Node::Return)
       throw;
   }
-  if (!IR)
+  if (!IR) {
+    if (F->Decl.K != Node::Destructor)
+      checkContracts(false);
     endConstantScope();
+  }
 }
 void Frame::stmt(const Node &N) {
   auto &A = N.Children;
@@ -2476,7 +2512,10 @@ void Frame::stmt(const Node &N) {
   if (N.K == Node::Return && InlineReturn) {
     if (!A.empty())
       fail(N.At, "constructor cannot return a value");
-    cleanup(0);
+    cleanup(1);
+    checkContracts(false);
+    cleanupScope(0);
+    exitInvariantConstructionLifetimes();
     branch(InlineReturn);
     B.SetInsertPoint(block("unreachable"));
     Live = false;
@@ -2531,8 +2570,6 @@ void Frame::stmt(const Node &N) {
         V.Prvalue = V.Expiring = true;
       }
     }
-    if (IR)
-      publishPointerResult(V);
     if (Transaction && Live)
       Transaction->checkReturn(N.At);
     if (!IR) {
@@ -2540,7 +2577,12 @@ void Frame::stmt(const Node &N) {
       throw ConstantTransfer{Node::Return, V, {}};
     }
     endExpression();
-    cleanup(0);
+    cleanup(1);
+    checkContracts(false, V);
+    cleanupScope(0);
+    exitInvariantConstructionLifetimes();
+    checkMethodInvariant(false);
+    publishPointerResult(V);
     if (V.Type == "void" || Result)
       B.CreateRetVoid();
     else
@@ -2791,6 +2833,7 @@ void Frame::stmt(const Node &N) {
       auto *Dest = N.K == Node::Break ? I->Break : I->Continue;
       if (Dest && (N.Text.empty() || N.Text == I->Name)) {
         cleanup(I->Depth);
+        exitInvariantConstructionLifetimes(I->Depth);
         branch(Dest);
         I->BreakUsed |= N.K == Node::Break && Live;
         B.SetInsertPoint(block("unreachable"));
@@ -2809,7 +2852,9 @@ void Frame::stmt(const Node &N) {
     if (!Target)
       Target = block("label." + N.Text);
     if (N.K == Node::Goto) {
-      cleanup(0, &F->ExitedLifetimes.at({N.At.Line, N.At.Column}));
+      const auto &Exited = F->ExitedLifetimes.at({N.At.Line, N.At.Column});
+      cleanup(0, &Exited);
+      exitInvariantConstructionLifetimes(0, &Exited);
       branch(Target);
       B.SetInsertPoint(block("unreachable"));
       Live = false;

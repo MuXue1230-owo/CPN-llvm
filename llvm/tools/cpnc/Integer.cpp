@@ -143,15 +143,23 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
     fail(At, "no implicit lossless conversion from " + V.Type + " to " + T);
   return {T, B.CreateIntCast(V.IR, U.ir(T), signedType(V.Type))};
 }
-void Frame::guard(llvm::Value *Bad) {
+void Frame::guard(llvm::Value *Bad, StringRef Kind) {
   if (auto *C = dyn_cast<ConstantInt>(Bad); C && C->isZero())
     return;
+  if (InPredicate && !Kind.empty())
+    fail({}, "contract predicate has a potentially failing " + Kind.str() +
+                 " operation");
   if (!IR)
     fail({}, "operation requires runtime evaluation");
   auto *Trap = block("trap"), *OK = block("valid");
   B.CreateCondBr(Bad, Trap, OK);
   B.SetInsertPoint(Trap);
-  B.CreateCall(Intrinsic::getOrInsertDeclaration(&U.M, Intrinsic::trap));
+  auto *Call =
+      B.CreateCall(Intrinsic::getOrInsertDeclaration(&U.M, Intrinsic::trap));
+  if (!Kind.empty())
+    Call->setMetadata(
+        "cpn.effect",
+        MDNode::get(U.C, MDString::get(U.C, "trap:" + Kind.str())));
   B.CreateUnreachable();
   B.SetInsertPoint(OK);
 }
@@ -254,7 +262,8 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   if (Shift && !isa<ConstantInt>(D.IR)) {
     unsigned Bits = std::max(8u, WB);
     auto *Count = B.CreateIntCast(D.IR, B.getIntNTy(Bits), signedType(D.Type));
-    guard(B.CreateICmpUGE(Count, ConstantInt::get(Count->getType(), W)));
+    guard(B.CreateICmpUGE(Count, ConstantInt::get(Count->getType(), W)),
+          "numeric");
   }
   llvm::Value *V = nullptr;
   if (Op == "&")
@@ -268,7 +277,7 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   else if (Op == "/" || Op == "%") {
     if (auto *C = dyn_cast<ConstantInt>(R); C && C->isZero())
       fail(At, "division by zero");
-    guard(B.CreateICmpEQ(R, ConstantInt::get(Ty, 0)));
+    guard(B.CreateICmpEQ(R, ConstantInt::get(Ty, 0)), "numeric");
     auto *Big = B.getIntNTy(W + 1);
     auto *X = B.CreateIntCast(L, Big, Signed),
          *Y = B.CreateIntCast(R, Big, Signed);
@@ -280,7 +289,7 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
       if (Opt.Overflow == "saturating")
         Q = B.CreateSelect(Overflow, Max, Q);
       else if (Opt.Overflow != "wrapping")
-        guard(Overflow);
+        guard(Overflow, "numeric");
     }
     V = B.CreateTrunc(Q, Ty);
   } else if (Op == "+" || Op == "-" || Op == "*" || Op == "<<") {
@@ -304,7 +313,7 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
       auto *Min = ConstantInt::get(Big, Lo), *Max = ConstantInt::get(Big, Hi);
       auto *Low = B.CreateICmpSLT(Z, Min), *High = B.CreateICmpSGT(Z, Max);
       if (Opt.Overflow == "checked")
-        guard(B.CreateOr(Low, High));
+        guard(B.CreateOr(Low, High), "numeric");
       else
         Z = B.CreateSelect(Low, Min, B.CreateSelect(High, Max, Z));
       V = B.CreateTrunc(Z, Ty);

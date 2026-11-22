@@ -5,10 +5,12 @@ namespace {
 std::string substitute(llvm::StringRef S, const std::set<std::string> &Names,
                        size_t Index) {
   std::string R;
+  auto IdentifierByte = [](char C) {
+    return llvm::isAlnum(C) || C == '_' || static_cast<unsigned char>(C) >= 128;
+  };
   while (!S.empty()) {
-    if (llvm::isAlnum(S[0]) || S[0] == '_') {
-      auto W =
-          S.take_while([](char C) { return llvm::isAlnum(C) || C == '_'; });
+    if (IdentifierByte(S[0])) {
+      auto W = S.take_while(IdentifierByte);
       R += W;
       if (Names.count(W.str()))
         R += "$" + std::to_string(Index);
@@ -94,6 +96,35 @@ std::string substituteBinders(llvm::StringRef Text, const Node &Decl,
 std::string normalized(llvm::StringRef Text, const Node &Decl) {
   return substituteBinders(Text, Decl, nullptr);
 }
+Node normalizedValueContracts(const Node &Decl) {
+  Node Copy;
+  Copy.Params = Decl.Params;
+  Copy.Contracts = Decl.Contracts;
+  normalizeContracts(Copy);
+  auto Bind = [&](auto &&Self, Node &N) -> void {
+    if (N.K == Node::Name) {
+      // A generic binder can be the head of a dependent qualified name.
+      // Member names, qualified tail components, and literals keep their
+      // spelling.
+      auto Head = llvm::StringRef(N.Text).take_until(
+          [](char C) { return C == ':' || C == '<'; });
+      if (llvm::any_of(Decl.Generics,
+                       [&](const Node &G) { return G.Text == Head; }))
+        N.Text = normalized(Head, Decl) + N.Text.substr(Head.size());
+    } else if (N.K == Node::TypeArg) {
+      // A type argument's token text is only its leading source token.
+      N.Text.clear();
+    }
+    N.Type = normalized(N.Type, Decl);
+    for (auto &A : N.TemplateArgs)
+      Self(Self, A);
+    for (auto &C : N.Children)
+      Self(Self, C);
+  };
+  for (auto &Clause : Copy.Contracts)
+    Bind(Bind, Clause);
+  return Copy;
+}
 std::string atom(const Node &N, const Node &Decl) {
   std::string Key = std::to_string(N.K) + "(" + normalized(N.Text, Decl) + "|" +
                     normalized(N.Type, Decl);
@@ -137,6 +168,20 @@ bool cpn::betterTypePattern(const Node &A, const Node &B) {
 }
 bool cpn::sameGenericResult(const Node &A, const Node &B) {
   return normalized(A.Type, A) == normalized(B.Type, B);
+}
+bool cpn::sameGenericValueContracts(const Node &A, const Node &B) {
+  return sameContracts(normalizedValueContracts(A),
+                       normalizedValueContracts(B));
+}
+
+EffectBound cpn::genericEffectBound(const Node &D, bool HasReceiver) {
+  auto E = D.Settings.find("effects");
+  if (E == D.Settings.end())
+    return std::nullopt;
+  auto Bound = bindEffectNames(E->second, D.Params, HasReceiver, D.At);
+  if (D.Noexcept && Bound.count("throw"))
+    fail(D.At, "noexcept contradicts a throw effect");
+  return Bound;
 }
 bool cpn::sameGenericSignature(const Node &A, const Node &B) {
   auto category = [](const Node &N) {
@@ -199,9 +244,34 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
       N.Type = substitute(N.Type, Names, *I);
     } else if (N.K == Node::Name && Names.count(N.Text))
       fail(N.At, "unexpanded pack in expression");
+    if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
+      std::string Bound;
+      auto Add = [&](llvm::StringRef Effect) {
+        if (!Bound.empty())
+          Bound += ",";
+        Bound += Effect;
+      };
+      llvm::SmallVector<llvm::StringRef> Items;
+      llvm::StringRef(E->second).split(Items, ',');
+      for (auto Item : Items) {
+        const auto [Kind, Region] = Item.split(':');
+        bool Pack = Kind != "trap" && Region != "any" && Region != "global" &&
+                    Region != "this" &&
+                    llvm::any_of(N.Params, [&](const Node &Param) {
+                      return Param.Pack && Param.Text == Region;
+                    });
+        if (!Pack)
+          Add(Item);
+        else
+          for (size_t J = 0; J < Count; ++J)
+            Add(Item.str() + "$" + std::to_string(J));
+      }
+      E->second = Bound.empty() ? "none" : std::move(Bound);
+    }
     sequence(N.Params, I);
     sequence(N.Children, I);
     sequence(N.TemplateArgs, I);
+    sequence(N.Contracts, I);
   };
   sequence(D.Generics, {});
   transform(D, {});

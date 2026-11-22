@@ -1,0 +1,652 @@
+#include "Sema.h"
+#include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/InstIterator.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/IntrinsicsX86.h"
+
+using namespace cpn;
+using llvm::StringRef;
+
+namespace {
+std::string position(unsigned I) { return "#" + std::to_string(I); }
+
+bool covers(const EffectSet &Bound, StringRef Effect) {
+  const auto [Kind, Region] = Effect.split(':');
+  return Bound.count(Effect.str()) ||
+         (!Region.empty() && Bound.count((Kind + ":any").str()));
+}
+
+std::string spelling(StringRef Effect) {
+  const auto [Kind, Region] = Effect.split(':');
+  if (Region.empty())
+    return Kind.str();
+  if (Region.starts_with("#"))
+    return (Kind + "(parameter " + Region.drop_front() + ")").str();
+  return (Kind + "(" + Region + ")").str();
+}
+
+constexpr StringRef CallEffects = "cpn.call.effects";
+constexpr StringRef OperationEffects = "cpn.effect";
+constexpr StringRef BoundaryEffects = "cpn.boundary.effects";
+constexpr StringRef BoundaryScope = "cpn.boundary";
+
+struct Summary {
+  EffectSet Effects, Boundary;
+  bool Open = false;
+  bool operator==(const Summary &Other) const {
+    return Effects == Other.Effects && Boundary == Other.Boundary &&
+           Open == Other.Open;
+  }
+};
+
+// These providers implement the frontend's own state and address metadata.
+bool runtimeBookkeeping(StringRef Name) {
+  return Name.starts_with("cpn.slot.") || Name.starts_with("cpn.view.") ||
+         Name.starts_with("cpn.pointer.") || Name == "cpn.new.generation" ||
+         Name == "cpn.generation" || Name == "cpn.borrow.valid" ||
+         Name == "cpn.extent.valid" || Name == "cpn.whole.epoch" ||
+         Name == "cpn.whole.request" || Name == "cpn.static.read";
+}
+
+void addMetadataEffects(const llvm::MDNode *MD, EffectSet &Effects) {
+  if (!MD)
+    return;
+  for (const auto &Operand : MD->operands())
+    Effects.insert(llvm::cast<llvm::MDString>(Operand)->getString().str());
+}
+
+class Inference {
+  using Regions = std::set<std::string>;
+  using Cell = std::pair<llvm::Value *, int64_t>;
+  const Context &U;
+  std::map<const llvm::Function *, const Function *> Declarations;
+  llvm::SmallPtrSet<llvm::Value *, 16> SourceGlobals;
+  std::map<llvm::Function *, Summary> Summaries;
+
+  llvm::Function *callee(const llvm::CallBase &Call) const {
+    return llvm::dyn_cast<llvm::Function>(
+        Call.getCalledOperand()->stripPointerCasts());
+  }
+
+  unsigned resultHeader(const Function &F) const {
+    return U.aggregate(F.Result);
+  }
+
+  bool receiverHeader(const Function &F) const {
+    return !F.Owner.empty() && !F.isStatic();
+  }
+
+  std::string argumentRegion(const llvm::Argument &A, bool Reachable) const {
+    unsigned I = A.getArgNo();
+    auto D = Declarations.find(A.getParent());
+    if (D == Declarations.end())
+      return position(I);
+    const auto &Decl = *D->second;
+    unsigned ResultHeader = resultHeader(Decl);
+    if (I < ResultHeader)
+      return "local";
+    I -= ResultHeader;
+    if (receiverHeader(Decl)) {
+      if (I == 0)
+        return "this";
+      --I;
+    }
+    if (I >= Decl.Params.size())
+      return "local"; // Construction continuation metadata.
+    if (U.aggregate(Decl.Params[I]) && !Reachable)
+      return "local";
+    return position(I);
+  }
+
+  struct Body {
+    const Inference &Analysis;
+    llvm::SmallPtrSet<llvm::BasicBlock *, 32> Reachable;
+    std::map<Cell, std::vector<llvm::Value *>> PointerValues;
+    std::map<llvm::Value *, llvm::SmallVector<llvm::Instruction *>>
+        UntrackedStores;
+
+    explicit Body(const Inference &Analysis, llvm::Function &F)
+        : Analysis(Analysis) {
+      llvm::SmallVector<llvm::BasicBlock *> Pending{&F.getEntryBlock()};
+      while (!Pending.empty()) {
+        auto *Block = Pending.pop_back_val();
+        if (!Reachable.insert(Block).second)
+          continue;
+        if (auto *Branch =
+                llvm::dyn_cast<llvm::CondBrInst>(Block->getTerminator()))
+          if (const auto *Cond =
+                  llvm::dyn_cast<llvm::ConstantInt>(Branch->getCondition())) {
+            Pending.push_back(Branch->getSuccessor(Cond->isZero()));
+            continue;
+          }
+        llvm::append_range(Pending, llvm::successors(Block));
+      }
+      for (auto *Block : Reachable)
+        for (auto &I : *Block) {
+          if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+            auto Slot = cell(Store->getPointerOperand());
+            if (llvm::isa<llvm::AllocaInst>(Slot.first) &&
+                Store->getValueOperand()->getType()->isPointerTy())
+              PointerValues[Slot].push_back(Store->getValueOperand());
+          } else if (auto *Transfer = llvm::dyn_cast<llvm::MemIntrinsic>(&I)) {
+            UntrackedStores[llvm::getUnderlyingObject(Transfer->getDest())]
+                .push_back(Transfer);
+          } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+            auto *Callee = Analysis.callee(*Call);
+            if (Callee && !Analysis.Declarations.count(Callee) &&
+                runtimeBookkeeping(Callee->getName()))
+              continue;
+            for (auto &Arg : Call->args())
+              if (Arg->getType()->isPointerTy())
+                UntrackedStores[llvm::getUnderlyingObject(Arg)].push_back(Call);
+          }
+        }
+    }
+
+    Cell cell(llvm::Value *P) const {
+      int64_t Offset = 0;
+      auto *Base = llvm::GetPointerBaseWithConstantOffset(
+          P, Offset, Analysis.U.M.getDataLayout());
+      return {Base, Offset};
+    }
+
+    bool isUntracked(llvm::Value *Base, const llvm::Instruction &Use) const {
+      auto It = UntrackedStores.find(Base);
+      return It != UntrackedStores.end() &&
+             llvm::any_of(It->second, [&](const llvm::Instruction *Store) {
+               return Store != &Use &&
+                      llvm::isPotentiallyReachable(Store, &Use);
+             });
+    }
+
+    void regions(llvm::Value *P, Regions &Out,
+                 llvm::SmallPtrSetImpl<llvm::Value *> &Visited,
+                 unsigned &Budget, bool ReachThrough = false) const {
+      if (!Budget) {
+        Out.insert("any");
+        return;
+      }
+      --Budget;
+      if (!Visited.insert(P).second)
+        return;
+      auto *Base = llvm::getUnderlyingObject(P);
+      if (Base != P)
+        return regions(Base, Out, Visited, Budget, ReachThrough);
+      if (auto *A = llvm::dyn_cast<llvm::Argument>(Base)) {
+        Out.insert(Analysis.argumentRegion(*A, ReachThrough));
+      } else if (llvm::isa<llvm::AllocaInst, llvm::ConstantPointerNull,
+                           llvm::Function>(Base)) {
+        Out.insert("local");
+      } else if (auto *Global = llvm::dyn_cast<llvm::GlobalVariable>(Base)) {
+        Out.insert(Analysis.SourceGlobals.contains(Global) ? "global"
+                                                           : "local");
+      } else if (auto *Merge = llvm::dyn_cast<llvm::PHINode>(Base)) {
+        for (unsigned I = 0; I < Merge->getNumIncomingValues(); ++I)
+          if (Reachable.contains(Merge->getIncomingBlock(I)))
+            regions(Merge->getIncomingValue(I), Out, Visited, Budget);
+      } else if (auto *Select = llvm::dyn_cast<llvm::SelectInst>(Base)) {
+        regions(Select->getTrueValue(), Out, Visited, Budget);
+        regions(Select->getFalseValue(), Out, Visited, Budget);
+      } else if (auto *Field = llvm::dyn_cast<llvm::ExtractValueInst>(Base)) {
+        // A pointer extracted from the compiler's call-transport header
+        // designates only the sidecar, never the program's objects.
+        auto *Loaded =
+            llvm::dyn_cast<llvm::LoadInst>(Field->getAggregateOperand());
+        auto *Header = Analysis.U.M.getGlobalVariable("cpn.pointer.call", true);
+        if (Loaded && Loaded->getPointerOperand() == Header)
+          Out.insert("local");
+        else
+          Out.insert("any");
+      } else if (auto *L = llvm::dyn_cast<llvm::LoadInst>(Base)) {
+        auto Address = cell(L->getPointerOperand());
+        if (!llvm::isa<llvm::AllocaInst>(Address.first)) {
+          regions(L->getPointerOperand(), Out, Visited, Budget, true);
+        } else if (auto It = PointerValues.find(Address);
+                   It != PointerValues.end() &&
+                   !isUntracked(Address.first, *L)) {
+          for (auto *V : It->second)
+            regions(V, Out, Visited, Budget);
+        } else {
+          Out.insert("any");
+        }
+      } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(Base)) {
+        auto *F = Analysis.callee(*Call);
+        auto Decl = Analysis.Declarations.find(F);
+        if (Decl != Analysis.Declarations.end() &&
+            !Decl->second->BorrowedResult.empty()) {
+          const auto &D = *Decl->second;
+          unsigned Offset =
+              Analysis.resultHeader(D) + Analysis.receiverHeader(D);
+          for (unsigned I : D.BorrowedResult)
+            regions(Call->getArgOperand(Offset + I), Out, Visited, Budget);
+        } else {
+          Out.insert(F && Decl == Analysis.Declarations.end() &&
+                             runtimeBookkeeping(F->getName())
+                         ? "local"
+                         : "any");
+        }
+      } else {
+        Out.insert("any");
+      }
+    }
+
+    Regions regions(llvm::Value *P) const {
+      Regions Out;
+      llvm::SmallPtrSet<llvm::Value *, 16> Visited;
+      unsigned Budget = 256;
+      regions(P, Out, Visited, Budget);
+      if (Out.empty())
+        Out.insert("any");
+      return Out;
+    }
+
+    Regions aggregateRegions(llvm::Value *P, const llvm::CallBase &Call) const {
+      auto [Base, Offset] = cell(P);
+      if (auto *A = llvm::dyn_cast<llvm::Argument>(Base))
+        return {Analysis.argumentRegion(*A, true)};
+      auto *Local = llvm::dyn_cast<llvm::AllocaInst>(Base);
+      if (!Local)
+        return regions(P);
+      if (Offset != 0 || isUntracked(Base, Call))
+        return {"any"};
+
+      // Resolve the pointers carried by an aggregate passed in its local ABI
+      // slot. Also inspect explicit stores into byte-allocated variant
+      // payloads.
+      Regions Out;
+      for (auto It = PointerValues.lower_bound({Base, INT64_MIN});
+           It != PointerValues.end() && It->first.first == Base; ++It)
+        for (auto *V : It->second) {
+          auto Roots = regions(V);
+          Out.insert(Roots.begin(), Roots.end());
+        }
+      llvm::SmallVector<std::pair<llvm::Type *, int64_t>> Pending{
+          {Local->getAllocatedType(), 0}};
+      const auto &DL = Analysis.U.M.getDataLayout();
+      unsigned Budget = 256;
+      while (!Pending.empty() && Budget--) {
+        auto [T, At] = Pending.pop_back_val();
+        if (T->isPointerTy()) {
+          if (!PointerValues.count({Base, At}))
+            return {"any"};
+        } else if (auto *S = llvm::dyn_cast<llvm::StructType>(T)) {
+          auto *Layout = DL.getStructLayout(S);
+          for (unsigned I = 0; I < S->getNumElements(); ++I)
+            Pending.emplace_back(S->getElementType(I),
+                                 At + Layout->getElementOffset(I));
+        } else if (auto *A = llvm::dyn_cast<llvm::ArrayType>(T)) {
+          if (A->getNumElements() > Budget)
+            return {"any"};
+          auto *Element = A->getElementType();
+          auto Stride = DL.getTypeAllocSize(Element).getFixedValue();
+          for (uint64_t I = 0; I < A->getNumElements(); ++I)
+            Pending.emplace_back(Element, At + I * Stride);
+        }
+      }
+      if (!Pending.empty())
+        return {"any"};
+      return Out;
+    }
+
+    void memory(EffectSet &Out, StringRef Kind, llvm::Value *Address) const {
+      for (const auto &Region : regions(Address))
+        if (Region != "local")
+          Out.insert((Kind + ":" + Region).str());
+    }
+
+    // A value observation entirely consumed by a write to that same
+    // designation is already covered by its write permission.
+    bool computesWrite(llvm::Value *V, llvm::Value *Address, bool &Wrote,
+                       llvm::SmallPtrSetImpl<llvm::Value *> &Visited) const {
+      if (!Visited.insert(V).second)
+        return true;
+      if (Visited.size() > 64)
+        return false;
+      for (auto *Use : V->users()) {
+        if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(Use)) {
+          if (Store->getValueOperand() != V || Store->isVolatile() ||
+              Store->isAtomic() ||
+              (Store->getPointerOperand() != Address &&
+               cell(Store->getPointerOperand()) != cell(Address)))
+            return false;
+          Wrote = true;
+          continue;
+        }
+        if (auto *Guard = llvm::dyn_cast<llvm::CondBrInst>(Use)) {
+          auto *Failure = Guard->getSuccessor(0);
+          if (llvm::isa<llvm::UnreachableInst>(Failure->getTerminator()) &&
+              llvm::any_of(*Failure, [](const llvm::Instruction &I) {
+                EffectSet Tags;
+                addMetadataEffects(I.getMetadata(OperationEffects), Tags);
+                return Tags.count("trap:numeric");
+              }))
+            continue;
+        }
+        if (!llvm::isa<llvm::BinaryOperator, llvm::CastInst, llvm::CmpInst,
+                       llvm::SelectInst, llvm::PHINode>(Use) ||
+            !computesWrite(Use, Address, Wrote, Visited))
+          return false;
+      }
+      return true;
+    }
+
+    bool computesWrite(llvm::LoadInst &L) const {
+      if (L.isVolatile() || L.isAtomic())
+        return false;
+      llvm::SmallPtrSet<llvm::Value *, 16> Visited;
+      bool Wrote = false;
+      return computesWrite(&L, L.getPointerOperand(), Wrote, Visited) && Wrote;
+    }
+
+    void remap(EffectSet &Out, const EffectSet &Source,
+               const llvm::CallBase &Call, unsigned Headers, bool Receiver,
+               llvm::ArrayRef<unsigned> ValueAggregates) const {
+      for (const auto &Item : Source) {
+        const auto [Kind, Region] = StringRef(Item).split(':');
+        unsigned Index = 0;
+        if (Region == "this" && Receiver) {
+          Index = Headers;
+        } else if (Region.starts_with("#") &&
+                   !Region.drop_front().getAsInteger(10, Index)) {
+          Index += Headers + Receiver;
+        } else {
+          Out.insert(Item);
+          continue;
+        }
+        if (Index >= Call.arg_size() ||
+            !Call.getArgOperand(Index)->getType()->isPointerTy())
+          Out.insert((Kind + ":any").str());
+        else if (Kind == "read" || Kind == "write") {
+          if (Region.starts_with("#") &&
+              llvm::is_contained(ValueAggregates, Index - Headers - Receiver)) {
+            for (const auto &Root :
+                 aggregateRegions(Call.getArgOperand(Index), Call))
+              if (Root != "local")
+                Out.insert((Kind + ":" + Root).str());
+          } else
+            memory(Out, Kind, Call.getArgOperand(Index));
+        } else
+          for (auto &Origin : regions(Call.getArgOperand(Index))) {
+            StringRef Domain(Origin);
+            if (Domain == "local" || Domain == "this")
+              Domain = "any";
+            Out.insert((Kind + ":" + Domain).str());
+          }
+      }
+    }
+  };
+
+  void callEffects(Body &Body, Summary &Out, EffectSet &Effects,
+                   llvm::CallBase &Call, bool Interprocedural) const {
+    llvm::Function *F = callee(Call);
+    EffectBound Bound;
+    unsigned Headers = 0;
+    bool Receiver = false;
+    llvm::SmallVector<unsigned> ValueAggregates;
+    auto *Descriptor = Call.getMetadata(CallEffects);
+    if (Descriptor) {
+      auto Number = [&](unsigned I) {
+        return llvm::mdconst::extract<llvm::ConstantInt>(
+                   Descriptor->getOperand(I))
+            ->getZExtValue();
+      };
+      Headers = Number(0);
+      Receiver = Number(1);
+      if (Number(2)) {
+        Bound.emplace();
+        for (unsigned I = 5; I < Descriptor->getNumOperands(); ++I)
+          Bound->insert(llvm::cast<llvm::MDString>(Descriptor->getOperand(I))
+                            ->getString()
+                            .str());
+      }
+      if (auto *V = llvm::dyn_cast_or_null<llvm::ValueAsMetadata>(
+              Descriptor->getOperand(3)))
+        F = llvm::cast<llvm::Function>(V->getValue());
+      for (const auto &I :
+           llvm::cast<llvm::MDNode>(Descriptor->getOperand(4))->operands())
+        ValueAggregates.push_back(
+            llvm::mdconst::extract<llvm::ConstantInt>(I)->getZExtValue());
+    }
+
+    const Function *D = nullptr;
+    if (auto It = Declarations.find(F); It != Declarations.end())
+      D = It->second;
+    if (!Descriptor && D) {
+      Bound = D->Effects;
+      Headers = resultHeader(*D);
+      Receiver = receiverHeader(*D);
+    }
+    if (D && ValueAggregates.empty())
+      for (unsigned I = 0; I < D->Params.size(); ++I)
+        if (U.aggregate(D->Params[I]))
+          ValueAggregates.push_back(I);
+
+    if (F && F->isIntrinsic()) {
+      if (auto *Transfer = llvm::dyn_cast<llvm::MemTransferInst>(&Call))
+        Body.memory(Effects, "read", Transfer->getSource());
+      if (auto *Memory = llvm::dyn_cast<llvm::MemIntrinsic>(&Call)) {
+        Body.memory(Effects, "write", Memory->getDest());
+        if (Memory->isVolatile())
+          Effects.insert("volatile");
+      }
+      if (F->getIntrinsicID() == llvm::Intrinsic::x86_sse_stmxcsr ||
+          F->getIntrinsicID() == llvm::Intrinsic::x86_sse_ldmxcsr)
+        Effects.insert({"fp_control", "fp_status"});
+      return;
+    }
+    if (F && !D && runtimeBookkeeping(F->getName()))
+      return;
+
+    auto Inferred = Summaries.find(F);
+    if (Bound) {
+      Body.remap(Effects, *Bound, Call, Headers, Receiver, ValueAggregates);
+    } else if (Inferred != Summaries.end() && !Descriptor &&
+               (Interprocedural || !D)) {
+      Body.remap(Effects, Inferred->second.Effects, Call, Headers, Receiver,
+                 ValueAggregates);
+      Out.Open |= Inferred->second.Open;
+    } else {
+      if (D && D->Decl.Foreign && (!F || F->isDeclaration()))
+        Effects.insert("foreign");
+      Out.Open = true;
+    }
+    if (Inferred != Summaries.end())
+      Body.remap(Effects, Inferred->second.Boundary, Call, Headers, Receiver,
+                 ValueAggregates);
+    else if (D && !D->Decl.Contracts.empty() &&
+             D->Defaults.Configuration.ContractsEnabled &&
+             D->Defaults.Configuration.ContractValidation == "check")
+      Effects.insert("trap:contract");
+  }
+
+  Summary summarize(llvm::Function &F, const Function *D) const {
+    Body Plan(*this, F);
+    Summary S;
+    bool Interprocedural =
+        !D || D->Definition.Configuration.InterproceduralEffects;
+    for (auto *Block : Plan.Reachable)
+      for (auto &I : *Block) {
+        if (I.getMetadata("cpn.internal"))
+          continue;
+        auto &Effects = I.getMetadata(BoundaryScope) ? S.Boundary : S.Effects;
+        addMetadataEffects(I.getMetadata(OperationEffects), Effects);
+        addMetadataEffects(I.getMetadata(BoundaryEffects), S.Boundary);
+        if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+          if (!Plan.computesWrite(*L))
+            Plan.memory(Effects, "read", L->getPointerOperand());
+          if (L->isVolatile())
+            Effects.insert("volatile");
+          if (L->isAtomic())
+            Effects.insert("atomic");
+        } else if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+          Plan.memory(Effects, "write", Store->getPointerOperand());
+          if (Store->isVolatile())
+            Effects.insert("volatile");
+          if (Store->isAtomic())
+            Effects.insert("atomic");
+        } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+          callEffects(Plan, S, Effects, *Call, Interprocedural);
+        }
+      }
+    return S;
+  }
+
+public:
+  explicit Inference(const Context &U) : U(U) {
+    for (const auto &F : U.Functions) {
+      Declarations.emplace(F.IR, &F);
+      if (F.BaseIR)
+        Declarations.emplace(F.BaseIR, &F);
+    }
+    for (const auto &[Name, Object] : U.Globals) {
+      if (Object.Address)
+        SourceGlobals.insert(llvm::getUnderlyingObject(Object.Address));
+      if (Object.ReferenceCell)
+        SourceGlobals.insert(Object.ReferenceCell);
+    }
+    for (const auto &[Name, Object] : U.ExternalObjects)
+      if (Object.Address)
+        SourceGlobals.insert(llvm::getUnderlyingObject(Object.Address));
+    for (auto &F : U.M)
+      if (!F.isDeclaration() &&
+          (Declarations.count(&F) || !runtimeBookkeeping(F.getName())))
+        Summaries.emplace(&F, Summary{});
+  }
+
+  void verify() {
+    bool Changed;
+    do {
+      Changed = false;
+      for (auto &[F, S] : Summaries) {
+        auto It = Declarations.find(F);
+        auto Next =
+            summarize(*F, It != Declarations.end() ? It->second : nullptr);
+        if (!(Next == S)) {
+          S = std::move(Next);
+          Changed = true;
+        }
+      }
+    } while (Changed);
+    for (const auto &D : U.Functions) {
+      const auto &Policy = D.Definition.Configuration;
+      if (!D.Effects && !Policy.StrictEffectDiagnostics)
+        continue;
+      bool Unknown = false;
+      for (auto *F : {D.IR, D.BaseIR}) {
+        auto It = Summaries.find(F);
+        if (It == Summaries.end())
+          continue;
+        if (D.Effects)
+          for (const auto &Effect : It->second.Effects)
+            if (!covers(*D.Effects, Effect))
+              fail(D.Decl.At, "effect " + spelling(Effect) +
+                                  " exceeds declared effects of '" + D.Name +
+                                  "'");
+        Unknown |= It->second.Open;
+      }
+      if (Unknown)
+        Policy.diagnose(D.Decl.At, Severity::Anomaly, {},
+                        "call effects could not be established for '" + D.Name +
+                            "'");
+    }
+  }
+};
+} // namespace
+
+EffectSet cpn::bindEffectNames(StringRef Bound, const std::vector<Node> &Params,
+                               bool HasReceiver, const Token &At) {
+  EffectSet Result;
+  if (Bound == "none")
+    return Result;
+  llvm::SmallVector<StringRef> Items;
+  Bound.split(Items, ',');
+  for (auto Item : Items) {
+    const auto [Kind, Region] = Item.split(':');
+    if (Region.empty() || Kind == "trap" || Region == "any" ||
+        Region == "global") {
+      Result.insert(Item.str());
+      continue;
+    }
+    if (Region == "this") {
+      if (!HasReceiver || (Kind != "read" && Kind != "write"))
+        fail(At, "invalid receiver effect region");
+      Result.insert(Item.str());
+      continue;
+    }
+    auto P =
+        llvm::find_if(Params, [&](const Node &N) { return Region == N.Text; });
+    if (P == Params.end())
+      fail(At, "unknown effect region '" + Region.str() + "'");
+    Result.insert((Kind + ":" + position(P - Params.begin())).str());
+  }
+  for (auto It = Result.begin(); It != Result.end();) {
+    const auto [Kind, Region] = StringRef(*It).split(':');
+    if (!Region.empty() && Region != "any" &&
+        Result.count((Kind + ":any").str()))
+      It = Result.erase(It);
+    else
+      ++It;
+  }
+  return Result;
+}
+
+std::string cpn::effectFlags(const EffectBound &Bound) {
+  if (!Bound)
+    return {};
+  std::string Flags = " effects_closed";
+  for (const auto &Item : *Bound)
+    Flags += " effect#" + Item;
+  return Flags;
+}
+
+EffectBound cpn::callableEffects(StringRef Type) {
+  EffectBound Result;
+  auto Flags = callableFlags(Type);
+  if (!Flags.count("effects_closed"))
+    return Result;
+  Result.emplace();
+  for (auto Flag : Flags)
+    if (Flag.consume_front("effect#"))
+      Result->insert(Flag.str());
+  return Result;
+}
+
+bool cpn::effectsFit(const EffectBound &Source, const EffectBound &Target) {
+  return !Target || (Source && llvm::all_of(*Source, [&](StringRef Item) {
+                       return covers(*Target, Item);
+                     }));
+}
+
+void cpn::describeEffectCall(llvm::CallBase &Call, const EffectBound &Bound,
+                             unsigned Headers, bool Receiver,
+                             llvm::Function *Contract,
+                             llvm::ArrayRef<unsigned> ValueAggregates) {
+  auto &C = Call.getContext();
+  auto Index = [&](unsigned I) {
+    return llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(llvm::Type::getInt32Ty(C), I));
+  };
+  llvm::SmallVector<llvm::Metadata *> Aggregates;
+  for (auto I : ValueAggregates)
+    Aggregates.push_back(Index(I));
+  llvm::SmallVector<llvm::Metadata *> Fields{
+      Index(Headers), Index(Receiver), Index(Bound.has_value()),
+      Contract ? llvm::ValueAsMetadata::get(Contract) : nullptr,
+      llvm::MDNode::get(C, Aggregates)};
+  if (Bound)
+    for (const auto &Item : *Bound)
+      Fields.push_back(llvm::MDString::get(C, Item));
+  Call.setMetadata(CallEffects, llvm::MDNode::get(C, Fields));
+}
+
+void Context::checkEffects() {
+  if (llvm::any_of(Functions, [](const Function &F) {
+        return F.Effects || F.Definition.Configuration.StrictEffectDiagnostics;
+      }))
+    Inference(*this).verify();
+  for (auto &F : M)
+    for (auto &I : llvm::instructions(F))
+      I.setMetadata(CallEffects, nullptr);
+}

@@ -261,7 +261,8 @@ std::string Context::callableType(const Function &D) {
     T += " noexcept";
   if (D.MayWhole)
     T += " whole";
-  T += parameterEffects(D.NoEscape, D.BorrowedResult, D.Consumes) + ">";
+  T += parameterEffects(D.NoEscape, D.BorrowedResult, D.Consumes) +
+       effectFlags(D.Effects) + ">";
   if (!Signatures.count(T)) {
     std::vector<std::string> Sig{D.Result};
     Sig.insert(Sig.end(), D.Params.begin(), D.Params.end());
@@ -280,7 +281,8 @@ bool Context::compatibleCallable(const std::string &From,
       Signatures.at(From) != Signatures.at(To))
     return false;
   if ((callableFlag(To, " noexcept") && !callableFlag(From, " noexcept")) ||
-      (callableFlag(From, " whole") && !callableFlag(To, " whole")))
+      (callableFlag(From, " whole") && !callableFlag(To, " whole")) ||
+      !effectsFit(callableEffects(From), callableEffects(To)))
     return false;
   auto Source = callableFlags(From), Target = callableFlags(To);
   for (auto Flag : Target)
@@ -617,6 +619,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
   Function D;
   D.ExitedLifetimes = validate(N, P, Owner);
   D.Decl = N;
+  normalizeContracts(D.Decl);
   D.MayWhole = N.Settings.count("lifecycle_effect");
   D.DefaultParams = N.Params;
   D.Name = Name;
@@ -656,6 +659,12 @@ Function *Context::declare(const Node &N, const std::string &Name,
     D.Params.push_back(ValueType);
     Types.push_back(aggregate(D.Params.back()) ? llvm::PointerType::getUnqual(C)
                                                : ir(D.Params.back(), Arg.At));
+  }
+  if (auto Attr = N.Settings.find("effects"); Attr != N.Settings.end()) {
+    bool HasReceiver = !Owner.empty() && !D.isStatic();
+    D.Effects = bindEffectNames(Attr->second, N.Params, HasReceiver, N.At);
+    if (N.Noexcept && D.Effects->count("throw"))
+      fail(N.At, "noexcept contradicts a throw effect");
   }
   for (auto Key : {"requires_initialized", "initializes"}) {
     auto Attr = N.Settings.find(Key);
@@ -744,10 +753,12 @@ Function *Context::declare(const Node &N, const std::string &Name,
           Prev->Consumes != D.Consumes || Prev->Result != D.Result ||
           Prev->Decl.Foreign != N.Foreign ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
+          ((D.Effects || N.Prototype) && Prev->Effects != D.Effects) ||
           Prev->Decl.Settings.count("lifecycle_effect") !=
               N.Settings.count("lifecycle_effect") ||
           (!N.Settings.count("qualifier") &&
            Prev->isStatic() != D.isStatic()) ||
+          (!D.Decl.Contracts.empty() && !sameContracts(Prev->Decl, D.Decl)) ||
           Prev->Decl.Required != N.Required ||
           Prev->Decl.Settings.count("mode") != N.Settings.count("mode"))
         fail(N.At, "incompatible redeclaration");
@@ -760,6 +771,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
           fail(Arg.At, "defaults belong to the canonical declaration");
       auto Defaults = Prev->Decl.Params;
       auto Canonical = Prev->Decl.Settings;
+      D.Decl.Contracts = std::move(Prev->Decl.Contracts);
       Prev->Decl = D.Decl;
       Prev->ExitedLifetimes = std::move(D.ExitedLifetimes);
       for (const auto *Key :
@@ -815,6 +827,8 @@ Function *Context::declare(const Node &N, const std::string &Name,
   Group.push_back(&Functions.back());
   if (N.Foreign)
     ExternalFunctions[N.Text] = Group.back();
+  if (Owner.empty())
+    bindContracts(*Group.back());
   return Group.back();
 }
 // The first declaration in a block owns the nominal identity, including a
@@ -1028,6 +1042,8 @@ void Context::record(const Node &N, const std::string &Name,
 void Context::declareMembers(const std::string &Name, const std::string &P) {
   auto &R = Records.at(Name);
   const auto &N = R.Decl;
+  if (!N.Contracts.empty())
+    R.InvariantSite = site();
   Frame Check(*this, nullptr, nullptr, P);
   Check.Env = R.Env;
   for (auto &D : R.Decl.Children)
@@ -1111,6 +1127,9 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
     Check.object(D, true);
   }
   buildTables(Name, Members);
+  for (auto *F : Members)
+    bindContracts(*F);
+  validateInvariants(Name);
   if (auto Bodies = OwnerBodies.find({N.At.Line, N.At.Column});
       Bodies != OwnerBodies.end())
     for (const auto &[Site, Definition] : Bodies->second)
@@ -1204,6 +1223,7 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
   }
   Body.Settings.erase("qualifier");
   Body.Settings.insert(Public.Settings.begin(), Public.Settings.end());
+  Body.Contracts = Public.Contracts;
   F.Decl = std::move(Body);
   F.Definition = *FamilyDecl.BodySite;
 }
@@ -1228,6 +1248,9 @@ void Context::genericFunction(const Node &D, const std::string &Name,
          "qualified generic definition must match an existing declaration");
   auto Scope = Qualified ? It->Prefix : P;
   auto Class = Qualified ? It->Owner : Owner;
+  const Node &Interface = It == Group.end() ? D : It->Decl;
+  bool HasReceiver = !Class.empty() && !Interface.Settings.count("static");
+  auto Effects = genericEffectBound(D, HasReceiver);
   for (const auto &Requirement : D.TemplateArgs)
     checkNormalForm(Requirement);
   validate(D, Scope, Class);
@@ -1239,12 +1262,17 @@ void Context::genericFunction(const Node &D, const std::string &Name,
     Group.push_back(std::move(F));
     return;
   }
-  if (!It->Decl.Prototype || D.Prototype || It->Body)
-    fail(D.At, "duplicate generic signature");
   if (!sameGenericResult(It->Decl, D) || D.Noexcept != It->Decl.Noexcept ||
       D.Required != It->Decl.Required || D.Foreign != It->Decl.Foreign ||
       D.Settings.count("mode") != It->Decl.Settings.count("mode"))
     fail(D.At, "incompatible generic definition");
+  if ((Effects || D.Prototype) &&
+      Effects != genericEffectBound(It->Decl, HasReceiver))
+    fail(D.At, "incompatible generic effect contract");
+  if (!D.Contracts.empty() && !sameGenericValueContracts(It->Decl, D))
+    fail(D.At, "incompatible generic value contract");
+  if (!D.Prototype && (!It->Decl.Prototype || It->Body))
+    fail(D.At, "duplicate generic signature");
   for (auto &G : D.Generics)
     if (!G.Children.empty())
       fail(G.At, "a separate definition cannot redeclare defaults");
@@ -1252,10 +1280,12 @@ void Context::genericFunction(const Node &D, const std::string &Name,
     if (!Arg.Children.empty())
       fail(Arg.At, "a separate definition cannot redeclare defaults");
   for (auto &[Effect, Value] : D.Settings)
-    if (Effect != "qualifier" && Effect != "category" &&
+    if (Effect != "qualifier" && Effect != "category" && Effect != "effects" &&
         (!It->Decl.Settings.count(Effect) ||
          It->Decl.Settings.at(Effect) != Value))
       fail(D.At, "incompatible generic definition contract");
+  if (D.Prototype)
+    return;
   It->Body = D;
   It->BodySite = site();
   std::vector<Function *> Pending;
@@ -1367,6 +1397,7 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
   }
 }
 void Context::emit(Function &D) {
+  bindContracts(D);
   if (D.Emitted || D.Emitting || D.Decl.Prototype ||
       D.Decl.Settings.count("control"))
     return;
@@ -1384,6 +1415,8 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
   F.bindParams();
   if (D.Decl.Settings.count("closure"))
     F.bindCaptures();
+  F.checkMethodInvariant(true);
+  F.checkContracts(true);
   auto &Body = D.Decl.Children.front();
   if (D.Decl.K == Node::Constructor &&
       Records.at(D.Owner).Decl.K == Node::Union) {
@@ -1409,7 +1442,9 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
   if (F.Live) {
     if (D.Result != "void")
       fail(D.Decl.At, "function can finish without returning a value");
+    F.checkContracts(false);
     F.cleanup(0);
+    F.checkMethodInvariant(false);
     F.B.CreateRetVoid();
   } else if (!F.B.GetInsertBlock()->hasTerminator())
     F.B.CreateUnreachable();
@@ -1427,6 +1462,7 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     U.enableStorage();
   U.unit(AST);
   U.checkWholeContracts();
+  U.checkEffects();
   U.checkBorrowEscapes();
   for (auto &F : U.Functions)
     for (auto *Entry : {F.IR, F.BaseIR})

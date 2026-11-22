@@ -19,7 +19,9 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Closure.cpp
     ConstantAggregate.cpp
     Construction.cpp
+    Contracts.cpp
     Dispatch.cpp
+    Effects.cpp
     Domain.cpp
     Driver.cpp
     Emit.cpp
@@ -27,6 +29,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Floating.cpp
     Generic.cpp
     Integer.cpp
+    Invariants.cpp
     Lexer.cpp
     Lifetime.cpp
     Whole.cpp

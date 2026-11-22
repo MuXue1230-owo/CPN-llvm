@@ -265,39 +265,141 @@ struct Checker {
            : Types.size() > 1 && Types[0] == "integer" ? Types[1]
                                                        : Types[0];
   }
+
+  // Resolve lexical names immediately. A dependent base or type application
+  // may supply its own members only after substitution.
+  bool predicateName(const Node &N, const Node &Decl, const Node *Owner,
+                     llvm::StringRef OwnerType, bool HasReceiver) {
+    auto Name = llvm::StringRef(N.Text);
+    if (Name == "this")
+      return HasReceiver;
+    if (Name == "true" || Name == "false" || Name == "nullptr" ||
+        Name == "std::move" || Name == "std::forward" ||
+        builtinPredicate(Name) || builtin(Name) || Names.constraint(N.Text) ||
+        Variables.count(N.Text) || Names.Env.Values.count(N.Text))
+      return true;
+    if (Name == "return_value")
+      return false;
+    auto Head = Name.take_until([](char C) { return C == ':' || C == '<'; });
+    if (Parameters.count(Head.str()) || Names.Env.Types.count(Head.str()) ||
+        llvm::any_of(Decl.Generics,
+                     [&](const Node &P) { return P.Text == Head; }))
+      return true;
+    if (Name == Decl.Text && Decl.K == Node::Function)
+      return true;
+    if (Owner && (Name == Owner->Text ||
+                  llvm::any_of(Owner->Children,
+                               [&](const Node &D) { return D.Text == Name; })))
+      return true;
+    if (!OwnerType.empty() && (U.lookupPath(OwnerType.str(), N.At, false) ||
+                               U.lookupPath(OwnerType.str(), N.At, true)))
+      return true;
+    auto Visible = [&](const std::string &Key) {
+      auto F = U.FunctionFamilies.find(Key);
+      return U.Globals.count(Key) || U.Cases.count(Key) ||
+             U.Aliases.count(Key) || U.Records.count(Key) ||
+             !Names.visibleOverloads(Key).empty() ||
+             (F != U.FunctionFamilies.end() &&
+              llvm::any_of(F->second, [&](const auto &Family) {
+                return Family.Site.Through <= Names.LookupLimit;
+              }));
+    };
+    if (!scopeKey(Names.Prefix, Name, Visible).empty())
+      return true;
+    // A qualified designator may have a nominal dependent owner. Retain the
+    // owner binding and defer its member lookup, including applied families.
+    auto Nominal = Name.contains('<')    ? Name.split('<').first
+                   : Name.contains("::") ? Name.rsplit("::").first
+                                         : llvm::StringRef{};
+    if (!Nominal.empty() &&
+        !scopeKey(Names.Prefix, Nominal, [&](const std::string &Key) {
+           return U.Records.count(Key) || U.Aliases.count(Key) ||
+                  U.Families.count(Key);
+         }).empty())
+      return true;
+    return HasReceiver && Owner && OwnerType.empty() &&
+           !Owner->TemplateArgs.empty() && !Name.contains("::");
+  }
+
+  void bindPredicateNames(const Node &N, const Node &Decl, const Node *Owner,
+                          llvm::StringRef OwnerType, bool HasReceiver) {
+    if (N.K == Node::Name &&
+        !predicateName(N, Decl, Owner, OwnerType, HasReceiver))
+      fail(N.At, "unknown name '" + N.Text + "' in contract predicate");
+    for (const auto &C : N.Children)
+      bindPredicateNames(C, Decl, Owner, OwnerType, HasReceiver);
+    for (const auto &A : N.TemplateArgs)
+      bindPredicateNames(A, Decl, Owner, OwnerType, HasReceiver);
+  }
 };
 } // namespace
 
-void Context::checkDomain(const Node &N, const std::string &Prefix) {
+void Context::checkDomain(const Node &N, const std::string &Prefix,
+                          const Node *SymbolOwner) {
   Checker Check(*this, Prefix);
+  const bool Record = N.K == Node::Record || N.K == Node::Union;
+  std::string OwnerType = llvm::StringRef(Prefix).rtrim(':').str();
+  if (auto Owner = Records.find(OwnerType); !Record && Owner != Records.end()) {
+    SymbolOwner = &Owner->second.Decl;
+    Check.Names.Env = Owner->second.Env;
+  } else
+    OwnerType.clear();
+  if (Record && !SymbolOwner)
+    SymbolOwner = &N;
+  auto Callable = [](const Node &D) {
+    return D.K == Node::Function || D.K == Node::Constructor ||
+           D.K == Node::Destructor;
+  };
+  if (Record)
+    for (const auto &D : N.Children)
+      if (Callable(D))
+        (void)genericEffectBound(D, !D.Settings.count("static"));
   for (auto &P : N.Generics) {
     if (P.K == Node::TypeParam)
       Check.Parameters.insert(P.Text);
     else
       Check.Variables[P.Text] = P.Type;
   }
-  if (Check.Parameters.empty())
-    return;
+  bool Dependent = !Check.Parameters.empty();
   Alternatives Alts(1);
-  const auto &Conditions = N.K == Node::Record ? N.Params : N.TemplateArgs;
-  for (auto &Q : Conditions)
-    Alts = Check.refine(Q, true, std::move(Alts));
+  const auto &Conditions = Record ? N.Params : N.TemplateArgs;
+  if (Dependent)
+    for (auto &Q : Conditions)
+      Alts = Check.refine(Q, true, std::move(Alts));
   auto Body = [&](const Node &D) {
     llvm::SaveAndRestore Scope(Check.Variables);
     for (auto &P : D.Params)
       Check.Variables[P.Text] = P.Type;
-    for (auto &C : D.Children)
-      Check.visit(C, Alts);
+    for (const auto &Clause : D.Contracts) {
+      llvm::SaveAndRestore Names(Check.Variables);
+      if (Clause.Text == "ensures" && D.Type != "void" && D.Type != "never")
+        Check.Variables["return_value"] = D.Type;
+      bool HasReceiver =
+          SymbolOwner && !D.Settings.count("static") &&
+          !(D.K == Node::Constructor && Clause.Text == "requires");
+      Check.bindPredicateNames(Clause.Children.front(), D, SymbolOwner,
+                               OwnerType, HasReceiver);
+      if (Dependent)
+        Check.visit(Clause.Children.front(), Alts);
+    }
+    if (Dependent && N.K != Node::Union)
+      for (auto &C : D.Children)
+        Check.visit(C, Alts);
   };
   if (N.K == Node::Function)
     Body(N);
-  if (N.K == Node::Record) {
+  if (Record) {
     for (auto &D : N.Children)
       if (D.K == Node::Field)
         Check.Variables[D.Text] = D.Type;
+    for (auto &Clause : N.Contracts) {
+      Check.bindPredicateNames(Clause.Children.front(), N, SymbolOwner,
+                               OwnerType, true);
+      if (Dependent)
+        Check.visit(Clause.Children.front(), Alts);
+    }
     for (auto &D : N.Children)
-      if (D.K == Node::Function || D.K == Node::Constructor ||
-          D.K == Node::Destructor)
+      if (Callable(D))
         Body(D);
   }
 }
