@@ -11,11 +11,22 @@ struct Check {
   std::map<std::string, Path> Labels;
   std::vector<std::pair<const Node *, Path>> Jumps;
   bool known(const std::string &S) const {
-    static const Scope Intrinsics = {
-        "std::move", "std::forward", "construct_at", "storage_of",
-        "destroy",   "destroy_base", "abandon",      "abandon_base",
-        "this",      "nullptr",      "true",         "false",
-        "SameType",  "ObjectType",   "CompleteType"};
+    static const Scope Intrinsics = {"std::move",
+                                     "std::forward",
+                                     "construct_at",
+                                     "storage_of",
+                                     "destroy",
+                                     "destroy_base",
+                                     "transfer_destruction",
+                                     "abandon",
+                                     "abandon_base",
+                                     "this",
+                                     "nullptr",
+                                     "true",
+                                     "false",
+                                     "SameType",
+                                     "ObjectType",
+                                     "CompleteType"};
     if (Names.count(S) || Intrinsics.count(S) || builtin(S) ||
         builtinPredicate(S) || U.Aliases.count(S) || U.Cases.count(S))
       return true;

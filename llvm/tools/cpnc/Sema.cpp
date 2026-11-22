@@ -592,6 +592,13 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   const auto &N = R.Decl;
   Frame Check(*this, nullptr, nullptr, P);
   Check.Env = R.Env;
+  for (auto &D : R.Decl.Children)
+    if (D.K == Node::Init && D.Type == "Complete") {
+      auto Sep = D.Text.find(':');
+      if (Sep != std::string::npos)
+        D.Text = D.Text.substr(0, Sep + 1) +
+                 Check.resolve(D.Text.substr(Sep + 1), D.At);
+    }
   buildViews(Name);
   bindOwners(Name, P);
   std::vector<Function *> Members;

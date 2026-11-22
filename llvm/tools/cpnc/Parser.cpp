@@ -193,11 +193,12 @@ class Parser {
              : AllowBuiltin && builtin(peek().Text) ? take()
                                                     : name();
     while (true) {
-      if (is("<") && (Families.count(T.Text) ||
-                      (Application &&
-                       (builtinPredicate(T.Text) || T.Text == "construct_at" ||
-                        T.Text == "destroy_base" || T.Text == "abandon_base" ||
-                        T.Text == "std::forward")))) {
+      if (is("<") &&
+          (Families.count(T.Text) ||
+           (Application &&
+            (builtinPredicate(T.Text) || T.Text == "construct_at" ||
+             T.Text == "destroy_base" || T.Text == "abandon_base" ||
+             T.Text == "transfer_destruction" || T.Text == "std::forward")))) {
         auto Start = Pos;
         std::vector<Node> Args;
         if (T.Text == "destroy_base" || T.Text == "abandon_base") {

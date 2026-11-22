@@ -1030,6 +1030,9 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     V.Expiring = true;
     return V;
   }
+  if (Name == "transfer_destruction" && Args.size() == 1 &&
+      C.TemplateArgs.size() == 1)
+    return transferOwner(C, Args.front());
   if ((Name == "destroy_base" || Name == "abandon_base") && Args.size() == 1 &&
       C.TemplateArgs.size() == 1)
     return baseRequest(C, Args.front());

@@ -303,6 +303,7 @@ public:
   void drop(Value, bool AsBase = false);
   void dropLayer(Value, bool AsBase);
   BasePath selectBase(const Record &, const BasePath &, const Node &);
+  Value transferOwner(const Node &, const Node &);
   Value baseRequest(const Node &, const Node &);
   llvm::Value *wholeEpoch();
   void propagateWhole(llvm::Value *);

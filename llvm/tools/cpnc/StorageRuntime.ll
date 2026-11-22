@@ -146,6 +146,7 @@ init:
 
 ; End all dependent views, including descendants that were abandoned.
 define internal void @cpn.slot.invalidate(ptr %s) {
+  call void @cpn.owner.forget(ptr %s)
   %stamp = getelementptr %cpn.slot, ptr %s, i32 0, i32 7
   %value = load i64, ptr %stamp
   %ended = and i64 %value, -2

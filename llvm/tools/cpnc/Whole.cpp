@@ -22,7 +22,8 @@ void Context::checkWholeContracts() {
 bool Frame::usesWhole(const Node &N) {
   if (N.Settings.count("lifecycle_effect") || N.K == Node::DestructionOwner ||
       (N.K == Node::Name &&
-       (N.Text == "destroy_base" || N.Text == "abandon_base")))
+       (N.Text == "destroy_base" || N.Text == "abandon_base" ||
+        N.Text == "transfer_destruction")))
     return true;
   return llvm::any_of(N.Children, usesWhole) ||
          llvm::any_of(N.Params, usesWhole) ||
@@ -163,24 +164,36 @@ llvm::Function *Context::coordinator(const std::string &Type) {
     BasePath Owner = Path;
     if (!Owner.empty())
       Owner.pop_back();
-    bool Eligible = !Path.empty();
+    llvm::Value *Binding = B.getInt32(Indices.at(Owner));
+    llvm::Value *Eligible = B.getInt1(!Path.empty());
     if (Path.size() == 1 && Path.front() < Root.VirtualCount) {
       if (auto I = Root.Owners.find(T); I != Root.Owners.end())
         Owner = I->second;
-      const auto &Layer = Records.at(Root.Views.at(Owner));
-      Eligible = llvm::any_of(Layer.Decl.Children, [&](const Node &D) {
-        if (D.K != Node::Init || D.Type != "Complete" ||
-            !StringRef(D.Text).starts_with("$virtual:"))
-          return false;
-        return llvm::any_of(
-            llvm::ArrayRef(Layer.Fields).take_front(Layer.VirtualCount),
-            [&](const Field &Field) {
-              return Field.Type == T && D.Text == Field.Decl.Text;
-            });
-      });
+      auto Manual = [&](const std::string &Type) {
+        const auto &Layer = Records.at(Type);
+        return llvm::any_of(Layer.Decl.Children, [&](const Node &D) {
+          return D.K == Node::Init && D.Type == "Complete" &&
+                 D.Text == "$virtual:" + T;
+        });
+      };
+      Binding = B.getInt32(Indices.at(Owner));
+      Eligible = B.getInt1(Manual(Root.Views.at(Owner)));
+      auto *Override = B.CreateCall(
+          M.getFunction("cpn.owner.find"),
+          {F.slotFor(Object), F.baseView(Object, Path).Address, typeID(T)});
+      for (const auto &[Candidate, Layer] : Root.Views) {
+        if (Candidate == Path || !Root.contains(Candidate, Path))
+          continue;
+        auto *Match = B.CreateCall(
+            M.getFunction("cpn.owner.matches"),
+            {Override, F.baseView(Object, Candidate).Address, typeID(Layer)});
+        Binding =
+            B.CreateSelect(Match, B.getInt32(Indices.at(Candidate)), Binding);
+        Eligible = B.CreateSelect(Match, B.getInt1(Manual(Layer)), Eligible);
+      }
     }
-    store(4, B.getInt32(Indices.at(Owner)));
-    store(5, B.getInt1(Eligible));
+    store(4, Binding);
+    store(5, Eligible);
     store(6, B.getFalse());
     store(7, B.getFalse());
   }
@@ -228,6 +241,42 @@ void Frame::propagateWhole(llvm::Value *Before) {
   B.SetInsertPoint(Next);
 }
 
+Value Frame::transferOwner(const Node &C, const Node &Operand) {
+  auto Target = eval(Operand);
+  if (StringRef(Target.Type).ends_with("*")) {
+    auto T = element(Target.Type);
+    if (StringRef(T).starts_with("const<") && T.back() == '>')
+      T = T.substr(6, T.size() - 7);
+    guard(B.CreateIsNull(Target.IR));
+    Value View{T, nullptr, Target.IR};
+    View.borrow(Target);
+    Target = View;
+  }
+  if (!IR || !Target.Address || !U.Records.count(Target.Type))
+    fail(C.At, "destruction transfer requires a class layer");
+  const auto &Layer = U.Records.at(Target.Type);
+  auto Virtuals = llvm::ArrayRef(Layer.Bases).take_front(Layer.VirtualCount);
+  auto T = resolve(C.TemplateArgs.front().Type, C.At);
+  auto V = llvm::find(Virtuals, T);
+  if (V == Virtuals.end())
+    fail(C.At, "target must contain the selected virtual base");
+  ensureLive(Target, C.At);
+  auto Base = baseView(Target, {unsigned(V - Virtuals.begin())});
+  auto *Registered = slotFor(Target);
+  auto *Containing = B.CreateCall(U.M.getFunction("cpn.slot.enclosing"),
+                                  {Target.Address, Base.Address});
+  auto *Slot =
+      B.CreateSelect(B.CreateIsNotNull(Registered), Registered, Containing);
+  guard(B.CreateIsNull(Slot));
+  // Entry into destruction freezes the binding for the complete object.
+  guard(B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(U.SlotType, Slot, 12)));
+  guard(B.CreateIsNotNull(B.CreateCall(U.M.getFunction("cpn.view.find"),
+                                       {Base.Address, U.typeID(T)})));
+  B.CreateCall(
+      U.M.getFunction("cpn.owner.assign"),
+      {Slot, Base.Address, U.typeID(T), Target.Address, U.typeID(Target.Type)});
+  return {"void"};
+}
 Value Frame::baseRequest(const Node &C, const Node &Operand) {
   if (F)
     F->MayWhole = true;
@@ -270,7 +319,11 @@ Value Frame::baseRequest(const Node &C, const Node &Operand) {
     exitWhole();
   }
   B.SetInsertPoint(External);
-  auto *Slot = slotFor(Object);
+  auto *Registered = slotFor(Object);
+  auto *Containing = B.CreateCall(U.M.getFunction("cpn.slot.enclosing"),
+                                  {Object.Address, Target.Address});
+  auto *Slot =
+      B.CreateSelect(B.CreateIsNotNull(Registered), Registered, Containing);
   guard(B.CreateIsNull(Slot));
   guard(B.CreateNot(B.CreateTrunc(
       B.CreateCall(U.M.getFunction("cpn.generation"), {Slot, B.getFalse()}),

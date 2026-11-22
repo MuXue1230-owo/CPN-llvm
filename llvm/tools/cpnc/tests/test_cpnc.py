@@ -1204,6 +1204,51 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
 
+    def test_owner_transfer_commits_per_object_and_freezes_at_destruction(self):
+        source = """
+            i32 trace; bool early;
+            struct V{~V(){trace=trace*10+2;}};
+            struct L:virtual V{Complete virtual_base<V>;
+                ~L(){if(early){destroy_base<V>(this);}trace=trace*10+1;}
+                cleanup {trace=trace*10+3;}};
+            struct R:virtual V{};
+            struct D:L,R{destruction_owner<V> = R;};
+            void change(L& layer){transfer_destruction<V>(layer);}
+        """
+        self.assertEqual(
+            self.program(
+                source
+                + """
+            i32 main(){{D d;change(d);early=true;}
+                      if(trace!=23){return 1;}trace=0;early=false;
+                      {D other;}if(trace!=132){return 2;}return 42;}
+            """
+            ),
+            42,
+        )
+        self.assertLess(
+            self.program(
+                source
+                + """
+            i32 main(){early=true;D d;return 0;}
+            """
+            ),
+            0,
+        )
+        self.assertLess(
+            self.program("""
+            struct V{};struct Layer:virtual V{~Layer(){transfer_destruction<V>(this);}};
+            i32 main(){Layer d;return 0;}
+            """),
+            0,
+        )
+        invalid = self.compile(
+            "struct V{};struct L:V{};void f(L& l){transfer_destruction<V>(l);}",
+            "--check",
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("virtual base", invalid.stderr)
+
     def test_direct_base_request_exits_the_destructor_body(self):
         for request in ("destroy_base<Parent>(this);", "this->Parent::~Parent();"):
             with self.subTest(request=request):
