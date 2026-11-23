@@ -3,10 +3,14 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/OptimizationRemarkEmitter.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/PassInstrumentation.h"
+#include "llvm/Transforms/Scalar/ConstraintElimination.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -15,6 +19,93 @@
 using namespace cpn;
 
 namespace {
+llvm::CondBrInst *controllingBranch(llvm::BasicBlock *&Arm,
+                                    llvm::BasicBlock &Join) {
+  // An operand can have its own argument-evaluation blocks. Follow only an
+  // unambiguous straight-line arm back to its conditional entry.
+  for (unsigned Depth = 0; Depth < 32; ++Depth) {
+    auto *Previous = Arm->getSinglePredecessor();
+    if (!Previous || Previous == &Join)
+      break;
+    if (auto *Branch =
+            llvm::dyn_cast<llvm::CondBrInst>(Previous->getTerminator()))
+      return Branch;
+    if (Previous->getSingleSuccessor() != Arm)
+      break;
+    Arm = Previous;
+  }
+  return nullptr;
+}
+
+llvm::Value *availableCondition(llvm::Value *V, llvm::IRBuilder<> &B,
+                                llvm::DominatorTree &Dom, unsigned Depth = 0) {
+  if (Dom.dominates(V, B.GetInsertPoint()))
+    return V;
+  if (Depth == 8)
+    return nullptr;
+  if (auto *Cast = llvm::dyn_cast<llvm::CastInst>(V);
+      Cast && Cast->isIntegerCast()) {
+    auto *Operand = availableCondition(Cast->getOperand(0), B, Dom, Depth + 1);
+    return Operand ? B.CreateCast(Cast->getOpcode(), Operand, Cast->getType())
+                   : nullptr;
+  }
+  if (auto *Compare = llvm::dyn_cast<llvm::ICmpInst>(V);
+      Compare && Compare->getOperand(0)->getType()->isIntegerTy()) {
+    auto *Left = availableCondition(Compare->getOperand(0), B, Dom, Depth + 1);
+    auto *Right = availableCondition(Compare->getOperand(1), B, Dom, Depth + 1);
+    if (Left && Right)
+      return B.CreateICmp(Compare->getPredicate(), Left, Right);
+  }
+  return nullptr;
+}
+
+// Native short-circuit expressions have a Boolean join. Expose a simple join
+// as a select without pruning edges, which might merge distinct failure sites.
+// The select leaves an unused right operand outside the condition's value when
+// the left operand bypassed it.
+void exposeShortCircuitConditions(llvm::Function &F, llvm::DominatorTree &Dom) {
+  for (auto &Block : F) {
+    if (!Dom.isReachableFromEntry(&Block))
+      continue;
+    for (auto &Phi : llvm::make_early_inc_range(Block.phis())) {
+      if (!Phi.getType()->isIntegerTy(1) || Phi.getNumIncomingValues() != 2)
+        continue;
+      auto *Shortcut =
+          llvm::dyn_cast<llvm::ConstantInt>(Phi.getIncomingValue(0));
+      unsigned Bypass = 0;
+      if (!Shortcut) {
+        Shortcut = llvm::dyn_cast<llvm::ConstantInt>(Phi.getIncomingValue(1));
+        Bypass = 1;
+      }
+      if (!Shortcut)
+        continue;
+      auto *Skipped = Phi.getIncomingBlock(Bypass);
+      auto *Evaluated = Phi.getIncomingBlock(1 - Bypass);
+      if (Skipped->getSingleSuccessor() != &Block ||
+          Evaluated->getSingleSuccessor() != &Block)
+        continue;
+      auto *Branch = controllingBranch(Skipped, Block);
+      const unsigned BypassEdge = Shortcut->isOne() ? 0 : 1;
+      if (!Branch || Branch != controllingBranch(Evaluated, Block) ||
+          Branch->getSuccessor(BypassEdge) != Skipped ||
+          Branch->getSuccessor(1 - BypassEdge) != Evaluated)
+        continue;
+
+      auto Insert = Block.getFirstNonPHIIt();
+      llvm::IRBuilder<> B(Insert);
+      auto *Right =
+          availableCondition(Phi.getIncomingValue(1 - Bypass), B, Dom);
+      if (!Right)
+        continue;
+      auto *Condition = B.CreateSelect(Branch->getCondition(),
+                                       BypassEdge == 0 ? Shortcut : Right,
+                                       BypassEdge == 0 ? Right : Shortcut);
+      Phi.replaceAllUsesWith(Condition);
+      Phi.eraseFromParent();
+    }
+  }
+}
+
 void reduceProofCFG(llvm::Function &F) {
   llvm::SmallVector<llvm::AllocaInst *> Locals;
   for (auto &Inst : F.getEntryBlock())
@@ -29,17 +120,26 @@ void reduceProofCFG(llvm::Function &F) {
   Analyses.registerPass([] { return llvm::PassInstrumentationAnalysis(); });
   Analyses.registerPass([] { return llvm::AssumptionAnalysis(); });
   Analyses.registerPass([] { return llvm::DominatorTreeAnalysis(); });
+  Analyses.registerPass([] { return llvm::LoopAnalysis(); });
+  Analyses.registerPass(
+      [] { return llvm::OptimizationRemarkEmitterAnalysis(); });
+  Analyses.registerPass([] { return llvm::ScalarEvolutionAnalysis(); });
   Analyses.registerPass([&] {
     llvm::TargetLibraryInfoImpl Library(F.getParent()->getTargetTriple());
     Library.disableAllFunctions();
     return llvm::TargetLibraryAnalysis(Library);
   });
   Analyses.registerPass([] { return llvm::TargetIRAnalysis(); });
-  llvm::EarlyCSEPass().run(F, Analyses);
+  Analyses.invalidate(F, llvm::EarlyCSEPass().run(F, Analyses));
+  exposeShortCircuitConditions(
+      F, Analyses.getResult<llvm::DominatorTreeAnalysis>(F));
 
   const auto Query = llvm::SimplifyQuery(F.getDataLayout()).getWithoutUndef();
   bool Changed;
   do {
+    // Keep relations between SSA inputs along dominating edges. A range for
+    // either input alone cannot prove, for example, a < c from a < b <= c.
+    Analyses.invalidate(F, llvm::ConstraintEliminationPass().run(F, Analyses));
     Changed = false;
     for (auto &Block : F)
       for (auto &Inst : llvm::make_early_inc_range(Block))
@@ -75,6 +175,8 @@ void reduceProofCFG(llvm::Function &F) {
     for (auto &Block : F)
       Changed |= llvm::ConstantFoldTerminator(&Block, true);
     Changed |= llvm::removeUnreachableBlocks(F, nullptr, nullptr, false);
+    if (Changed)
+      Analyses.invalidate(F, llvm::PreservedAnalyses::none());
   } while (Changed);
 }
 } // namespace

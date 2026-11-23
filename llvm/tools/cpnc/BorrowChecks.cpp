@@ -37,7 +37,17 @@ llvm::SmallVector<unsigned> positions(const llvm::MDNode *Descriptor,
 struct Slot {
   llvm::Value *Base;
   int64_t Offset;
+  bool operator==(const Slot &Other) const {
+    return Base == Other.Base && Offset == Other.Offset;
+  }
 };
+struct Condition {
+  Slot Subject;
+  const llvm::Constant *Number;
+  bool Equal;
+  bool Memory = false;
+};
+using Conditions = llvm::SmallVector<Condition, 4>;
 struct Invocation {
   llvm::CallBase &Call;
   const Invocation *Caller;
@@ -83,6 +93,19 @@ class EscapeCheck {
         return uint64_t(B.Offset) - uint64_t(A.Offset) >= DL.getPointerSize();
       return uint64_t(A.Offset) - uint64_t(B.Offset) >= Size;
     }
+    if (llvm::isa<llvm::PHINode, llvm::SelectInst>(A.Base) ||
+        llvm::isa<llvm::PHINode, llvm::SelectInst>(B.Base)) {
+      llvm::SmallVector<const llvm::Value *, 4> Left, Right;
+      llvm::getUnderlyingObjects(A.Base, Left);
+      llvm::getUnderlyingObjects(B.Base, Right);
+      auto Storage = [](const llvm::Value *V) {
+        return llvm::isa<llvm::AllocaInst, llvm::GlobalVariable>(V);
+      };
+      return !Left.empty() && !Right.empty() && llvm::all_of(Left, Storage) &&
+             llvm::all_of(Right, [&](const llvm::Value *V) {
+               return Storage(V) && !llvm::is_contained(Left, V);
+             });
+    }
     if (llvm::isa<llvm::AllocaInst>(A.Base) ||
         llvm::isa<llvm::AllocaInst>(B.Base)) {
       auto Known = [&](llvm::Value *V) {
@@ -112,6 +135,17 @@ class EscapeCheck {
                        DL.getTypeStoreSize(S->getValueOperand()->getType()));
     }
     if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+      if (auto *Stack = llvm::dyn_cast<llvm::AllocaInst>(Target.Base);
+          Stack && Stack->getAllocatedType()->isIntegerTy() &&
+          llvm::all_of(Stack->users(), [&](llvm::User *Use) {
+            if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(Use))
+              return Load->getPointerOperand() == Stack;
+            if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(Use))
+              return Store->getPointerOperand() == Stack &&
+                     Store->getValueOperand() != Stack;
+            return false;
+          }))
+        return false;
       if (auto *Descriptor = Call->getMetadata(BorrowMetadata);
           Descriptor && callSetting(*Descriptor, ReadOnly))
         return false;
@@ -485,38 +519,406 @@ class EscapeCheck {
     Active.erase(&Current);
   }
 
+  static bool constrain(Conditions &Path, Condition Test) {
+    if (!Test.Memory && !Test.Subject.Offset) {
+      if (llvm::isa<llvm::ConstantInt, llvm::ConstantPointerNull>(
+              Test.Subject.Base))
+        return (Test.Subject.Base == Test.Number) == Test.Equal;
+      if (llvm::isa<llvm::AllocaInst>(Test.Subject.Base) &&
+          llvm::isa<llvm::ConstantPointerNull>(Test.Number))
+        return !Test.Equal;
+    }
+    for (const auto &Known : Path) {
+      if (Known.Memory != Test.Memory || !(Known.Subject == Test.Subject) ||
+          Known.Number->getType() != Test.Number->getType())
+        continue;
+      if (Known.Number == Test.Number)
+        return Known.Equal == Test.Equal;
+      if (Known.Equal && Test.Equal)
+        return false;
+    }
+    Path.push_back(Test);
+    return true;
+  }
+
+  const llvm::ConstantInt *knownOutput(llvm::CallBase &Call,
+                                       const Condition &Test) const {
+    auto *Callee = Call.getCalledFunction();
+    if (!Callee || !Definitions.contains(Callee) || Call.arg_empty() ||
+        !Call.getArgOperand(0)->getType()->isPointerTy())
+      return nullptr;
+    const auto Output = slot(Call.getArgOperand(0));
+    int64_t Offset;
+    if (Output.Base != Test.Subject.Base ||
+        llvm::SubOverflow(Test.Subject.Offset, Output.Offset, Offset) ||
+        Offset < 0)
+      return nullptr;
+
+    // A native result producer can establish a fixed discriminant in its
+    // caller's destination. Inspect each reachable normal return without
+    // treating unknown writes or a control-flow merge as an exact constant.
+    const Slot Destination{Callee->getArg(0), Offset};
+    const llvm::ConstantInt *Value = nullptr;
+    unsigned Budget = 128;
+    llvm::SmallPtrSet<llvm::BasicBlock *, 8> Seen;
+    llvm::SmallVector<llvm::BasicBlock *, 8> Work{&Callee->getEntryBlock()};
+    while (!Work.empty()) {
+      auto *Block = Work.pop_back_val();
+      if (!Seen.insert(Block).second)
+        continue;
+      if (!Budget--)
+        return nullptr;
+      if (!llvm::isa<llvm::ReturnInst>(Block->getTerminator())) {
+        if (auto *Known = successor(Block))
+          Work.push_back(Known);
+        else
+          llvm::append_range(Work, llvm::successors(Block));
+        continue;
+      }
+      const llvm::ConstantInt *Last = nullptr;
+      for (auto *Current = Block; Current && !Last;
+           Current = Current->getSinglePredecessor()) {
+        for (auto &I : llvm::reverse(*Current)) {
+          if (!Budget--)
+            return nullptr;
+          if (auto *S = llvm::dyn_cast<llvm::StoreInst>(&I);
+              S && !S->isVolatile() && !S->isAtomic() &&
+              slot(S->getPointerOperand()) == Destination &&
+              S->getValueOperand()->getType() == Test.Number->getType()) {
+            Last = llvm::dyn_cast<llvm::ConstantInt>(S->getValueOperand());
+            if (!Last)
+              return nullptr;
+            break;
+          }
+          if (mayChange(I, Destination))
+            return nullptr;
+        }
+      }
+      if (!Last || (Value && Last != Value))
+        return nullptr;
+      Value = Last;
+    }
+    return Value;
+  }
+
+  // Discriminants are frequently extracted from an aggregate load. Retain
+  // the relevant byte offset until we cross the actual load, so a write
+  // between the load and its branch cannot change the observed value.
+  bool
+  reverseConditions(llvm::Instruction &I, Conditions &Path,
+                    const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors,
+                    bool &Uncertain) const {
+    auto Later = std::move(Path);
+    Path.clear();
+    for (auto Test : Later) {
+      if (Test.Memory) {
+        if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I);
+            Store && slot(Store->getPointerOperand()) == Test.Subject &&
+            Store->getValueOperand()->getType() == Test.Number->getType()) {
+          Test.Subject = {Store->getValueOperand(), 0};
+          Test.Memory = false;
+        } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+                   Call && Constructors.contains(Call->getCalledFunction())) {
+          if (!disjoint(Test.Subject, slot(Call->getArgOperand(0)),
+                        DL.getPointerSize())) {
+            Uncertain = true;
+            continue;
+          }
+        } else if (mayChange(I, Test.Subject)) {
+          auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+          auto *Fixed = Call ? knownOutput(*Call, Test) : nullptr;
+          if (!Fixed)
+            Uncertain = true;
+          else if ((Fixed == Test.Number) != Test.Equal)
+            return false;
+          continue;
+        }
+      } else if (Test.Subject.Base == &I) {
+        if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(&I);
+            Load && !Load->isVolatile() && !Load->isAtomic()) {
+          auto Address = slot(Load->getPointerOperand());
+          if (llvm::AddOverflow(Address.Offset, Test.Subject.Offset,
+                                Address.Offset)) {
+            Uncertain = true;
+            continue;
+          }
+          Test.Subject = Address;
+          Test.Memory = true;
+        } else if (auto *Extract = llvm::dyn_cast<llvm::ExtractValueInst>(&I);
+                   Extract && Extract->getNumIndices() == 1 &&
+                   Extract->getAggregateOperand()->getType()->isStructTy()) {
+          auto *Type = llvm::cast<llvm::StructType>(
+              Extract->getAggregateOperand()->getType());
+          auto Offset =
+              DL.getStructLayout(Type)->getElementOffset(*Extract->idx_begin());
+          if (llvm::AddOverflow(Test.Subject.Offset, int64_t(Offset),
+                                Test.Subject.Offset)) {
+            Uncertain = true;
+            continue;
+          }
+          Test.Subject.Base = Extract->getAggregateOperand();
+        } else if (auto *Compare = llvm::dyn_cast<llvm::ICmpInst>(&I);
+                   Compare && Compare->isEquality() && !Test.Subject.Offset) {
+          auto *Other = Compare->getOperand(1);
+          if (!llvm::isa<llvm::ConstantInt, llvm::ConstantPointerNull>(Other)) {
+            Uncertain = true;
+            continue;
+          }
+          const bool Expected = Test.Number->isNullValue() != Test.Equal;
+          Test = {{Compare->getOperand(0), 0},
+                  llvm::cast<llvm::Constant>(Other),
+                  Expected ==
+                      (Compare->getPredicate() == llvm::CmpInst::ICMP_EQ)};
+        } else if (I.getOpcode() == llvm::Instruction::Xor &&
+                   I.getType()->isIntegerTy(1) && !Test.Subject.Offset &&
+                   llvm::isa<llvm::ConstantInt>(I.getOperand(1))) {
+          if (llvm::cast<llvm::ConstantInt>(I.getOperand(1))->isOne())
+            Test.Equal = !Test.Equal;
+          Test.Subject.Base = I.getOperand(0);
+        } else if (!llvm::isa<llvm::PHINode>(I)) {
+          Uncertain = true;
+          continue;
+        }
+      }
+      if (!constrain(Path, Test))
+        return false;
+    }
+    return true;
+  }
+
+  bool enterPredecessor(llvm::BasicBlock *From, llvm::BasicBlock *To,
+                        Conditions &Path, bool &Uncertain) const {
+    if (auto *Known = successor(From); Known && Known != To)
+      return false;
+    auto Later = std::move(Path);
+    Path.clear();
+    for (auto Test : Later) {
+      if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(Test.Subject.Base);
+          Phi && Phi->getParent() == To) {
+        auto *Incoming = Phi->getIncomingValueForBlock(From);
+        if (Test.Memory) {
+          auto Address = slot(Incoming);
+          if (llvm::AddOverflow(Address.Offset, Test.Subject.Offset,
+                                Address.Offset)) {
+            Uncertain = true;
+            continue;
+          }
+          Test.Subject = Address;
+        } else
+          Test.Subject.Base = Incoming;
+      }
+      if (!constrain(Path, Test))
+        return false;
+    }
+    auto *Terminator = From->getTerminator();
+    if (auto *Branch = llvm::dyn_cast<llvm::CondBrInst>(Terminator)) {
+      if (Branch->getSuccessor(0) == Branch->getSuccessor(1))
+        return true;
+      auto *Value =
+          llvm::ConstantInt::get(llvm::Type::getInt1Ty(From->getContext()),
+                                 Branch->getSuccessor(0) == To);
+      return constrain(Path, {{Branch->getCondition(), 0}, Value, true});
+    }
+    if (auto *Switch = llvm::dyn_cast<llvm::SwitchInst>(Terminator)) {
+      Slot Subject{Switch->getCondition(), 0};
+      if (Switch->getDefaultDest() == To) {
+        for (const auto &Case : Switch->cases())
+          if (Case.getCaseSuccessor() != To &&
+              !constrain(Path, {Subject, Case.getCaseValue(), false}))
+            return false;
+      } else {
+        const llvm::ConstantInt *Number = nullptr;
+        for (const auto &Case : Switch->cases())
+          if (Case.getCaseSuccessor() == To) {
+            if (Number) {
+              Uncertain = true;
+              return true;
+            }
+            Number = Case.getCaseValue();
+          }
+        if (Number)
+          return constrain(Path, {Subject, Number, true});
+      }
+    }
+    return true;
+  }
+
+  using TestOrigin = llvm::function_ref<bool(
+      llvm::Value *, llvm::ArrayRef<const llvm::Value *>)>;
+  enum class BorrowQuestion { ExpiredReferent, ExpiredLoad, PublishedOrigin };
+
+  // Follow pointer storage backwards, through the predecessor-specific value
+  // of any result address and through exact copies of the stored pointer.
+  // Static borrowing must remain an error only when the relevant flow path
+  // is known, including the case guard on a tagged Result payload.
+  bool checkStoredOrigins(
+      llvm::Instruction &Use, Slot Target, llvm::LoadInst *Pending,
+      const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors,
+      BorrowQuestion Question, TestOrigin Test) const {
+    const bool EveryPath = Question != BorrowQuestion::PublishedOrigin;
+    enum class Origin { Search, Matched, Unknown };
+    struct Position {
+      llvm::BasicBlock *Block;
+      llvm::BasicBlock::iterator Cursor;
+      Slot Target;
+      llvm::LoadInst *PendingLoad;
+      Origin Result = Origin::Search;
+      bool Uncertain = false;
+      Conditions Path;
+      llvm::SmallVector<const llvm::Value *, 4> Ended;
+      llvm::SmallVector<llvm::BasicBlock *, 8> Visited;
+    };
+    llvm::SmallVector<Position, 4> Work{
+        {Use.getParent(), Use.getIterator(), Target, Pending}};
+    bool Proved = false;
+    unsigned Budget = 2048;
+    while (!Work.empty()) {
+      auto P = Work.pop_back_val();
+      if (llvm::is_contained(P.Visited, P.Block)) {
+        if (EveryPath)
+          return false;
+        continue;
+      }
+      P.Visited.push_back(P.Block);
+      bool Finished = false;
+      while (P.Cursor != P.Block->begin()) {
+        if (!Budget--)
+          return false;
+        auto &I = *--P.Cursor;
+        if (!reverseConditions(I, P.Path, Constructors, P.Uncertain)) {
+          Finished = true;
+          break;
+        }
+        if (P.Result != Origin::Search)
+          continue;
+        if (EveryPath)
+          if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I))
+            if (Call->getMetadata(TemporaryEnd))
+              P.Ended.push_back(Call->getArgOperand(0));
+        if (Question == BorrowQuestion::ExpiredLoad) {
+          if (Test(P.Target.Base, P.Ended))
+            P.Result = Origin::Matched;
+          else if (mayChange(I, P.Target))
+            P.Result = Origin::Unknown;
+          continue;
+        }
+        if (P.PendingLoad) {
+          if (&I == P.PendingLoad) {
+            P.Target = slot(P.PendingLoad->getPointerOperand());
+            P.PendingLoad = nullptr;
+          }
+          continue;
+        }
+        llvm::Value *Referent = nullptr;
+        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+            Call && Constructors.contains(Call->getCalledFunction()) &&
+            slot(Call->getArgOperand(0)) == P.Target) {
+          Referent = Call->getArgOperand(1);
+        } else if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I);
+                   Store && !Store->isVolatile() && !Store->isAtomic() &&
+                   Store->getValueOperand()->getType()->isPointerTy() &&
+                   slot(Store->getPointerOperand()) == P.Target) {
+          if (auto *Load =
+                  llvm::dyn_cast<llvm::LoadInst>(Store->getValueOperand());
+              Load && !Load->isVolatile() && !Load->isAtomic()) {
+            P.PendingLoad = Load;
+            continue;
+          }
+          Referent = Store->getValueOperand();
+        }
+        if (Referent) {
+          P.Result =
+              Test(Referent, P.Ended) ? Origin::Matched : Origin::Unknown;
+        } else if (mayChange(I, P.Target))
+          P.Result = Origin::Unknown;
+      }
+      if (Finished)
+        continue;
+      if (llvm::pred_empty(P.Block)) {
+        if (EveryPath && P.Result != Origin::Matched)
+          return false;
+        if (P.Result == Origin::Matched) {
+          if (!EveryPath && !P.Uncertain)
+            return true;
+          Proved |= EveryPath && !P.Uncertain;
+        }
+        continue;
+      }
+      for (auto *Pred : llvm::predecessors(P.Block)) {
+        auto Previous = P;
+        if (!Reachable.contains(Pred) ||
+            !enterPredecessor(Pred, P.Block, Previous.Path, Previous.Uncertain))
+          continue;
+        if (!P.PendingLoad && P.Result == Origin::Search)
+          if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(P.Target.Base);
+              Phi && Phi->getParent() == P.Block) {
+            auto Address = slot(Phi->getIncomingValueForBlock(Pred));
+            if (llvm::AddOverflow(Address.Offset, P.Target.Offset,
+                                  Address.Offset))
+              return false;
+            Previous.Target = Address;
+          }
+        Previous.Block = Pred;
+        Previous.Cursor = Pred->end();
+        Work.push_back(std::move(Previous));
+      }
+    }
+    return Proved;
+  }
+
+  static bool expired(llvm::Value *Referent,
+                      llvm::ArrayRef<const llvm::Value *> Ended) {
+    llvm::SmallVector<const llvm::Value *, 4> Objects;
+    llvm::getUnderlyingObjects(Referent, Objects);
+    return !Objects.empty() && llvm::all_of(Objects, [&](auto *Object) {
+      return llvm::is_contained(Ended, Object);
+    });
+  }
+
   void verifyTemporaryGet(
       llvm::CallBase &Getter, const Token &At,
       const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors) const {
-    const auto Target = slot(Getter.getArgOperand(0));
-    auto *Block = Getter.getParent();
-    auto Current = Getter.getIterator();
-    llvm::SmallPtrSet<llvm::Value *, 4> Expired;
-    for (unsigned Budget = 256; Block && Budget; --Budget) {
-      if (Current == Block->begin()) {
-        Block = Block->getSinglePredecessor();
-        if (Block)
-          Current = Block->end();
-        continue;
-      }
-      auto &I = *--Current;
-      if (auto *C = llvm::dyn_cast<llvm::CallBase>(&I)) {
-        if (C->getMetadata(TemporaryEnd))
-          Expired.insert(C->getArgOperand(0));
-        if (Constructors.contains(C->getCalledFunction())) {
-          const auto Output = slot(C->getArgOperand(0));
-          if (Output.Base == Target.Base && Output.Offset == Target.Offset) {
-            const auto Referent = slot(C->getArgOperand(1));
-            if (Expired.contains(Referent.Base))
-              fail(callSite(Getter, At),
-                   "Ref designates an ended full-expression temporary");
-            return;
-          }
-        }
-      }
-      if (mayChange(I, Target))
-        return;
-    }
+    if (checkStoredOrigins(Getter, slot(Getter.getArgOperand(0)), nullptr,
+                           Constructors, BorrowQuestion::ExpiredReferent,
+                           expired))
+      fail(callSite(Getter, At),
+           "Ref designates an ended full-expression temporary");
+  }
+
+  void verifyTemporaryLoad(
+      llvm::LoadInst &Load, const Token &At,
+      const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors) const {
+    auto *Address = Load.getPointerOperand();
+    llvm::SmallVector<const llvm::Value *, 4> Objects;
+    llvm::getUnderlyingObjects(Address, Objects);
+    if (Objects.empty() || llvm::any_of(Objects, [](const auto *Object) {
+          return !llvm::isa<llvm::AllocaInst>(Object) ||
+                 llvm::none_of(Object->users(), [](const auto *User) {
+                   auto *I = llvm::dyn_cast<llvm::Instruction>(User);
+                   return I && I->getMetadata(TemporaryEnd);
+                 });
+        }))
+      return;
+    if (checkStoredOrigins(Load, slot(Address), nullptr, Constructors,
+                           BorrowQuestion::ExpiredLoad, expired))
+      fail(At, "load designates an ended full-expression temporary");
+  }
+
+  bool publishesStoredBorrow(
+      llvm::Instruction &Use, llvm::Value *Value, Prohibited Denied,
+      const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors) const {
+    auto *Load =
+        llvm::dyn_cast<llvm::LoadInst>(llvm::getUnderlyingObject(Value));
+    if (!Load || Load->isVolatile() || Load->isAtomic() ||
+        !Load->getType()->isPointerTy())
+      return false;
+    auto Exact = [&](llvm::Value *Referent,
+                     llvm::ArrayRef<const llvm::Value *>) {
+      return Denied(llvm::getUnderlyingObject(Referent));
+    };
+    return checkStoredOrigins(Use, slot(Load->getPointerOperand()), Load,
+                              Constructors, BorrowQuestion::PublishedOrigin,
+                              Exact);
   }
 
 public:
@@ -567,9 +969,11 @@ public:
     auto IsAutomatic = [&](llvm::Value *V) {
       return llvm::isa<llvm::AllocaInst>(V) || Automatic.contains(V);
     };
-    auto Check = [&](llvm::Value *V, bool Returning, bool Direct) {
+    auto Check = [&](llvm::Instruction &Use, llvm::Value *V, bool Returning,
+                     bool Direct) {
       unsigned Budget = 256;
-      if (originatesFrom(V, Budget, IsAutomatic))
+      if (originatesFrom(V, Budget, IsAutomatic) ||
+          publishesStoredBorrow(Use, V, IsAutomatic, RefConstructors))
         fail(At, Direct ? "borrow of automatic storage escapes the function"
                         : "borrow of automatic storage escapes through the "
                           "result or static object");
@@ -577,9 +981,11 @@ public:
       if (Restricted.empty())
         return;
       Budget = 256;
-      if (originatesFrom(V, Budget, [&](llvm::Value *Source) {
-            return Restricted.contains(Source);
-          }))
+      auto IsRestricted = [&](llvm::Value *Source) {
+        return Restricted.contains(Source);
+      };
+      if (originatesFrom(V, Budget, IsRestricted) ||
+          publishesStoredBorrow(Use, V, IsRestricted, RefConstructors))
         fail(At, "escaping borrow violates the declared parameter contract");
     };
     for (auto *BB : Reachable)
@@ -587,9 +993,11 @@ public:
         if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
             Call && RefGetters.contains(Call->getCalledFunction()))
           verifyTemporaryGet(*Call, At, RefConstructors);
+        if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(&I))
+          verifyTemporaryLoad(*Load, At, RefConstructors);
         if (auto *R = llvm::dyn_cast<llvm::ReturnInst>(&I))
           if (auto *V = R->getReturnValue(); V && V->getType()->isPointerTy())
-            Check(V, true, true);
+            Check(*R, V, true, true);
         auto *S = llvm::dyn_cast<llvm::StoreInst>(&I);
         if (!S || !S->getValueOperand()->getType()->isPointerTy())
           continue;
@@ -601,7 +1009,7 @@ public:
         unsigned Budget = 256;
         if (Type && Dest.Offset >= 0 && pointerAt(Type, Dest.Offset) &&
             survivesReturn(*S, Dest, Budget))
-          Check(S->getValueOperand(), Dest.Base == Result, false);
+          Check(*S, S->getValueOperand(), Dest.Base == Result, false);
       }
     unsigned Budget = 4096;
     llvm::SmallPtrSet<llvm::Function *, 16> Active;

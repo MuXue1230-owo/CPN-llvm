@@ -185,42 +185,49 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
   auto subobject = [&](const std::string &FieldType, unsigned I,
                        const Case *Alternative = nullptr) {
     auto *Fields = Alternative ? unpackVariant(*Alternative, C, At) : C;
-    Value V{unconst(FieldType), Fields->getAggregateElement(I), nullptr,
-            Source.Readonly || FieldType != unconst(FieldType)};
-    V.Expiring = Source.Expiring;
+    auto T = unconst(FieldType);
+    bool Readonly = Source.Readonly || FieldType != T ||
+                    (Alternative && Alternative->Decl.Params[I].Const);
+    Value V{T, Fields->getAggregateElement(I), nullptr, Readonly};
     if (Source.Location) {
       auto Place = *Source.Location;
-      Place.Type = V.Type;
-      Place.Readonly |= V.Readonly;
+      Place.Type = T;
+      Place.Readonly |= Readonly;
       Place.Steps.push_back({I, Alternative});
+      V = Place.read(*this, At);
       V.Location = std::make_shared<ConstantPlace>(std::move(Place));
     }
+    V.Expiring = Source.Expiring;
     return llvm::cast<llvm::Constant>(constantCopy(V, At).IR);
   };
   if (auto R = U.Records.find(Type); R != U.Records.end()) {
     auto S = R->second.Special.find(Op);
-    {
+    auto CopyPayload = [&] {
       auto Tag = llvm::cast<llvm::ConstantInt>(C->getAggregateElement(0u))
                      ->getZExtValue();
       auto &Alternative = U.Cases.at(U.Variants.at(Type).at(Tag));
       std::vector<llvm::Constant *> Fields;
       for (unsigned I = 0; I < Alternative.Types.size(); ++I)
         Fields.push_back(subobject(Alternative.Types[I], I, &Alternative));
-      C = packVariant(Alternative,
-                      llvm::ConstantStruct::get(Alternative.Payload, Fields),
-                      At);
-      if (S != R->second.Special.end() && S->second.Body) {
-        Frame Body(U, S->second.Body, nullptr);
-        Body.bindInlineParams({Source});
-        Body.checkContracts(true);
-        Value Dest{Type, C};
-        Body.ConstantReceiver = &Dest;
-        U.ConstantInvariantLifetimes.push_back(&Dest);
-        auto End =
-            llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
-        Body.constructorBody(S->second.Body->Decl.Children.front());
-        C = llvm::cast<llvm::Constant>(Dest.IR);
-      }
+      return packVariant(Alternative,
+                         llvm::ConstantStruct::get(Alternative.Payload, Fields),
+                         At);
+    };
+    if (S == R->second.Special.end() || !S->second.Body)
+      C = CopyPayload();
+    else {
+      auto *D = S->second.Body;
+      requireObserver(D->Effects, At, D);
+      Frame Body(U, D, nullptr);
+      Body.bindInlineParams({Source});
+      Body.checkContracts(true);
+      Value Dest{Type, CopyPayload()};
+      Body.ConstantReceiver = &Dest;
+      U.ConstantInvariantLifetimes.push_back(&Dest);
+      auto End =
+          llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
+      Body.constructorBody(D->Decl.Children.front());
+      C = llvm::cast<llvm::Constant>(Dest.IR);
     }
   } else if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType());
              Array && U.aggregate(unconst(element(Type))) &&
@@ -758,8 +765,14 @@ Value Frame::constantAssignment(const Node &N) {
   auto Place = constantPlace(N.Children.front());
   if (!Place || Place->Root->Address || Place->Readonly)
     fail(N.At, "constant assignment requires a writable local variable");
-  auto Old = Place->read(*this, N.At);
   const auto &Type = Place->Type;
+  if (N.Text == "=" && U.Variants.count(Type)) {
+    auto Right = eval(N.Children[1], Type);
+    auto Left = Place->read(*this, N.At);
+    Left.Location = std::make_shared<ConstantPlace>(std::move(*Place));
+    return applyOperator("operator=", N.At, {{Left, Right}, {}, {}});
+  }
+  auto Old = Place->read(*this, N.At);
   Value V;
   if (N.Text == "=")
     V = eval(N.Children[1], Type);

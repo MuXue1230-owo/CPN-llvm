@@ -1,9 +1,16 @@
 #include "NumericLiteral.h"
 #include "Sema.h"
 #include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/IR/IntrinsicsX86.h"
+#include "llvm/Transforms/Utils/ModuleUtils.h"
 using namespace cpn;
 namespace {
+constexpr unsigned MXCSRRounding = 3u << 13;
+constexpr unsigned MXCSRSubnormal = (1u << 15) | (1u << 6);
+constexpr unsigned MXCSRFlags = 0x3f, MXCSRMasks = MXCSRFlags << 7;
+constexpr unsigned MXCSREvents = 0x3d, MXCSREventMasks = MXCSREvents << 7;
+
 llvm::RoundingMode rounding(const std::string &Name) {
   if (Name == "toward_zero")
     return llvm::RoundingMode::TowardZero;
@@ -16,21 +23,65 @@ llvm::RoundingMode rounding(const std::string &Name) {
   return llvm::RoundingMode::NearestTiesToEven;
 }
 
+unsigned roundingRegister(llvm::RoundingMode Mode) {
+  switch (Mode) {
+  case llvm::RoundingMode::NearestTiesToEven:
+    return 0;
+  case llvm::RoundingMode::TowardNegative:
+    return 1;
+  case llvm::RoundingMode::TowardPositive:
+    return 2;
+  case llvm::RoundingMode::TowardZero:
+    return 3;
+  default:
+    llvm_unreachable("unsupported MXCSR rounding mode");
+  }
+}
+
 llvm::AllocaInst *mxcsrSlot(Frame &F) {
   llvm::IRBuilder<> Entry(F.IR->getEntryBlock().begin());
   return Entry.CreateAlloca(F.B.getInt32Ty(), nullptr, "fp.control");
 }
-llvm::Value *readMXCSR(Frame &F, llvm::Value *Cell) {
-  F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
-                     &F.U.M, llvm::Intrinsic::x86_sse_stmxcsr),
-                 {Cell});
+llvm::Value *readMXCSR(Frame &F, llvm::Value *Cell,
+                       llvm::StringRef Effect = {}) {
+  auto *Call = F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                                  &F.U.M, llvm::Intrinsic::x86_sse_stmxcsr),
+                              {Cell});
+  if (!Effect.empty())
+    Call->setMetadata(
+        "cpn.effect",
+        llvm::MDNode::get(F.U.C, llvm::MDString::get(F.U.C, Effect)));
   return F.B.CreateLoad(F.B.getInt32Ty(), Cell);
 }
-void writeMXCSR(Frame &F, llvm::Value *Cell, llvm::Value *V) {
+void writeMXCSR(Frame &F, llvm::Value *Cell, llvm::Value *V,
+                llvm::StringRef Effect = {}) {
   F.B.CreateStore(V, Cell);
-  F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
-                     &F.U.M, llvm::Intrinsic::x86_sse_ldmxcsr),
-                 {Cell});
+  auto *Call = F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                                  &F.U.M, llvm::Intrinsic::x86_sse_ldmxcsr),
+                              {Cell});
+  if (!Effect.empty())
+    Call->setMetadata(
+        "cpn.effect",
+        llvm::MDNode::get(F.U.C, llvm::MDString::get(F.U.C, Effect)));
+}
+
+llvm::Value *roundingFromMXCSR(llvm::IRBuilder<> &B, llvm::Value *Value) {
+  auto *RC = B.CreateAnd(B.CreateLShr(Value, 13), 3);
+  // MXCSR rounds to nearest, negative, positive, zero in this order.
+  auto *Modes = B.getInt32(1 | (3 << 8) | (2 << 16));
+  return B.CreateTrunc(B.CreateLShr(Modes, B.CreateShl(RC, 3)), B.getInt8Ty());
+}
+
+llvm::Value *denseFlags(llvm::IRBuilder<> &B, llvm::Value *Value) {
+  return B.CreateTrunc(B.CreateOr(B.CreateAnd(Value, 1),
+                                  B.CreateAnd(B.CreateLShr(Value, 1), 30)),
+                       B.getInt8Ty());
+}
+
+llvm::Value *sparseFlags(llvm::IRBuilder<> &B, llvm::Value *Value) {
+  auto *Wide = B.CreateZExt(Value, B.getInt32Ty());
+  return B.CreateOr(B.CreateAnd(Wide, 1),
+                    B.CreateShl(B.CreateAnd(Wide, 30), 1));
 }
 
 // MXCSR contains the active rounding and subnormal controls, exception masks,
@@ -40,10 +91,6 @@ class FloatingOperation {
   Frame &F;
   llvm::AllocaInst *Cell = nullptr;
   llvm::Value *Saved = nullptr, *Traps = nullptr;
-  static constexpr unsigned Rounding = 3u << 13;
-  static constexpr unsigned Subnormal = (1u << 15) | (1u << 6);
-  static constexpr unsigned Flags = 0x3f, Masks = Flags << 7, Events = 0x3d;
-
 public:
   llvm::RoundingMode Mode;
   explicit FloatingOperation(Frame &F, bool Observed = false) : F(F) {
@@ -51,7 +98,7 @@ public:
     auto Name = F.Opt.FPRounding;
     if (Name.empty())
       Name = Strict ? "current" : "nearest_ties_even";
-    if (Name == "current" && !F.Opt.InitialRounding.empty())
+    if (!F.IR && Name == "current" && !F.Opt.InitialRounding.empty())
       Name = F.Opt.InitialRounding;
     Mode = Name == "current" ? llvm::RoundingMode::NearestTiesToEven
                              : rounding(Name);
@@ -61,10 +108,7 @@ public:
     if (!F.IR)
       return;
     bool Preserve = F.Opt.FPSubnormal == "preserve" ||
-                    (Observed && F.Opt.FPSubnormal.empty()) ||
-                    ((F.Opt.FPSubnormal == "current" ||
-                      (Strict && F.Opt.FPSubnormal.empty())) &&
-                     F.Opt.InitialSubnormal == "preserve");
+                    (!Strict && Observed && F.Opt.FPSubnormal.empty());
     if (!Observed && !Strict && !F.Opt.FPTrapMask && Name == "current" &&
         !Preserve)
       return;
@@ -73,35 +117,31 @@ public:
     auto *Controls = Saved;
     if (Observed || Strict || F.Opt.FPTrapMask) {
       if (!Observed) {
-        if (F.Opt.FPTrapMask || F.Opt.FPInitialTraps)
-          Traps = F.B.getInt32(
-              F.Opt.FPTrapMask.value_or(F.Opt.FPInitialTraps.value_or(0)));
+        if (F.Opt.FPTrapMask)
+          Traps = F.B.getInt32(*F.Opt.FPTrapMask);
         else
-          Traps =
-              F.B.CreateAnd(F.B.CreateNot(F.B.CreateLShr(Saved, 7)), Events);
+          Traps = F.B.CreateAnd(F.B.CreateNot(F.B.CreateLShr(Saved, 7)),
+                                MXCSREvents);
       }
-      Controls = F.B.CreateOr(F.B.CreateAnd(Controls, ~Flags), Masks);
+      Controls = F.B.CreateOr(F.B.CreateAnd(Controls, ~MXCSRFlags), MXCSRMasks);
     }
     if (Name != "current") {
-      unsigned RC = Mode == llvm::RoundingMode::TowardNegative   ? 1
-                    : Mode == llvm::RoundingMode::TowardPositive ? 2
-                    : Mode == llvm::RoundingMode::TowardZero     ? 3
-                                                                 : 0;
-      Controls = F.B.CreateOr(F.B.CreateAnd(Controls, ~Rounding), RC << 13);
+      Controls = F.B.CreateOr(F.B.CreateAnd(Controls, ~MXCSRRounding),
+                              roundingRegister(Mode) << 13);
     }
     if (Preserve)
-      Controls = F.B.CreateAnd(Controls, ~Subnormal);
+      Controls = F.B.CreateAnd(Controls, ~MXCSRSubnormal);
     writeMXCSR(F, Cell, Controls);
   }
   llvm::Value *finish() {
     if (!Saved)
       return F.B.getInt32(0);
-    auto *Local = F.B.CreateAnd(readMXCSR(F, Cell), Flags);
+    auto *Local = F.B.CreateAnd(readMXCSR(F, Cell), MXCSRFlags);
     writeMXCSR(F, Cell, F.B.CreateOr(Saved, Local));
     Saved = nullptr;
     if (Traps)
       F.guard(F.B.CreateIsNotNull(F.B.CreateAnd(Local, Traps)), "numeric");
-    return F.B.CreateAnd(Local, Events);
+    return F.B.CreateAnd(Local, MXCSREvents);
   }
   ~FloatingOperation() { finish(); }
   static unsigned eventBits(llvm::APFloat::opStatus Status) {
@@ -521,17 +561,11 @@ llvm::Value *castRounding(Frame &F, bool Integer, bool Exact,
   auto Name = F.Opt.FPRounding;
   if (Name.empty())
     Name = F.Opt.FPProfile == "strict" ? "current" : "nearest_ties_even";
-  if (Name == "current" && !F.Opt.InitialRounding.empty())
+  if (!F.IR && Name == "current" && !F.Opt.InitialRounding.empty())
     Name = F.Opt.InitialRounding;
   if (Name != "current" || !F.IR)
     return B.getInt8(unsigned(rounding(Name)));
-  auto *Current = readMXCSR(F, mxcsrSlot(F));
-  auto *RC = B.CreateTrunc(B.CreateLShr(Current, 13), B.getIntNTy(2));
-  // MXCSR rounds to nearest, negative, positive, zero in this order.
-  auto *Modes = B.getInt32(1 | (3 << 8) | (2 << 16));
-  return B.CreateTrunc(
-      B.CreateLShr(Modes, B.CreateShl(B.CreateZExt(RC, B.getInt32Ty()), 3)),
-      B.getInt8Ty());
+  return roundingFromMXCSR(B, readMXCSR(F, mxcsrSlot(F)));
 }
 
 void mergeCastEvents(Frame &F, llvm::Value *Flags) {
@@ -547,7 +581,189 @@ void mergeCastEvents(Frame &F, llvm::Value *Flags) {
   auto *Events = F.B.CreateShl(F.B.CreateZExt(Flags, F.B.getInt32Ty()), 1);
   writeMXCSR(F, Cell, F.B.CreateOr(Current, Events));
 }
+
+enum class ContextOperation { GetControl, GetStatus, SetControl, Clear, Merge };
+
+std::optional<ContextOperation> contextOperation(llvm::StringRef Name) {
+  Name.consume_front("::");
+  Name.consume_front("std::numeric::");
+  return llvm::StringSwitch<std::optional<ContextOperation>>(Name)
+      .Case("get_fp_control", ContextOperation::GetControl)
+      .Case("get_fp_status", ContextOperation::GetStatus)
+      .Case("try_set_fp_control", ContextOperation::SetControl)
+      .Case("clear_fp_status", ContextOperation::Clear)
+      .Case("merge_fp_status", ContextOperation::Merge)
+      .Default(std::nullopt);
+}
+
+constexpr char ControlType[] = "std::numeric::FPControl";
+constexpr char StatusType[] = "std::numeric::FPStatus";
+constexpr char FlagSetType[] = "std::numeric::FPFlagSet";
+constexpr char SubnormalType[] = "std::numeric::SubnormalPolicy";
+constexpr char ControlErrorType[] = "std::numeric::FPControlError";
+
+llvm::Value *oneField(Frame &F, const char *Type, llvm::Value *Field) {
+  return F.B.CreateInsertValue(llvm::Constant::getNullValue(F.U.ir(Type)),
+                               Field, 0);
+}
+
+Value setControl(Frame &F, llvm::Value *Control, const Token &At) {
+  auto &B = F.B;
+  auto *Mode = B.CreateExtractValue(Control, 0);
+  auto *Traps = B.CreateExtractValue(Control, {1, 0});
+  auto *Subnormal = B.CreateExtractValue(Control, {2, 0});
+  auto *BadMode = B.CreateICmpUGE(Mode, B.getInt8(4));
+  auto *BadSubnormal = B.CreateIsNotNull(Subnormal);
+  auto *BadTraps = B.CreateICmpUGT(Traps, B.getInt8(31));
+  auto *Bad = B.CreateOr(BadMode, B.CreateOr(BadSubnormal, BadTraps));
+
+  const auto Type =
+      F.resolve("::std::Result<void,::std::numeric::FPControlError>", At);
+  const auto &Ok = F.U.Cases.at(Type + "::Ok");
+  const auto &Err = F.U.Cases.at(Type + "::Err");
+  auto *Storage = F.resultAddress(Type, At);
+  auto *Tag = B.CreateStructGEP(F.U.ir(Type), Storage, 0);
+  auto *Success = F.block("fp.control.ok"),
+       *Failure = F.block("fp.control.err"),
+       *Done = F.block("fp.control.result");
+  B.CreateCondBr(Bad, Failure, Success);
+
+  B.SetInsertPoint(Success);
+  auto *Cell = mxcsrSlot(F);
+  auto *Saved = readMXCSR(F, Cell, "fp_control");
+  // The four admitted source enumerators map to zero, nearest, positive,
+  // negative respectively, in the encoding of RoundingMode.
+  auto *RC = B.CreateAnd(
+      B.CreateLShr(B.getInt32(3 | (2 << 16) | (1 << 24)),
+                   B.CreateShl(B.CreateZExt(Mode, B.getInt32Ty()), 3)),
+      3);
+  auto *NewControls = B.CreateOr(
+      B.CreateShl(RC, 13),
+      B.CreateXor(B.CreateShl(sparseFlags(B, Traps), 7), MXCSREventMasks));
+  constexpr unsigned OwnedControls =
+      MXCSRRounding | MXCSRSubnormal | MXCSREventMasks;
+  writeMXCSR(F, Cell,
+             B.CreateOr(B.CreateAnd(Saved, ~OwnedControls), NewControls),
+             "fp_control");
+  B.CreateStore(B.getInt32(Ok.Tag), Tag);
+  F.branch(Done);
+
+  B.SetInsertPoint(Failure);
+  auto ErrorTag = [&](const char *Case) {
+    return B.getInt32(
+        F.U.Cases.at(std::string(ControlErrorType) + "::" + Case).Tag);
+  };
+  auto *Error = B.CreateSelect(BadSubnormal, ErrorTag("UnsupportedSubnormal"),
+                               ErrorTag("UnsupportedTrapMask"));
+  Error = B.CreateSelect(BadMode, ErrorTag("UnsupportedRounding"), Error);
+  B.CreateStore(oneField(F, ControlErrorType, Error),
+                F.payloadAddress(Err, Storage, 0));
+  B.CreateStore(B.getInt32(Err.Tag), Tag);
+  F.branch(Done);
+  B.SetInsertPoint(Done);
+  return F.callResult(Type, nullptr, At, Storage);
+}
 } // namespace
+
+bool cpn::floatingContextName(llvm::StringRef Name) {
+  return contextOperation(Name).has_value();
+}
+
+Value Frame::floatingContextCall(const Node &Call, llvm::StringRef Name,
+                                 const std::vector<Node> &Args) {
+  const auto Op = *contextOperation(Name);
+  const bool Observe =
+      Op == ContextOperation::GetControl || Op == ContextOperation::GetStatus;
+  if (!Call.TemplateArgs.empty() || Args.size() != (Observe ? 0u : 1u))
+    fail(Call.At, "invalid floating context arguments");
+  if (!IR)
+    fail(Call.At, "floating context operations require runtime evaluation");
+  if (InPredicate)
+    fail(Call.At, "contract predicate cannot access the floating context");
+
+  Value Arg;
+  if (!Observe) {
+    const char *Type = Op == ContextOperation::SetControl ? ControlType
+                       : Op == ContextOperation::Clear    ? FlagSetType
+                                                          : StatusType;
+    Arg = load(eval(Args.front(), Type));
+    if (Arg.Type == "never")
+      return Arg;
+    if (Arg.Type != Type)
+      fail(Args.front().At,
+           "floating context operation requires " + std::string(Type));
+    if (Op == ContextOperation::SetControl)
+      return setControl(*this, Arg.IR, Call.At);
+  }
+
+  auto *Cell = mxcsrSlot(*this);
+  auto *Saved = readMXCSR(*this, Cell,
+                          Op == ContextOperation::GetControl ? "fp_control"
+                                                             : "fp_status");
+  if (Observe) {
+    const char *Type =
+        Op == ContextOperation::GetControl ? ControlType : StatusType;
+    auto *Storage = resultAddress(Type, Call.At);
+    llvm::Value *Result;
+    if (Op == ContextOperation::GetControl) {
+      auto *Traps = denseFlags(B, B.CreateNot(B.CreateLShr(Saved, 7)));
+      auto *Mode =
+          B.CreateTrunc(B.CreateOr(B.CreateAnd(B.CreateLShr(Saved, 6), 1),
+                                   B.CreateAnd(B.CreateLShr(Saved, 14), 2)),
+                        B.getInt8Ty());
+      Result = oneField(*this, Type, roundingFromMXCSR(B, Saved));
+      Result =
+          B.CreateInsertValue(Result, oneField(*this, FlagSetType, Traps), 1);
+      Result =
+          B.CreateInsertValue(Result, oneField(*this, SubnormalType, Mode), 2);
+    } else
+      Result = oneField(*this, Type,
+                        oneField(*this, FlagSetType, denseFlags(B, Saved)));
+    B.CreateStore(Result, Storage);
+    return callResult(Type, nullptr, Call.At, Storage);
+  }
+
+  auto *Flags = sparseFlags(B, Op == ContextOperation::Clear
+                                   ? B.CreateExtractValue(Arg.IR, 0)
+                                   : B.CreateExtractValue(Arg.IR, {0, 0}));
+  auto *Updated = Op == ContextOperation::Clear
+                      ? B.CreateAnd(Saved, B.CreateNot(Flags))
+                      : B.CreateOr(Saved, Flags);
+  writeMXCSR(*this, Cell, Updated, "fp_status");
+  return {"void"};
+}
+
+void Context::initializeFloatingRoot() {
+  auto Entry = llvm::find_if(Functions, [](const Function &F) {
+    return F.Name == "main" && F.Owner.empty() && F.Emitted;
+  });
+  if (Entry == Functions.end())
+    return;
+  const auto &Config = Entry->Definition.Configuration;
+  if (Config.FPProfile != "strict" ||
+      (Config.InitialRounding.empty() && Config.InitialSubnormal.empty() &&
+       !Config.FPInitialTraps))
+    return;
+
+  auto *Type = llvm::FunctionType::get(llvm::Type::getVoidTy(C), false);
+  auto *Init = llvm::Function::Create(Type, llvm::GlobalValue::InternalLinkage,
+                                      "cpn.fp.initialize", M);
+  Frame Root(*this, nullptr, Init);
+  auto &B = Root.B;
+  B.SetInsertPoint(Root.block("entry"));
+  auto *Cell = mxcsrSlot(Root);
+  auto *Saved = readMXCSR(Root, Cell);
+  auto Mask = MXCSRMasks ^ (Config.FPInitialTraps.value_or(0) << 7);
+  auto Controls =
+      Mask | (roundingRegister(rounding(Config.InitialRounding)) << 13);
+  constexpr unsigned InitialFields =
+      MXCSRRounding | MXCSRSubnormal | MXCSRMasks | MXCSRFlags;
+  writeMXCSR(Root, Cell,
+             B.CreateOr(B.CreateAnd(Saved, ~InitialFields), Controls));
+  B.CreateRetVoid();
+  // The root context is established before user static initialization.
+  llvm::appendToGlobalCtors(M, Init, 65534);
+}
 
 ScalarCastProjection Frame::projectScalarCast(Value Source,
                                               const std::string &Type,

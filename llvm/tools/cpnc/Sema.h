@@ -13,6 +13,7 @@ inline bool memoryIdentity(llvm::StringRef T) {
   return T == StorageIdentityType;
 }
 bool usesMemoryLibrary(const Node &);
+bool usesFloatingContext(const Node &);
 using SourcePosition = std::pair<unsigned, unsigned>;
 struct JumpCleanups {
   std::map<SourcePosition, std::set<SourcePosition>> Exited;
@@ -20,6 +21,9 @@ struct JumpCleanups {
 };
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
+std::string nativeLinkName(const llvm::Module &, llvm::StringRef Category,
+                           llvm::ArrayRef<llvm::StringRef> Components);
+std::string externalIRName(llvm::StringRef Symbol);
 struct ConstantPlace;
 struct Case;
 struct Value;
@@ -130,6 +134,7 @@ struct Function {
   EffectBound Effects;
   EffectSet PredicateEffects;
   std::string Name, Result, Owner, Prefix, DefaultPrefix;
+  std::string ExternalSymbol;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
   Substitution Env, DefaultEnv;
@@ -315,12 +320,13 @@ struct Context {
   std::deque<Function> Functions;
   std::map<std::string, Function *> Instances;
   std::vector<std::pair<std::string, llvm::Function *>> Startup, Shutdown;
-  unsigned Serial = 0;
   size_t Sequence = 0, LookupLimit = SIZE_MAX;
+  unsigned StorageSerial = 0;
   DefinitionSite site() const { return {Opt, std::min(Sequence, LookupLimit)}; }
   explicit Context(llvm::Module &M, Options O)
       : M(M), C(M.getContext()), Opt(std::move(O)) {}
   llvm::Type *ir(const std::string &T, const Token &At = {});
+  bool cScalarType(const std::string &T) const;
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
   void defineQualified(const Node &, const std::string &,
@@ -356,7 +362,8 @@ struct Context {
   void verifyProvenContracts();
   void bindScalarLibrary();
   void bindMemoryLibrary(bool Owners);
-  void bindNumericLibrary();
+  void bindNumericLibrary(bool WithFPContext);
+  void initializeFloatingRoot();
   void checkBorrowEscapes();
   std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
   llvm::Function *coordinator(const std::string &);
@@ -617,6 +624,8 @@ public:
                                   Value Receiver);
   std::optional<Value> namedInteger(const Node &, llvm::StringRef,
                                     const std::vector<Node> &);
+  Value floatingContextCall(const Node &, llvm::StringRef,
+                            const std::vector<Node> &);
   std::optional<Value> floatingSpecial(const Node &, llvm::StringRef,
                                        const std::vector<Node> &);
   CallArguments evaluateArguments(const std::vector<Node> &,
@@ -829,6 +838,11 @@ public:
   void restoreFlow(const Node &, bool Exit = false);
   void checkAccess(Frame &, const Token &) const;
   void checkBaseAccess(Frame &, const Value &, const Token &) const;
+  static bool mayAccess(const EffectBound &, const EffectSet &Predicate,
+                        llvm::StringRef Region);
+  void checkCallArguments(Frame &, llvm::ArrayRef<Value>,
+                          llvm::ArrayRef<std::string>, const EffectBound &,
+                          const EffectSet &Predicate, const Token &) const;
   std::optional<Value> firstWrite(Frame &, const Node &);
   bool needsDelegate(const Frame &) const;
 };

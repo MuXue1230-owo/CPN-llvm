@@ -917,7 +917,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       if (U.Records.count(D.Type)) {
         auto Special = R.Expiring || !R.Address ? SpecialOperation::MoveAssign
                                                 : SpecialOperation::CopyAssign;
-        if (Op != "=" || D.Type != R.Type ||
+        // Tagged assignment can publish a new generation in its result.
+        if (Op != "=" || D.Type != R.Type || U.Variants.count(D.Type) ||
             !U.Records.at(D.Type).Special.count(Special)) {
           if (Op == "=" && D.Type == R.Type &&
               methodOwner(D.Type, Token{"operator=", N.At.Line, N.At.Column})
@@ -1165,7 +1166,7 @@ Function *Frame::select(std::string Name, const Node &N,
   std::optional<Diagnostic> Rejection;
   if (auto It = U.FunctionFamilies.find(Key); It != U.FunctionFamilies.end())
     for (auto &Fam : It->second) {
-      if (Fam.Site.Through > LookupLimit)
+      if (Fam.Owner.empty() && Fam.Site.Through > LookupLimit)
         continue;
       try {
         Group.push_back(prepareCandidate(Fam, Key, N, Args));
@@ -1424,6 +1425,9 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   }
   Scopes = std::move(Original);
   Prefix = std::move(OldPrefix);
+  if (Transaction)
+    Transaction->checkCallArguments(*this, Cells, D.Params, D.Effects,
+                                    D.PredicateEffects, T);
   if (!D.Owner.empty() && D.Decl.K == Node::Function && !D.isStatic()) {
     if (Transaction)
       Transaction->checkBaseAccess(*this, Receiver, T);
@@ -2338,9 +2342,19 @@ void Frame::endExpression(size_t From) {
       drop(V);
     // Keep the lifetime boundary for local borrow checking, without adding
     // instrumentation to the generated module.
-    if (IR && llvm::isa_and_nonnull<llvm::AllocaInst>(V.Address)) {
-      auto *End = B.CreateLifetimeEnd(V.Address);
-      End->setMetadata("cpn.borrow.temporary.end", llvm::MDNode::get(U.C, {}));
+    if (IR && V.Address) {
+      // Conditional expressions keep the selected temporary's address in a
+      // PHI. Each of its underlying local allocations belongs to this same
+      // full expression, even when its arm was not evaluated.
+      llvm::SmallVector<const llvm::Value *, 4> Allocations;
+      llvm::getUnderlyingObjects(V.Address, Allocations);
+      for (auto *Address : Allocations)
+        if (auto *Stack = llvm::dyn_cast<llvm::AllocaInst>(Address)) {
+          auto *End =
+              B.CreateLifetimeEnd(const_cast<llvm::AllocaInst *>(Stack));
+          End->setMetadata("cpn.borrow.temporary.end",
+                           llvm::MDNode::get(U.C, {}));
+        }
     }
   }
 }
@@ -2464,24 +2478,43 @@ void Frame::object(const Node &N, bool Global) {
     auto *LT = U.ir(Ty, N.At);
     if (!LT->isSized())
       fail(N.At, "static requires a complete type");
+    std::string Symbol;
+    std::string ExternalSymbol;
     if (N.Foreign) {
-      auto Prev = U.ExternalObjects.find(N.Text);
+      if (!U.cScalarType(Ty))
+        fail(N.At, "no C ABI transport for this object type");
+      auto Raw = N.Settings.find("abi_symbol");
+      ExternalSymbol = Raw == N.Settings.end() ? N.Text : Raw->second;
+      if (Existing) {
+        auto *BoundObject =
+            llvm::dyn_cast_or_null<llvm::GlobalVariable>(Found->second.Address);
+        if (!BoundObject || !BoundObject->hasExternalLinkage())
+          fail(N.At, "conflicting external object declaration");
+        auto Bound = BoundObject->getName();
+        Bound.consume_front("\1");
+        if (Raw != N.Settings.end() && ExternalSymbol != Bound)
+          fail(N.At, "conflicting external object declaration");
+        ExternalSymbol = Bound.str();
+      }
+      Symbol = externalIRName(ExternalSymbol);
+      auto Prev = U.ExternalObjects.find(ExternalSymbol);
       if (Prev != U.ExternalObjects.end()) {
         G = llvm::cast<llvm::GlobalVariable>(Prev->second.Address);
         if (Prev->second.Type != Ty || Prev->second.Readonly != Readonly ||
             (N.Definition && G->hasInitializer()))
           fail(N.At, "conflicting external object declaration");
-      } else if (Existing || U.M.getNamedValue(N.Text))
-        fail(N.At, "conflicting external symbol '" + N.Text + "'");
-    }
+      } else if (Existing || U.M.getNamedValue(Symbol))
+        fail(N.At, "conflicting external symbol '" + ExternalSymbol + "'");
+    } else
+      Symbol = nativeLinkName(U.M, "obj", {Name, Ty});
     if (!G)
-      G = new llvm::GlobalVariable(
-          U.M, LT, false,
-          N.Foreign ? llvm::GlobalValue::ExternalLinkage
-                    : llvm::GlobalValue::InternalLinkage,
-          nullptr, N.Foreign ? N.Text : "cpn.g." + Name);
+      G = new llvm::GlobalVariable(U.M, LT, false,
+                                   N.Foreign
+                                       ? llvm::GlobalValue::ExternalLinkage
+                                       : llvm::GlobalValue::InternalLinkage,
+                                   nullptr, Symbol);
     if (N.Foreign)
-      U.ExternalObjects[N.Text] = {Ty, nullptr, G, Readonly};
+      U.ExternalObjects[ExternalSymbol] = {Ty, nullptr, G, Readonly};
     if (N.Foreign && !N.Definition) {
       names()[Name] = {Ty, nullptr, G, Readonly};
       return;
@@ -2596,10 +2629,11 @@ void Frame::object(const Node &N, bool Global) {
     } else
       V = place(Args[0]);
     V = bindReference(V, Ty, N.At);
+    if (IR)
+      V.IR = nullptr;
     V.DeclaredAt = {N.At.Line, N.At.Column};
     names()[Name] = V;
-    if (!IR)
-      endExpression();
+    endExpression();
     return;
   }
   if (!IR) {

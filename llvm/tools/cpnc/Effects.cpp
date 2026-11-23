@@ -650,8 +650,9 @@ class Inference {
         if (Memory->isVolatile())
           Effects.insert("volatile");
       }
-      if (F->getIntrinsicID() == llvm::Intrinsic::x86_sse_stmxcsr ||
-          F->getIntrinsicID() == llvm::Intrinsic::x86_sse_ldmxcsr)
+      if ((F->getIntrinsicID() == llvm::Intrinsic::x86_sse_stmxcsr ||
+           F->getIntrinsicID() == llvm::Intrinsic::x86_sse_ldmxcsr) &&
+          !Call.getMetadata(OperationEffects))
         Effects.insert({"fp_control", "fp_status"});
       return;
     }

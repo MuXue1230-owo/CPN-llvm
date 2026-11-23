@@ -244,12 +244,18 @@ llvm::Constant *Frame::unpackVariant(const Case &C, llvm::Constant *Image,
 
 void Frame::constantMatch(const Node &N) {
   const auto &SubjectExpr = N.Children.front();
+  const size_t Mark = Temps.size();
   auto Place = constantPlace(SubjectExpr);
   auto Subject = Place ? Place->read(*this, N.At) : eval(SubjectExpr);
   if (!Place && Subject.Location)
     Place = *Subject.Location;
-  if (Subject.Prvalue)
-    consume(Subject);
+  // The match owns a prvalue subject through the selected arm. Keep its
+  // original lifetime registration for this arm's payload designations.
+  if (Subject.Prvalue && Subject.ConstantTemporary)
+    llvm::erase_if(Temps, [&](const Value &V) {
+      return V.ConstantTemporary == Subject.ConstantTemporary;
+    });
+  endExpression(Mark);
   auto Alternatives = U.Variants.find(Subject.Type);
   if (Alternatives == U.Variants.end())
     fail(N.At, "match requires a union value");
@@ -316,8 +322,9 @@ void Frame::constantMatch(const Node &N) {
     endConstantScope();
     Scopes.pop_back();
     if (Subject.Prvalue)
-      constantDrop(load(Subject), N.At);
-    endExpression();
+      retireConstantCell(Subject.ConstantTemporary ? *Subject.ConstantTemporary
+                                                   : Subject,
+                         N.At);
   };
   try {
     stmt(*Body);
@@ -350,6 +357,7 @@ void Frame::visitPayload(Value Object,
 void Frame::transferPayload(Value Source, llvm::Value *Dest,
                             SpecialOperation Op, const Token &At) {
   auto *Ty = U.ir(Source.Type);
+  auto *ParentSlot = TracksStorage ? slotFor(Source) : nullptr;
   visitPayload(Source, [&](const Case &C) {
     const bool Construct = Op == SpecialOperation::CopyConstruct ||
                            Op == SpecialOperation::MoveConstruct;
@@ -358,9 +366,15 @@ void Frame::transferPayload(Value Source, llvm::Value *Dest,
             ? beginConstructionPrefix({Source.Type, nullptr, Dest}, &C)
             : nullptr;
     for (size_t I = 0; I < C.Types.size(); ++I) {
-      transfer({C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
-                Source.Readonly || C.Decl.Params[I].Const},
-               payloadAddress(C, Dest, I), Op, At);
+      Value Field{C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
+                  Source.Readonly || C.Decl.Params[I].Const};
+      if (ParentSlot) {
+        Field.Slot = B.CreateCall(
+            U.M.getFunction("cpn.slot.find"),
+            {Field.Address, U.typeID(Field.Type), ParentSlot, B.getTrue()});
+        ensureLive(Field, At);
+      }
+      transfer(Field, payloadAddress(C, Dest, I), Op, At);
       if (Progress)
         B.CreateStore(B.getInt64(I + 1), Progress);
     }

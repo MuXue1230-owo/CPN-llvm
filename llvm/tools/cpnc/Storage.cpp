@@ -160,7 +160,7 @@ void Frame::trackLocal(Value &Cell, llvm::StringRef Prefix) {
   if (Cell.Type == StorageViewType || (Pointer && !TracksStorage))
     return;
   Value Owner{Cell.Type, nullptr, Cell.Address, Cell.Readonly};
-  Owner.Storage = (Prefix + std::to_string(U.Serial++)).str();
+  Owner.Storage = (Prefix + std::to_string(U.StorageSerial++)).str();
   track(Owner);
   Active[Owner.Storage] = true;
   Extents[Owner.Storage] = Owner;
@@ -313,11 +313,9 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
   Place.checkLifetime(C.At, View);
   if (Place.Root->Address)
     fail(C.At, "constant storage operation requires an automatic object");
-  if ((!Place.Steps.empty() && !Place.Steps.back().BaseOwner.empty()) ||
-      llvm::any_of(Place.Steps,
-                   [](const auto &Step) { return Step.Alternative; }))
+  if (!Place.Steps.empty() && !Place.Steps.back().BaseOwner.empty())
     fail(C.At, "constant storage operation requires an automatic object, "
-               "record member or array element");
+               "member or array element");
   if (View) {
     auto Storage = Place.Root->ConstantIdentity.Storage;
     if (Storage->OriginalExtent && Place.Steps.empty())

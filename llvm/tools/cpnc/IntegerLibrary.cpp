@@ -569,6 +569,8 @@ Value bitField(Frame &F, const Node &Call, const std::vector<Node> &Args,
 } // namespace
 
 bool cpn::integerLibraryName(StringRef Name, bool ExplicitDestination) {
+  if (floatingContextName(Name))
+    return !ExplicitDestination;
   if (auto Bits = lookupBits(Name))
     return !ExplicitDestination || Bits->Op != BitOperation::Insert;
   auto Op = lookupOperation(Name);
@@ -611,7 +613,22 @@ bool cpn::usesNumericLibrary(const Node &D) {
   return false;
 }
 
-void Context::bindNumericLibrary() {
+bool cpn::usesFloatingContext(const Node &D) {
+  if (D.K == Node::Name && floatingContextName(D.Text))
+    return true;
+  for (StringRef Spelling : {StringRef(D.Type), StringRef(D.Text)})
+    if (Spelling.contains("std::numeric::FPControl") ||
+        Spelling.contains("std::numeric::FPStatus") ||
+        Spelling.contains("std::numeric::SubnormalPolicy"))
+      return true;
+  for (const auto *Nodes : {&D.Children, &D.Params, &D.Generics,
+                            &D.TemplateArgs, &D.Pattern, &D.Contracts})
+    if (llvm::any_of(*Nodes, usesFloatingContext))
+      return true;
+  return false;
+}
+
+void Context::bindNumericLibrary(bool WithFPContext) {
   // The provider's private u8 representation remains available even when
   // the source restricts its own fixed-width arithmetic types.
   llvm::SaveAndRestore Policy(Opt);
@@ -721,12 +738,76 @@ void Context::bindNumericLibrary() {
     Decl.At.Column = Index + 100;
   }
   unit(Library);
+  if (!WithFPContext)
+    return;
+
+  unit(parse(R"cpn(
+    namespace std {
+      namespace numeric {
+        class SubnormalPolicy {
+          u8 mode;
+        public:
+          SubnormalPolicy() noexcept {}
+          SubnormalPolicy(const<SubnormalPolicy>& other)=default;
+          SubnormalPolicy(SubnormalPolicy&& other)=default;
+          SubnormalPolicy& operator=(const<SubnormalPolicy>& other)=default;
+          SubnormalPolicy& operator=(SubnormalPolicy&& other)=default;
+          constexpr bool operator==(const<SubnormalPolicy>& other) const noexcept {
+            return mode==other.mode;
+          }
+          constexpr bool operator!=(const<SubnormalPolicy>& other) const noexcept {
+            return mode!=other.mode;
+          }
+        };
+        struct FPControl {
+          std::numeric::RoundingMode rounding(std::numeric::RoundingMode::NearestTiesEven);
+          std::numeric::FPFlagSet trap_mask;
+          SubnormalPolicy subnormal;
+          FPControl(const<FPControl>& other)=default;
+          FPControl(FPControl&& other)=default;
+          FPControl& operator=(const<FPControl>& other)=default;
+          FPControl& operator=(FPControl&& other)=default;
+        };
+        struct FPStatus {
+          std::numeric::FPFlagSet flags;
+          FPStatus(const<FPStatus>& other)=default;
+          FPStatus(FPStatus&& other)=default;
+          FPStatus& operator=(const<FPStatus>& other)=default;
+          FPStatus& operator=(FPStatus&& other)=default;
+        };
+        union FPControlError {
+          case UnsupportedRounding;
+          case UnsupportedSubnormal;
+          case UnsupportedTrapMask;
+          FPControlError(const<FPControlError>& other)=default;
+          FPControlError(FPControlError&& other)=default;
+        };
+      }
+    }
+  )cpn",
+             Opt));
+  // The provider's Preserve constant contains no live context or startup work.
+  const std::string PolicyType = "std::numeric::SubnormalPolicy";
+  const std::string MemberName = PolicyType + "::Preserve";
+  Node Member(Node::Field, {"Preserve", 0, 0});
+  Member.Type = qualifyConst(PolicyType);
+  Member.Const = Member.Required = true;
+  Member.Settings["storage"] = "static";
+  StaticMembers.emplace(MemberName, std::make_pair(PolicyType, Member));
+  auto *Preserve = llvm::Constant::getNullValue(ir(PolicyType));
+  auto *Storage = new llvm::GlobalVariable(M, Preserve->getType(), true,
+                                           llvm::GlobalValue::InternalLinkage,
+                                           Preserve, "cpn.g." + MemberName);
+  Globals.emplace(MemberName, Value{PolicyType, Preserve, Storage, true});
+  ConstantObjects.insert(Storage);
 }
 
 std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
                                          const std::vector<Node> &Args) {
   if (Call.K != Node::Name)
     return std::nullopt;
+  if (floatingContextName(Name))
+    return floatingContextCall(Call, Name, Args);
   if (auto Bits = lookupBits(Name))
     return Bits->Op == BitOperation::Reinterpret
                ? reinterpretBits(*this, Call, Args)

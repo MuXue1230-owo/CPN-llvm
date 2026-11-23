@@ -3,6 +3,8 @@
 #include "llvm/Support/SaveAndRestore.h"
 #include <algorithm>
 #include <iterator>
+#include <memory>
+#include <tuple>
 
 using namespace cpn;
 using llvm::StringRef;
@@ -109,13 +111,14 @@ int precedence(const std::string &S) {
   return 0;
 }
 class Parser {
-  std::vector<Token> Tokens;
+  std::shared_ptr<std::vector<Token>> Tokens;
   size_t Pos = 0;
   std::set<std::string> Types, HiddenTypes, TypeParameters;
   // The owner is the declaration identity, which survives lexical shadowing
   // of its name. Only pointer (*) and array ([) layers affect member syntax.
   struct ReceiverType {
     std::string Owner, Layers;
+    bool Dependent = false;
   };
   using Receivers = std::map<std::string, ReceiverType>;
   Receivers NominalReceivers, ValueReceivers, FieldReceivers;
@@ -171,7 +174,9 @@ class Parser {
       if (C.K == Node::Record || C.K == Node::Alias ||
           C.K == Node::Enumeration || C.K == Node::Union)
         Types.insert(Key);
-      if (!C.Generics.empty() || C.K == Node::Constraint)
+      if (C.K == Node::Function && !C.Generics.empty())
+        publishMemberFamily(Key, C.Generics);
+      else if (!C.Generics.empty() || C.K == Node::Constraint)
         Families[Key] = C.Generics;
       if (C.K == Node::Alias)
         publishAlias(C, Key);
@@ -181,6 +186,19 @@ class Parser {
   }
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
+  std::set<std::string> ConflictingMemberSchemas;
+  void publishMemberFamily(const std::string &Key,
+                           const std::vector<Node> &Parameters) {
+    auto &Previous = Families[Key];
+    if (!Previous.empty() &&
+        (Previous.size() != Parameters.size() ||
+         !std::equal(Previous.begin(), Previous.end(), Parameters.begin(),
+                     [](const Node &L, const Node &R) {
+                       return L.K == R.K && L.Pack == R.Pack;
+                     })))
+      ConflictingMemberSchemas.insert(Key);
+    Previous = Parameters;
+  }
   ReceiverType receiverType(const Node &N) const {
     if (N.K == Node::Name) {
       if (N.Text == "this" && !CurrentReceiver.Owner.empty())
@@ -193,6 +211,8 @@ class Parser {
       return receiverType(N.Children.front());
     if (N.K == Node::Member) {
       auto Base = receiverType(N.Children.front());
+      if (Base.Dependent)
+        return Base;
       if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
         return {};
       if (auto I = FieldReceivers.find(Base.Owner + "::" + N.Text);
@@ -203,6 +223,8 @@ class Parser {
     if (N.K != Node::Unary && N.K != Node::Index)
       return {};
     auto Base = receiverType(N.Children.front());
+    if (Base.Dependent)
+      return Base;
     if (Base.Owner.empty())
       return {};
     if (N.K == Node::Unary && N.Text == "&") {
@@ -221,17 +243,17 @@ class Parser {
     }
     return {};
   }
-  std::string memberFamily(const Node &N, const Token &Member,
-                           bool Pointer) const {
+  std::optional<std::string> memberFamily(const Node &N, const Token &Member,
+                                          bool Pointer) const {
     auto Type = receiverType(N);
     if (!Type.Owner.empty() && Type.Layers == (Pointer ? "*" : "")) {
       auto Key = Type.Owner + "::" + Member.Text;
       if (Families.count(Key))
         return Key;
       if (OwnMembers.count(Key))
-        return {};
+        return std::string();
     }
-    return Families.count(Member.Text) ? Member.Text : std::string();
+    return std::nullopt;
   }
   unsigned Depth = 0;
   struct Nest {
@@ -243,7 +265,7 @@ class Parser {
     ~Nest() { --D; }
   };
   const Token &peek(size_t N = 0) const {
-    return Tokens[std::min(Pos + N, Tokens.size() - 1)];
+    return (*Tokens)[std::min(Pos + N, Tokens->size() - 1)];
   }
   bool is(StringRef S) const { return peek().Text == S; }
   bool eat(StringRef S) {
@@ -371,6 +393,16 @@ class Parser {
     };
     std::string Schema = T.Text;
     while (true) {
+      const bool Unqualified =
+          Application && !Root && !StringRef(Schema).contains("::");
+      const bool Shadowed = Unqualified && (HiddenTypes.count(Schema) ||
+                                            ValueReceivers.count(Schema));
+      auto MemberSchema = CurrentReceiver.Owner + "::" + Schema;
+      const auto &ArgumentSchema =
+          Unqualified && !Shadowed && !Types.count(Schema) &&
+                  ConflictingMemberSchemas.count(MemberSchema)
+              ? MemberSchema
+              : Schema;
       std::optional<bool> BitArgumentsAreTypes;
       if (Application && is("<") && (Root || !HiddenTypes.count(T.Text)) &&
           bitExtractionName(T.Text))
@@ -386,7 +418,8 @@ class Parser {
              (known(peek(1).Text) || peek(1).Text == "::" ||
               peek(2).Text == "::"))));
       if (is("<") &&
-          (Families.count(Schema) || NumericApplication ||
+          ((!Shadowed && Families.count(ArgumentSchema)) ||
+           NumericApplication ||
            (Application &&
             (builtinPredicate(T.Text) || T.Text == "construct_at" ||
              T.Text == "destroy_base" || T.Text == "abandon_base" ||
@@ -398,9 +431,12 @@ class Parser {
           expect("<");
           Args.push_back(baseSelector());
           closeAngle();
-        } else
-          Args = templateArgs(Schema, &Canonical, BitArgumentsAreTypes);
-        if (!Application || is("::") || Types.count(Schema))
+        } else if (Application &&
+                   ConflictingMemberSchemas.count(ArgumentSchema))
+          Args = deferredTemplateArgs();
+        else
+          Args = templateArgs(ArgumentSchema, &Canonical, BitArgumentsAreTypes);
+        if (!Application || is("::") || Types.count(ArgumentSchema))
           T.Text += Canonical.empty() ? spelling(Start) : Canonical;
         else {
           Application->ExplicitApplication = true;
@@ -418,10 +454,12 @@ class Parser {
     }
     if (NominalSchema)
       *NominalSchema = (Root ? "::" : "") + AliasSchema(Schema);
-    if (Receiver && (Root || !TypeParameters.count(
-                                 StringRef(Schema).split("::").first.str()))) {
-      if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
-          I != NominalReceivers.end())
+    if (Receiver) {
+      if (!Root &&
+          TypeParameters.count(StringRef(Schema).split("::").first.str()))
+        Receiver->Dependent = true;
+      else if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
+               I != NominalReceivers.end())
         *Receiver = I->second;
     }
     if (Root)
@@ -440,15 +478,21 @@ class Parser {
   std::string spelling(size_t Start) const {
     std::string S;
     for (size_t I = Start; I < Pos; ++I)
-      S += Tokens[I].Text;
+      S += (*Tokens)[I].Text;
     return S;
+  }
+  std::vector<Token> &editableTokens() {
+    if (!Tokens.unique())
+      Tokens = std::make_shared<std::vector<Token>>(*Tokens);
+    return *Tokens;
   }
   void closeAngle() {
     if (is(">>")) {
-      Tokens[Pos].Text = ">";
-      auto Second = Tokens[Pos++];
+      auto &Editable = editableTokens();
+      Editable[Pos].Text = ">";
+      auto Second = Editable[Pos++];
       ++Second.Column;
-      Tokens.insert(Tokens.begin() + Pos, std::move(Second));
+      Editable.insert(Editable.begin() + Pos, std::move(Second));
     } else
       expect(">");
   }
@@ -465,9 +509,9 @@ class Parser {
         *Canonical += ">";
       return Out;
     }
-    auto It = Families.find(Name);
     do {
       size_t I = Out.size(), Begin = Pos;
+      auto It = Families.find(Name);
       bool T = It != Families.end() && !It->second.empty()
                    ? It->second[std::min(I, It->second.size() - 1)].K ==
                          Node::TypeParam
@@ -502,6 +546,95 @@ class Parser {
     if (Canonical)
       *Canonical += ">";
     return Out;
+  }
+  bool possibleMemberApplication() const {
+    unsigned Group = 0;
+    for (size_t I = 1;; ++I) {
+      const auto &Word = peek(I).Text;
+      if (Word.empty())
+        return false;
+      if (Word == "(" || Word == "[" || Word == "{")
+        ++Group;
+      else if (Word == ")" || Word == "]" || Word == "}") {
+        if (!Group)
+          return false;
+        --Group;
+      } else if (!Group) {
+        if (Word == ";")
+          return false;
+        if ((Word == ">" || Word == ">>") && peek(I + 1).Text == "(")
+          return true;
+      }
+    }
+  }
+  bool argumentDelimiter() const {
+    return is(",") || is("...") || is(">") || is(">>");
+  }
+  Node deferredTemplateArgument() {
+    auto At = peek();
+    Parser TypeParse(*this);
+    std::optional<Node> Type, Value;
+    try {
+      Node Candidate(Node::TypeArg, At);
+      Candidate.Type = TypeParse.type();
+      if (TypeParse.argumentDelimiter())
+        Type = std::move(Candidate);
+    } catch (const Diagnostic &) {
+      // The selected parameter can still admit a constant expression.
+    }
+    try {
+      auto Candidate = expr(1, true);
+      if (argumentDelimiter())
+        Value = std::move(Candidate);
+    } catch (const Diagnostic &) {
+      // Type-only tokens may be valid for the selected parameter.
+    }
+    if (!Value) {
+      if (!Type)
+        fail(At, "expected a generic type or constant argument");
+      *this = std::move(TypeParse);
+      return std::move(*Type);
+    }
+    if (!Type)
+      return std::move(*Value);
+    const auto &TypeEnd = TypeParse.peek();
+    if (std::tie(TypeEnd.Line, TypeEnd.Column) !=
+        std::tie(peek().Line, peek().Column))
+      fail(At, "ambiguous generic argument boundary");
+    TypeQueries.merge(TypeParse.TypeQueries);
+    Node Both(Node::GenericArgument, At);
+    Both.Children.push_back(std::move(*Type));
+    Both.Children.push_back(std::move(*Value));
+    return Both;
+  }
+  std::vector<Node> deferredTemplateArgs() {
+    std::vector<Node> Arguments;
+    expect("<");
+    if (!is(">") && !is(">>")) {
+      do {
+        auto Argument = deferredTemplateArgument();
+        Argument.Pack = eat("...");
+        Arguments.push_back(std::move(Argument));
+      } while (eat(","));
+    }
+    closeAngle();
+    return Arguments;
+  }
+  std::optional<std::vector<Node>> deferredMemberApplication() {
+    if (!possibleMemberApplication())
+      return std::nullopt;
+    Parser Probe(*this);
+    std::vector<Node> Arguments;
+    try {
+      Arguments = Probe.deferredTemplateArgs();
+    } catch (const Diagnostic &) {
+      // A relational expression can have the same leading tokens.
+      return std::nullopt;
+    }
+    if (!Probe.is("("))
+      return std::nullopt;
+    *this = std::move(Probe);
+    return Arguments;
   }
   std::string type(std::string *NominalSchema = nullptr,
                    ReceiverType *Receiver = nullptr) {
@@ -736,9 +869,17 @@ class Parser {
           Node M(Node::Member, Id);
           if (is("<")) {
             auto Schema = memberFamily(N, Id, Ptr);
-            if (!Schema.empty()) {
-              M.TemplateArgs = templateArgs(Schema);
+            if (Schema && !Schema->empty()) {
+              M.TemplateArgs = ConflictingMemberSchemas.count(*Schema)
+                                   ? deferredTemplateArgs()
+                                   : templateArgs(*Schema);
               M.ExplicitApplication = true;
+            } else if (!Schema &&
+                       (Families.count(Id.Text) || receiverType(N).Dependent)) {
+              if (auto Arguments = deferredMemberApplication()) {
+                M.TemplateArgs = std::move(*Arguments);
+                M.ExplicitApplication = true;
+              }
             }
           }
           M.Children.push_back(std::move(N));
@@ -1332,11 +1473,18 @@ class Parser {
           Value = effectBound();
         else if (Key.Text == "admission_effects")
           fail(Key, "admission_effects requires an asynchronous callable");
-        else if (Key.Text == "static_id") {
+        else if (Key.Text == "static_id" || Key.Text == "abi_symbol" ||
+                 Key.Text == "abi_cc" || Key.Text == "abi_layout") {
           auto ID = take();
           if (!StringRef(ID.Text).starts_with("\""))
-            fail(ID, "static_id requires a string literal");
+            fail(ID, Key.Text + " requires a string literal");
           Value = unquote(ID);
+        } else if (Key.Text == "abi_pack" || Key.Text == "abi_align") {
+          auto Amount = take();
+          if (Amount.Text.empty() || !llvm::isDigit(Amount.Text.front()) ||
+              realToken(Amount.Text))
+            fail(Amount, Key.Text + " requires an integer literal");
+          Value = llvm::toString(integerLiteral(Amount), 10, false);
         } else if (Key.Text == "init_after") {
           do {
             if (!Value.empty())
@@ -1436,6 +1584,19 @@ class Parser {
         if (D.K != Node::Function && D.K != Node::Destructor &&
             D.K != Node::Constructor && D.K != Node::Lambda)
           fail(D.At, Key + " requires a callable");
+      } else if (Key == "abi_symbol" || Key == "abi_cc") {
+        if (!D.Foreign ||
+            (D.K != Node::Function && (D.K != Node::Object || Key == "abi_cc")))
+          fail(D.At, Key + " requires an applicable foreign declaration");
+        if (Key == "abi_symbol" &&
+            (Value.empty() || Value.find('\0') != std::string::npos ||
+             StringRef(Value).starts_with('\1')))
+          fail(D.At, "invalid raw object-file symbol");
+        if (Key == "abi_cc" && Value != "sysv-amd64-2018.lp64")
+          fail(D.At, "CFG002: unavailable calling convention '" + Value + "'");
+      } else if (Key == "abi_layout" || Key == "abi_pack" ||
+                 Key == "abi_align") {
+        fail(D.At, "CFG002: " + Key + " is unavailable on the selected target");
       } else if (D.K != Node::Object)
         fail(D.At, "static attribute requires an object");
       if (!D.Settings.emplace(Key, Value).second)
@@ -1472,8 +1633,13 @@ class Parser {
       Node N(NS ? Node::Namespace : Node::Linkage, T);
       if (NS)
         N.Text = name().Text;
-      else
-        expect("\"C\"");
+      else {
+        auto Linkage = take();
+        if (Linkage.Text == "\"C++\"")
+          fail(Linkage, "CFG002: the target has no direct C++ ABI binding");
+        if (Linkage.Text != "\"C\"")
+          fail(Linkage, "expected \"C\" or \"C++\" linkage");
+      }
       if (eat("{")) {
         if (NS) {
           llvm::SaveAndRestore NamespaceAliases(AliasSchemas);
@@ -1514,19 +1680,20 @@ class Parser {
           Rule.Params = params(true);
           expect("{");
           while (!eat("}")) {
-            size_t End = Pos, Arrow = Tokens.size();
+            size_t End = Pos, Arrow = Tokens->size();
             unsigned D = 0;
-            while (End < Tokens.size() && !(Tokens[End].Text == ";" && !D)) {
-              auto &W = Tokens[End].Text;
+            while (End < Tokens->size() &&
+                   !((*Tokens)[End].Text == ";" && !D)) {
+              const auto &W = (*Tokens)[End].Text;
               if (W == "->" && !D)
                 Arrow = End;
               D += (W == "(" || W == "[");
               D -= (W == ")" || W == "]");
               ++End;
             }
-            if (Arrow == Tokens.size())
+            if (Arrow == Tokens->size())
               fail(peek(), "expression requirement needs a result type");
-            Tokens[Arrow].Text = "$result";
+            editableTokens()[Arrow].Text = "$result";
             auto E = expr();
             expect("$result");
             E.Type = type();
@@ -1731,7 +1898,7 @@ class Parser {
         auto Key = Receiver.Owner + "::" + D.Text;
         OwnMembers.insert(Key);
         if (!D.Generics.empty() && D.K == Node::Function)
-          Families[Key] = D.Generics;
+          publishMemberFamily(Key, D.Generics);
         if (D.K == Node::Field)
           FieldReceivers[Key] = ValueReceivers.at(D.Text);
         R.Children.push_back(std::move(D));
@@ -1805,9 +1972,13 @@ class Parser {
       fail(Id, "invalid qualified declaration");
     bool Fn = !Def && (!Q.empty() || operatorSpelling(Id.Text) || Proto ||
                        (Foreign && is("(")) || !G.empty() || functionBody());
+    if (Ty == "auto" && (Foreign || Fn))
+      fail(Id, "this declaration requires an explicit type");
     if (!Fn) {
       if (Foreign && !Def && !is(";"))
         fail(Id, "an external object initializer requires define");
+      if (Foreign && !Def && CE)
+        fail(Id, "a constexpr external object requires a definition");
       if (Virtual || Eval || (Static && !StorageStatic) || (Foreign && Static))
         fail(Id, "invalid object declaration modifier");
       ValueReceivers[Id.Text] = Receiver;
@@ -1874,13 +2045,17 @@ class Parser {
   }
 
 public:
-  explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {
+  explicit Parser(std::vector<Token> T)
+      : Tokens(std::make_shared<std::vector<Token>>(std::move(T))) {
     Types.insert(
         {"std::AccessError", "std::Ref", "std::ScalarError", "std::Result"});
     Types.insert({"std::mem::StorageView", "std::mem::StorageIdentity"});
     Types.insert({"std::numeric::NumericResult", "std::numeric::NumericStatus",
                   "std::numeric::NumericErrorCode", "std::numeric::FPFlag",
                   "std::numeric::FPFlagSet", "std::numeric::RoundingMode"});
+    Types.insert({"std::numeric::FPControl", "std::numeric::FPStatus",
+                  "std::numeric::FPControlError",
+                  "std::numeric::SubnormalPolicy"});
     Node TypeParam(Node::TypeParam, {});
     Families["std::Ref"] = {TypeParam};
     Families["std::Result"] = {TypeParam, TypeParam};
@@ -2095,6 +2270,9 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       O.FPRequireFinite = V == "true";
       continue;
     }
+    if (StringRef(K).starts_with("numeric.fp.initial_") &&
+        Scope > ConfigScope::File)
+      fail(N.At, "CFG001: initial floating controls bind to the root context");
     if (K == "numeric.fp.trap_mask" || K == "numeric.fp.initial_trap_mask" ||
         K == "numeric.fp.result_mask") {
       if (K == "numeric.fp.trap_mask" && V == "current") {

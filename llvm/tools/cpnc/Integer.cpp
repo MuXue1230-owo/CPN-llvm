@@ -97,6 +97,7 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
                  : S;
     };
     cpn::Value View{unqualified(A), nullptr, V.IR};
+    View.ConstructionBase = V.ConstructionBase;
     auto Target = unqualified(D);
     if ((A == unqualified(A) || D != Target) &&
         adjust(View, Target, At, false)) {
@@ -136,6 +137,7 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
       P->addIncoming(llvm::ConstantPointerNull::get(B.getPtrTy()), Entry);
       P->addIncoming(View.Address, Adjusted);
       V.IR = P;
+      V.ConstructionBase = View.ConstructionBase;
       return V;
     }
     if (U.compatibleCallable(A, D)) {

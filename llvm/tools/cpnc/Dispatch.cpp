@@ -638,6 +638,10 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
     }
     Actual.push_back(V);
   }
+  if (Transaction)
+    Transaction->checkCallArguments(*this, Actual,
+                                    llvm::ArrayRef(Sig).drop_front(), Effects,
+                                    Predicate, At);
   auto *FT = llvm::FunctionType::get(
       Storage ? B.getVoidTy() : U.ir(Sig.front()), Types, false);
   auto *Before = wholeEpoch();

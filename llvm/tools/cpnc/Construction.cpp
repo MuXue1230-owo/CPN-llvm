@@ -393,6 +393,52 @@ Construction::slotCallback(Frame &Em, unsigned Slot) {
   return {Hook, Capture};
 }
 
+bool Construction::mayAccess(const EffectBound &Effects,
+                             const EffectSet &Predicate,
+                             llvm::StringRef Region) {
+  auto Matches = [&](const EffectSet &Bound) {
+    return Bound.count(("read:" + Region).str()) ||
+           Bound.count(("write:" + Region).str()) || Bound.count("read:any") ||
+           Bound.count("write:any") || Bound.count("foreign") ||
+           Bound.count("whole");
+  };
+  return !Effects || Matches(*Effects) || Matches(Predicate);
+}
+
+void Construction::checkCallArguments(Frame &Em, llvm::ArrayRef<Value> Actual,
+                                      llvm::ArrayRef<std::string> Params,
+                                      const EffectBound &Effects,
+                                      const EffectSet &Predicate,
+                                      const Token &At) const {
+  if (Em.TypeQuery)
+    return;
+  for (auto [Index, Argument] : llvm::enumerate(Actual)) {
+    llvm::StringRef Parameter = Params[Index];
+    llvm::Value *Designated = Parameter.ends_with("*")   ? Argument.IR
+                              : Parameter.ends_with("&") ? Argument.Address
+                                                         : nullptr;
+    if (!Designated)
+      continue;
+    const bool Layer = Designated == Object.Address &&
+                       (Argument.Type == Object.Type ||
+                        (Parameter.ends_with("*") &&
+                         unconst(element(Argument.Type)) == Object.Type));
+    const bool Base = Argument.ConstructionBase &&
+                      Argument.ConstructionBase->first == Object.Address;
+    if (!Layer && !Base)
+      continue;
+    if (!mayAccess(Effects, Predicate, "#" + std::to_string(Index)))
+      continue;
+    if (Base)
+      checkBaseAccess(Em, Argument, At);
+    else if (!Order.empty()) {
+      auto Last = At;
+      Last.Text = Order.back();
+      checkAccess(Em, Last);
+    }
+  }
+}
+
 llvm::Value *Construction::admitCall(Frame &Em, const Function &D,
                                      const Token &At) {
   if (D.Owner != Object.Type) {
@@ -407,7 +453,8 @@ llvm::Value *Construction::admitCall(Frame &Em, const Function &D,
     checkAccess(Em, T);
   }
   if (D.Initializes.empty()) {
-    if (D.RequiresAlive.empty() && !Order.empty()) {
+    if (D.RequiresAlive.empty() && !Order.empty() &&
+        mayAccess(D.Effects, D.PredicateEffects, "this")) {
       auto Last = At;
       Last.Text = Order.back();
       checkAccess(Em, Last);

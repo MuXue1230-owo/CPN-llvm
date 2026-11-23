@@ -68,6 +68,7 @@ inline bool operatorSpelling(llvm::StringRef Name) {
 bool builtin(llvm::StringRef);
 bool builtinPredicate(llvm::StringRef);
 bool integerLibraryName(llvm::StringRef, bool ExplicitDestination = false);
+bool floatingContextName(llvm::StringRef);
 bool floatingSpecialName(llvm::StringRef);
 bool bitExtractionName(llvm::StringRef);
 bool realToken(llvm::StringRef);
@@ -129,7 +130,8 @@ struct Node {
     Union,
     Variant,
     Match,
-    Tail
+    Tail,
+    GenericArgument
   } K = Empty;
   Token At;
   std::string Text, Type;

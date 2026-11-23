@@ -6,6 +6,29 @@
 
 using namespace cpn;
 using llvm::StringRef;
+
+std::string cpn::nativeLinkName(const llvm::Module &M, StringRef Category,
+                                llvm::ArrayRef<StringRef> Components) {
+  std::string Name = ("cpn.v1." + Category).str();
+  Name += "." + llvm::toHex(M.getModuleIdentifier(), /*LowerCase=*/true);
+  for (auto Part : Components)
+    Name += "." + llvm::toHex(Part, /*LowerCase=*/true);
+  return Name;
+}
+
+std::string cpn::externalIRName(StringRef Symbol) {
+  // Raw ELF names do not participate in compiler-support lookup. The byte
+  // prefix preserves the object-file name and keeps IR identities distinct.
+  return Symbol.starts_with("llvm.") || Symbol.starts_with("cpn.")
+             ? ("\1" + Symbol).str()
+             : Symbol.str();
+}
+
+bool Context::cScalarType(const std::string &T) const {
+  return integer(T) || floating(T) || T == "bool" || T == "char" ||
+         StringRef(T).ends_with("*") || Enums.count(T);
+}
+
 std::vector<std::string> cpn::splitArguments(StringRef S) {
   std::vector<std::string> Out;
   unsigned Angles = 0, Groups = 0;
@@ -594,6 +617,64 @@ std::string Frame::resolve(std::string S, const Token &At) {
   }
   fail(At, "unsupported or unknown type '" + S + "'");
 }
+// The alternative productions share a name (possibly followed by array
+// brackets). Classify that name in the caller's scope before binding either
+// production, independently of overload conversion or constraint viability.
+static const Node &boundGenericArgument(Frame &F, const Node &Argument) {
+  assert(Argument.K == Node::GenericArgument);
+  const auto &Expr = Argument.Children[1];
+  const Node *Head = &Expr;
+  while (Head->K == Node::Index)
+    Head = &Head->Children.front();
+  if (Head->K != Node::Name)
+    fail(Argument.At, "cannot establish the kind of this generic argument");
+  const auto &Name = Head->Text;
+  for (auto I = F.Scopes.rbegin(); I != F.Scopes.rend(); ++I) {
+    if (I->Aliases.count(Name))
+      return Argument.Children[0];
+    if (I->Names.count(Name) || I->UnavailableNames.count(Name))
+      return Expr;
+  }
+  auto Unqualified = StringRef(Name);
+  Unqualified.consume_front("::");
+  if (builtin(Unqualified) || F.Env.Types.count(Name))
+    return Argument.Children[0];
+  if (F.Env.Values.count(Name))
+    return Expr;
+  auto Receiver = F.ConstantReceiver ? F.ConstantReceiver->Type : F.Self.Type;
+  if (Receiver.empty() && F.F && F.F->isStatic())
+    Receiver = F.F->Owner;
+  if (!Receiver.empty()) {
+    auto At = Head->At;
+    At.Text = Name;
+    if (F.U.lookupPath(Receiver, At, false))
+      return Expr;
+  }
+
+  auto Kind = [&](const std::string &Key) -> std::optional<bool> {
+    if (F.U.Aliases.count(Key) || F.U.Enums.count(Key) ||
+        F.U.Records.count(Key) || F.U.MemberTypes.count(Key))
+      return true;
+    if (auto I = F.U.Families.find(Key); I != F.U.Families.end())
+      return I->second.Decl.K == Node::Record ||
+             I->second.Decl.K == Node::Union;
+    if (F.U.Globals.count(Key) || F.U.StaticMembers.count(Key) ||
+        F.U.Overloads.count(Key) || F.U.Cases.count(Key))
+      return false;
+    return std::nullopt;
+  };
+  std::string Tail;
+  if (auto Owner = F.memberQualifier(Name, Argument.At, Tail))
+    if (auto IsType = Kind(*Owner + "::" + Tail.substr(0, Tail.find('<'))))
+      return *IsType ? Argument.Children[0] : Expr;
+  auto Key = scopeKey(F.Prefix, StringRef(Name).split('<').first,
+                      [&](const auto &K) { return Kind(K).has_value(); });
+  if (!Key.empty())
+    return *Kind(Key) ? Argument.Children[0] : Expr;
+  fail(Argument.At,
+       "cannot establish the kind of generic argument '" + Name + "'");
+}
+
 Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
                          const std::vector<cpn::Value> &Actual,
                          const Token &At) {
@@ -611,6 +692,8 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
     Defaults.Opt = Fam.Site.Configuration;
     Defaults.LookupLimit = Fam.Site.Through;
     const Node *A = I < Explicit.size() ? &Explicit[I] : nullptr;
+    if (A && A->K == Node::GenericArgument)
+      A = &boundGenericArgument(*this, *A);
     if (P.K == Node::TypeParam) {
       if (A) {
         if (A->K != Node::TypeArg)
@@ -791,19 +874,25 @@ Function *Context::declare(const Node &N, const std::string &Name,
   }
   auto &Group = Overloads[Name];
   if (N.Foreign) {
-    auto Scalar = [&](const std::string &T) {
-      return integer(T) || floating(T) || T == "bool" || T == "char" ||
-             StringRef(T).ends_with("*") || Enums.count(T);
-    };
-    if ((D.Result != "void" && !Scalar(D.Result)) ||
-        !llvm::all_of(D.Params, Scalar))
+    if ((D.Result != "void" && !cScalarType(D.Result)) ||
+        !llvm::all_of(D.Params, [&](const auto &T) { return cScalarType(T); }))
       fail(N.At, "no C ABI transport for this function signature");
-    if (auto Previous = ExternalFunctions.find(N.Text);
+    if (auto Raw = N.Settings.find("abi_symbol"); Raw != N.Settings.end())
+      D.ExternalSymbol = Raw->second;
+    else {
+      auto Previous = llvm::find_if(Group, [&](const Function *F) {
+        return F->Decl.Foreign && F->Params == D.Params;
+      });
+      D.ExternalSymbol =
+          Previous == Group.end() ? N.Text : (*Previous)->ExternalSymbol;
+    }
+    if (auto Previous = ExternalFunctions.find(D.ExternalSymbol);
         Previous != ExternalFunctions.end()) {
       auto *Prev = Previous->second;
       if (Prev->Params != D.Params || Prev->Result != D.Result ||
           Prev->Decl.Noexcept != N.Noexcept)
-        fail(N.At, "conflicting C function declarations for '" + N.Text + "'");
+        fail(N.At, "conflicting C function declarations for '" +
+                       D.ExternalSymbol + "'");
       if (!llvm::is_contained(Group, Prev))
         Group.push_back(Prev);
     }
@@ -827,6 +916,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
           Prev->BorrowedResult != D.BorrowedResult ||
           Prev->Consumes != D.Consumes || Prev->Result != D.Result ||
           Prev->Decl.Foreign != N.Foreign ||
+          Prev->ExternalSymbol != D.ExternalSymbol ||
           Prev->Decl.Noexcept != N.Noexcept || Prev->Decl.K != N.K ||
           ((D.Effects || N.Prototype) && Prev->Effects != D.Effects) ||
           Prev->Decl.Settings.count("lifecycle_effect") !=
@@ -869,10 +959,30 @@ Function *Context::declare(const Node &N, const std::string &Name,
   auto *FT = llvm::FunctionType::get(
       aggregate(D.Result) ? llvm::Type::getVoidTy(C) : ir(D.Result, N.At),
       Types, false);
-  std::string Symbol = N.Foreign ? N.Text
-                       : Export
-                           ? Name
-                           : "cpn." + std::to_string(Serial++) + "." + Name;
+  std::string Symbol;
+  if (N.Foreign)
+    Symbol = externalIRName(D.ExternalSymbol);
+  else if (Export)
+    Symbol = Name;
+  else {
+    llvm::SmallVector<StringRef, 8> Identity{
+        Name,
+        Owner,
+        D.Result,
+        D.isStatic() ? "static" : "",
+        N.Const ? "const" : "",
+        N.Noexcept ? "noexcept" : "",
+        N.Settings.count("category") ? StringRef(N.Settings.at("category"))
+                                     : StringRef()};
+    Identity.append(D.Params.begin(), D.Params.end());
+    Symbol = nativeLinkName(M,
+                            N.K == Node::Constructor  ? "ctor"
+                            : N.K == Node::Destructor ? "dtor"
+                                                      : "fn",
+                            Identity);
+    if (M.getNamedValue(Symbol))
+      fail(N.At, "conflicting native function identity '" + Name + "'");
+  }
   if (Export && M.getNamedValue(Symbol)) {
     auto *Existing = M.getFunction(Symbol);
     if (!SlotType || !N.Foreign || (Symbol != "malloc" && Symbol != "free") ||
@@ -895,7 +1005,7 @@ Function *Context::declare(const Node &N, const std::string &Name,
   Functions.push_back(std::move(D));
   Group.push_back(&Functions.back());
   if (N.Foreign)
-    ExternalFunctions[N.Text] = Group.back();
+    ExternalFunctions[Group.back()->ExternalSymbol] = Group.back();
   if (Owner.empty())
     bindContracts(*Group.back());
   return Group.back();
@@ -1564,8 +1674,9 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     U.enableStorage();
   U.bindScalarLibrary();
   U.bindMemoryLibrary(Memory);
-  if (llvm::any_of(AST, usesNumericLibrary))
-    U.bindNumericLibrary();
+  const bool FPContext = llvm::any_of(AST, usesFloatingContext);
+  if (FPContext || llvm::any_of(AST, usesNumericLibrary))
+    U.bindNumericLibrary(FPContext);
   U.unit(AST);
   U.emitForeignContractAdapters();
   U.checkWholeContracts();
@@ -1623,6 +1734,7 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     }
   }
   U.finishStaticReads();
+  U.initializeFloatingRoot();
   auto Hook = [&](auto &List, bool IsStartup) {
     if (List.empty())
       return;
@@ -1661,4 +1773,12 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Hook(U.Shutdown, false);
   U.finishPointerStorage();
   U.finishLocalConstantAddresses();
+  auto CheckRawSymbol = [&](StringRef Symbol, const Token &At) {
+    if (Symbol.starts_with("cpn.") && M.getNamedValue(Symbol))
+      fail(At, "conflicting external symbol '" + Symbol.str() + "'");
+  };
+  for (const auto &[Symbol, F] : U.ExternalFunctions)
+    CheckRawSymbol(Symbol, F->Decl.At);
+  for (const auto &[Symbol, Object] : U.ExternalObjects)
+    CheckRawSymbol(Symbol, {});
 }

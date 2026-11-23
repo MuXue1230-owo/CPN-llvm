@@ -71,19 +71,19 @@ The minimal `std::Result` binding supports case queries, receiver-qualified
 Wrong-case checked access selects ContractTrap. `try_value()` and `try_error()`
 return `WrongCase` on an inactive case and preserve payload references through
 the corresponding const-qualified or mutable `std::Ref` on success. Mapping
-adapters remain incomplete. Borrow checking rejects proved escapes through
-these aggregates and proved use of a direct `Ref` after its referent's
-full-expression lifetime. Borrow flow through joined temporary Results
-remains partial.
+adapters remain incomplete. Borrow checking follows reaching stores, selected
+Result cases and supported branch joins to diagnose provable lifetime expiry
+and publication of automatic borrows. Opaque writes and unresolved alias
+paths limit that analysis.
 
 ### Outstanding Core coverage
 
-* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Out-of-line generic member definitions bind both the owner and member parameters. Known declared receivers select the proper member template schema even when other owners declare same-name members with different parameter kinds. Chained type aliases work in qualified static generic calls. More complete computed comparisons and member template parsing for inferred, dependent or unresolved inherited receivers remain partial.
-* Contract proof is conservative. Override checking proves supported predicate implications against each inherited declaration and its receiver view. Indirect callable types retain selected predicate-check effects and published borrow origins. Stronger proof rules and opaque foreign lifetime contracts remain partial.
-* Construction checks recognize immutable receiver aliases and diagnose proved early inherited access. Cleanup checks the reverse frontier and retains reconstructed slots' cleanup rank. A continuing Whole transfer rolls back completed construction prefixes for authored and aggregate constructors, array elements, memberwise copies, and tagged payloads. Construction contracts through less direct aliases and some access and lifecycle checks remain partial.
+* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Out-of-line generic member definitions bind both the owner and member parameters. Inferred, dependent and inherited receivers bind explicit type and constant arguments against the selected member. Member overloads can declare different parameter kinds in the same owner, and qualified static calls support chained aliases. More complete computed comparisons and ambiguous relational or member-template syntax on unresolved receivers remain partial.
+* Contract proof remains conservative. The proof CFG retains ordered signed and unsigned scalar relations across conditions, including short-circuit clauses and inherited override checks. Indirect callable types retain selected predicate-check effects and published borrow origins. Additional proof rules and opaque foreign lifetime contracts remain partial.
+* Construction checks recognize immutable receiver aliases, equivalent conditional receiver views, and known layer and base arguments at direct and indirect calls. Access and initialization still obey the published effect and construction-state contracts. Cleanup checks the reverse frontier and retains reconstructed slots' cleanup rank. A continuing Whole transfer rolls back completed construction prefixes for authored and aggregate constructors, array elements, memberwise copies, and tagged payloads. Analysis of opaque or dynamically aliased access remains partial.
 * Complete objects and individually selected member and array-element extents support replacement, including by another fitting type. Pointer provenance after untracked foreign writes or raw storage reinterpretation, whole-program escape checking, storage transfer, and allocator ownership remain incomplete.
-* Constant evaluation supports generation-checked replacement of complete automatic objects, ordinary record members and array elements. Replacement of a tagged union by an explicit case is supported. StorageView exposes capacity, alignment and identity in native and constant execution. Direct tagged-payload transitions and stronger shared-base and closure lifetime checks remain partial.
-* Floating-point arithmetic covers f32 and f64. Additional FP context APIs and provider controls remain unavailable.
+* Constant evaluation supports generation-checked replacement of complete automatic objects, ordinary record members, array elements and active tagged payloads. Match keeps temporary payloads alive through arm cleanup. Authored tagged assignment preserves the fresh returned designation when it replaces a case. StorageView exposes capacity, alignment and identity in native and constant execution. Shared-base and closure lifetime checks remain partial.
+* Floating-point arithmetic covers f32 and f64. Direct numeric context calls expose MXCSR controls and sticky state. The setter admits nearest-even, toward-zero and the two directed rounding modes, the five IEEE trap flags and gradual subnormals. Other rounding and subnormal provider selections remain unavailable through the setter.
 * The supported ABI is x86-64 System V for the tested scalar boundary. C++ ABI features, separate compilation, module imports, reflection, exceptions and concurrent execution are unimplemented capabilities.
 
 ### Target and invocation
@@ -100,6 +100,15 @@ linkage. File-scope startup and shutdown use ELF constructors and destructors.
 A project can explicitly select `static.schedule = serial`, `static.workers = 1`,
 and a nonempty `static.identity_namespace`. The namespace defaults to the root
 identity.
+
+Native function and object symbols use the `cpn.v1` naming scheme. Each
+dot-separated identity field is the lowercase hexadecimal encoding of its
+exact UTF-8 bytes. Fields include the logical root, qualified declaration,
+signature and applicable receiver qualifiers. Specialized declarations use
+their canonical instance identities. Hosted `main` and C-bound declarations
+retain their external names. `[[abi_symbol("...")]]` gives a C-bound function
+or object an exact ELF symbol, and `[[abi_cc("sysv-amd64-2018.lp64")]]`
+selects the target's supported calling convention explicitly.
 
 The target has eight-bit bytes and 64-bit platform integers. Native addition, subtraction, multiplication and negation use modulo arithmetic. Exceptional Native division or remainder and invalid variable shift counts terminate through a target trap. Known invalid ordinary division or shift domains produce a source diagnostic. Direct object creation writes an ELF object suitable for the ordinary system linker.
 

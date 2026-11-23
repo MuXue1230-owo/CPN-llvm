@@ -299,10 +299,14 @@ void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
     auto Tag = llvm::cast<llvm::ConstantInt>(Image->getAggregateElement(0u))
                    ->getZExtValue();
     auto &Active = U.Cases.at(U.Variants.at(Type).at(Tag));
-    auto *Payload = unpackVariant(Active, Image, At);
-    for (unsigned I = Active.Types.size(); I; --I)
-      constantDrop({Active.Types[I - 1], Payload->getAggregateElement(I - 1)},
-                   At);
+    auto Subject = Object.Location ? *Object.Location
+                                   : ConstantPlace{&Object, {}, Type, false};
+    for (unsigned I = Active.Types.size(); I; --I) {
+      auto Payload = Subject;
+      Payload.Type = Active.Types[I - 1];
+      Payload.Steps.push_back({I - 1, &Active});
+      Body.retireConstantExtent(std::move(Payload), At, false, true);
+    }
   }
   auto HasObligation = [&](const cpn::Field &Field) {
     return Body.ConstantMembersAlive.at(Field.Decl.Text) &&
