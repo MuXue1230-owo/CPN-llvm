@@ -291,6 +291,49 @@ class CompilerTests(unittest.TestCase):
         ):
             self.assertNotEqual(self.compile(source, "--check").returncode, 0)
 
+    def test_dependent_assignment_requires_matching_category_evidence(self):
+        requirements = """
+            constraint Copies<type A> {
+                expression (A& left, const<A>& right) {left = right -> A&;}
+            };
+            constraint Moves<type A> {
+                expression (A& left, A& right) {left = std::move(right) -> A&;}
+            };
+        """
+        self.assertEqual(
+            self.program(
+                requirements
+                + """
+                generic<type T> requires(Copies<T>)
+                void copy_to(T& left,T& right){left=right;}
+                generic<type T> requires(Moves<T>)
+                void move_to(T& left,T&& right){left=std::move(right);}
+                generic<type T> void guarded(T& left,const<T>& right){
+                    if constexpr(Copies<T>){left=right;}
+                }
+                generic<type T> requires(CopyConstructible<T>)
+                struct Box {T item; Box(const<T>& source){item=source;} };
+                i32 main(){
+                    i32 left; i32 right(18); copy_to(left,right);
+                    i32 first(left); right=24; move_to(left,std::move(right));
+                    guarded(left,right); Box<i32> box(left); return first+box.item;
+                }
+            """
+            ),
+            42,
+        )
+        for definition in (
+            "generic<type T> void f(T& a,const<T>& b){a=b;}",
+            "generic<type T> requires(Copies<T>) void f(T& a,T& b){a=std::move(b);}",
+            "generic<type T> requires(Moves<T>) void f(T& a,T& b){a=b;}",
+        ):
+            with self.subTest(definition=definition):
+                result = self.compile(requirements + definition, "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(
+                    "dependent operation '=' is not established", result.stderr
+                )
+
     def test_generic_contracts_keep_declaration_parameter_positions(self):
         self.assertEqual(
             self.program("""
@@ -1756,6 +1799,51 @@ class CompilerTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(diagnosis, result.stderr)
+
+    def test_calls_and_inferred_objects_bind_member_syntax_from_result_types(self):
+        self.assertEqual(
+            self.program("""
+                struct Range {bool operator>(i32 n) const {return n==0;}};
+                struct Less {Range operator<(i32 n) const {return Range();}};
+                struct Holder {Less get;};
+                struct Reader {generic<const i32 N> i32 get() const {return N;}};
+                generic<type T> struct GenericHolder {Less get;};
+                namespace lib {
+                    Holder holder(){return Holder();}
+                    Reader reader(){return Reader();}
+                    Holder pick(i32 first,i32 second(0)){return Holder();}
+                    Reader pick(){return Reader();}
+                    struct More {
+                        Reader get_reader() const {return Reader();}
+                        static Holder make(){return Holder();}
+                        static Holder pick(i32 first,i32 second(0)){return Holder();}
+                        static Reader pick(){return Reader();}
+                    };
+                    struct Inherited:Holder {};
+                    struct GenericInherited:GenericHolder<i32> {};
+                }
+                i32 exercise(bool choose){
+                    auto object(lib::holder());
+                    lib::More more;
+                    lib::Inherited inherited;
+                    lib::GenericInherited generic_inherited;
+                    alias Factory=function<Holder()>*;
+                    Factory make(&lib::holder);
+                    decltype(lib::holder()) other;
+                    if (!(object.get < 1 > (0)) || !(lib::holder().get < 2 > (0)) ||
+                        !(make().get < 3 > (0)) || !(inherited.get < 4 > (0)) ||
+                        !((choose ? object : other).get < 5 > (0)) ||
+                        !(generic_inherited.get < 6 > (0)) ||
+                        !(lib::More::make().get < 7 > (0)) ||
+                        !(lib::pick(0).get < 8 > (0)) ||
+                        !(lib::More::pick(0).get < 9 > (0))) {return 0;}
+                    return more.get_reader().get<11>() + lib::reader().get<15>() +
+                           lib::pick().get<7>() + lib::More::pick().get<9>();
+                }
+                i32 main(){return exercise(true);}
+            """),
+            42,
+        )
 
     def test_member_overload_argument_kinds_follow_caller_declarations(self):
         source = """
@@ -6859,6 +6947,36 @@ class CompilerTests(unittest.TestCase):
                 construct_at<i32>(inner,42);return 1;}"""),
             0,
         )
+
+    def test_const_static_objects_retain_independent_storage_authority(self):
+        source = """
+            const i32 first(18);
+            constexpr i32 second(24);
+            constexpr i32 original_sum(18+second);
+            i32 main(){
+                if(original_sum!=42){return 3;}
+                auto a(storage_of(first));
+                auto b(storage_of(second));
+                if (a.capacity_bytes()!=usize(4) || a.identity()==b.identity()) {return 1;}
+                destroy(first);
+                destroy(second);
+                auto current(construct_at<i32>(a,40));
+                auto another(construct_at<i32>(b,2));
+                return *current+*another;
+            }
+        """
+        for preset in ("Debug", "Release"):
+            with self.subTest(preset=preset):
+                self.assertEqual(self.program(source, "--preset", preset), 42)
+        stale = source.replace("return *current+*another;", "return second;")
+        self.assertEqual(self.program(stale), -signal.SIGILL)
+        invalid = self.compile(
+            "i32 main(){i32 local; auto view(storage_of(local));"
+            "transfer_storage(view,view);return 0;}",
+            "--check",
+        )
+        self.assertEqual(invalid.returncode, 1, invalid.stderr)
+        self.assertIn("exclusive storage authority", invalid.stderr)
 
     def test_nullable_virtual_base_conversion(self):
         self.assertEqual(

@@ -2564,6 +2564,7 @@ void Frame::object(const Node &N, bool Global) {
       names()[Name] = {Ty, nullptr, G, Readonly};
       return;
     }
+    const bool RegisterExtent = U.SlotType && (!N.Foreign || !Readonly);
     G->setInitializer(llvm::Constant::getNullValue(LT));
     bool Simple = !Tail && !U.Records.count(Ty) && !ends(Ty, "]") &&
                   (Args.empty() ||
@@ -2580,9 +2581,9 @@ void Frame::object(const Node &N, bool Global) {
       auto V = construct(Ty, Args, N.At, nullptr, Tail);
       endExpression();
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
-      // A const source object can still change its hidden dispatch state
-      // between active destructor layers.
-      G->setConstant(Readonly && !containsDispatchState(Ty));
+      // Value qualification does not prevent authorized storage reuse or
+      // changes to the hidden dispatch state between destructor layers.
+      G->setConstant(Readonly && !RegisterExtent && !containsDispatchState(Ty));
       StaticConstant = N.Required ? V.IR : nullptr;
       if (N.Required)
         U.ConstantObjects.insert(G);
@@ -2590,7 +2591,7 @@ void Frame::object(const Node &N, bool Global) {
       if (carriesPointerBounds(Ty))
         Bound.borrow(V);
       names()[Name] = Bound;
-      if ((!U.SlotType || Readonly) &&
+      if (!RegisterExtent &&
           !(N.Required && (carriesPointerBounds(Ty) || U.aggregate(Ty))))
         return;
     }
@@ -2629,7 +2630,7 @@ void Frame::object(const Node &N, bool Global) {
       Init.saveBounds(Init.storedPointerCell(G), V);
       Init.endExpression();
     }
-    if (U.SlotType && !Readonly) {
+    if (RegisterExtent) {
       auto *GlobalSlot = new llvm::GlobalVariable(
           U.M, U.SlotType, false, llvm::GlobalValue::InternalLinkage,
           llvm::Constant::getNullValue(U.SlotType), "cpn.static.slot");

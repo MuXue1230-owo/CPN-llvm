@@ -439,8 +439,6 @@ struct CallableTypeParts {
   llvm::StringRef Result, Parameters, Flags;
 };
 std::optional<CallableTypeParts> splitCallableType(llvm::StringRef);
-std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
-                     llvm::function_ref<bool(const std::string &)> Contains);
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
 bool sameGenericValueContracts(const Node &, const Node &);

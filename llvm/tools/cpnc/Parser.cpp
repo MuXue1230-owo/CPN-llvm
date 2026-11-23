@@ -113,16 +113,40 @@ int precedence(const std::string &S) {
 class Parser {
   std::shared_ptr<std::vector<Token>> Tokens;
   size_t Pos = 0;
+  std::string Namespace;
   std::set<std::string> Types, HiddenTypes, TypeParameters;
   // The owner is the declaration identity, which survives lexical shadowing
   // of its name. Only pointer (*) and array ([) layers affect member syntax.
   struct ReceiverType {
     std::string Owner, Layers;
     bool Dependent = false;
+    std::shared_ptr<const ReceiverType> CallableResult;
+    bool known() const { return !Owner.empty() || Dependent || CallableResult; }
+    bool operator==(const ReceiverType &Other) const {
+      return Owner == Other.Owner && Layers == Other.Layers &&
+             Dependent == Other.Dependent &&
+             (CallableResult == Other.CallableResult ||
+              (CallableResult && Other.CallableResult &&
+               *CallableResult == *Other.CallableResult));
+    }
   };
   using Receivers = std::map<std::string, ReceiverType>;
   Receivers NominalReceivers, ValueReceivers, FieldReceivers;
   std::map<std::pair<unsigned, unsigned>, ReceiverType> ReceiverDeclarations;
+  std::map<std::pair<unsigned, unsigned>, ReceiverType> NominalExpressions;
+  std::map<std::pair<unsigned, unsigned>, std::string>
+      QualifiedMemberExpressions;
+  struct CallShape {
+    size_t Required;
+    std::optional<size_t> Maximum;
+    ReceiverType Result;
+    bool accepts(size_t Count) const {
+      return Count >= Required && (!Maximum || Count <= *Maximum);
+    }
+  };
+  std::map<std::string, std::vector<CallShape>> CallResults;
+  std::map<std::string, std::vector<ReceiverType>> BaseReceivers;
+  std::set<std::string> SpecializedReceivers;
   ReceiverType CurrentReceiver;
   std::set<std::string> OwnMembers;
   static ReceiverType recordReceiver(const Node &R) {
@@ -132,6 +156,8 @@ class Parser {
   }
   std::map<std::string, std::string> AliasSchemas;
   void publishReceiver(const Node &Decl, const std::string &Name) {
+    if (Decl.K == Node::Function)
+      return;
     auto I = ReceiverDeclarations.find({Decl.At.Line, Decl.At.Column});
     if (I == ReceiverDeclarations.end())
       return;
@@ -204,23 +230,117 @@ class Parser {
       ConflictingMemberSchemas.insert(Key);
     Previous = Parameters;
   }
+  void publishCallResult(const std::string &Key, const ReceiverType &Result,
+                         llvm::ArrayRef<Node> Params) {
+    CallShape Shape{0, std::nullopt, Result};
+    if (llvm::none_of(Params, [](const Node &P) { return P.Pack; })) {
+      Shape.Maximum = Params.size();
+      auto Defaulted = llvm::find_if(
+          Params, [](const Node &P) { return !P.Children.empty(); });
+      Shape.Required = std::distance(Params.begin(), Defaulted);
+    }
+    auto &Overloads = CallResults[Key];
+    if (llvm::none_of(Overloads, [&](const CallShape &Existing) {
+          return Existing.Required == Shape.Required &&
+                 Existing.Maximum == Shape.Maximum && Existing.Result == Result;
+        }))
+      Overloads.push_back(std::move(Shape));
+  }
+  std::string indexedMember(const std::string &Owner, StringRef Name) const {
+    std::set<std::string> Visited, Matches;
+    auto Search = [&](auto &&Self, const std::string &Type) -> void {
+      if (Type.empty() || !Visited.insert(Type).second)
+        return;
+      auto Key = (Type + "::" + Name).str();
+      if (OwnMembers.count(Key)) {
+        Matches.insert(std::move(Key));
+        return;
+      }
+      if (auto I = BaseReceivers.find(Type); I != BaseReceivers.end())
+        for (const auto &Base : I->second)
+          Self(Self, Base.Owner);
+    };
+    Search(Search, Owner);
+    return Matches.size() == 1 ? *Matches.begin() : std::string();
+  }
+  ReceiverType callReceiver(const Node &Call) const {
+    const auto &Callee = Call.Children.front();
+    ReceiverType Callable;
+    std::string Key;
+    if (Callee.K == Node::Member) {
+      auto Base = receiverType(Callee.Children.front());
+      if (Base.Dependent)
+        return Base;
+      if (Base.Layers == (Callee.Definition ? "*" : ""))
+        Key = indexedMember(Base.Owner, Callee.Text);
+      if (auto I = FieldReceivers.find(Key); I != FieldReceivers.end())
+        Callable = I->second;
+    } else if (Callee.K == Node::Name && !ValueReceivers.count(Callee.Text)) {
+      auto Name = StringRef(Callee.Text);
+      bool Root = Name.consume_front("::");
+      if ((Name == "std::move" || Name == "std::forward") &&
+          Call.Children.size() == 2)
+        return receiverType(Call.Children.back());
+      const auto Site = std::pair(Callee.At.Line, Callee.At.Column);
+      if (auto I = NominalExpressions.find(Site); I != NominalExpressions.end())
+        return I->second;
+      if (auto I = QualifiedMemberExpressions.find(Site);
+          I != QualifiedMemberExpressions.end())
+        Key = I->second;
+      else if (!Root && !Name.contains("::"))
+        Key = indexedMember(CurrentReceiver.Owner, Name);
+      if (Key.empty())
+        Key = scopeKey(Namespace, Callee.Text, [&](const std::string &Entry) {
+          return CallResults.count(Entry);
+        });
+    } else
+      Callable = receiverType(Callee);
+    if (Callable.CallableResult &&
+        (Callable.Layers == "*" || Callable.Layers.empty()))
+      return *Callable.CallableResult;
+    if (auto I = CallResults.find(Key); I != CallResults.end()) {
+      const ReceiverType *Uniform = nullptr;
+      const auto Args = llvm::ArrayRef(Call.Children).drop_front();
+      const bool Expanded =
+          llvm::any_of(Args, [](const Node &A) { return A.Pack; });
+      for (const auto &Overload : I->second) {
+        if (!Expanded && !Overload.accepts(Args.size()))
+          continue;
+        if (Uniform && !(*Uniform == Overload.Result))
+          return {};
+        Uniform = &Overload.Result;
+      }
+      if (Uniform)
+        return *Uniform;
+    }
+    return {};
+  }
   ReceiverType receiverType(const Node &N) const {
     if (N.K == Node::Name) {
       if (N.Text == "this" && !CurrentReceiver.Owner.empty())
         return {CurrentReceiver.Owner, "*"};
       if (auto I = ValueReceivers.find(N.Text); I != ValueReceivers.end())
         return I->second;
+      auto Key = indexedMember(CurrentReceiver.Owner, N.Text);
+      if (auto I = FieldReceivers.find(Key); I != FieldReceivers.end())
+        return I->second;
       return {};
     }
     if (N.K == Node::Configured)
       return receiverType(N.Children.front());
+    if (N.K == Node::Call)
+      return callReceiver(N);
+    if (N.K == Node::Conditional) {
+      auto Left = receiverType(N.Children[1]);
+      return Left == receiverType(N.Children[2]) ? Left : ReceiverType{};
+    }
     if (N.K == Node::Member) {
       auto Base = receiverType(N.Children.front());
       if (Base.Dependent)
         return Base;
       if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
         return {};
-      if (auto I = FieldReceivers.find(Base.Owner + "::" + N.Text);
+      if (auto I = FieldReceivers.find(indexedMember(Base.Owner, N.Text));
           I != FieldReceivers.end())
         return I->second;
       return {};
@@ -230,7 +350,7 @@ class Parser {
     auto Base = receiverType(N.Children.front());
     if (Base.Dependent)
       return Base;
-    if (Base.Owner.empty())
+    if (!Base.known())
       return {};
     if (N.K == Node::Unary && N.Text == "&") {
       Base.Layers += '*';
@@ -252,10 +372,10 @@ class Parser {
                                           bool Pointer) const {
     auto Type = receiverType(N);
     if (!Type.Owner.empty() && Type.Layers == (Pointer ? "*" : "")) {
-      auto Key = Type.Owner + "::" + Member.Text;
+      auto Key = indexedMember(Type.Owner, Member.Text);
       if (Families.count(Key))
         return Key;
-      if (OwnMembers.count(Key))
+      if (!Key.empty())
         return std::string();
     }
     return std::nullopt;
@@ -383,7 +503,8 @@ class Parser {
   }
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr,
                   std::string *NominalSchema = nullptr,
-                  ReceiverType *Receiver = nullptr) {
+                  ReceiverType *Receiver = nullptr,
+                  std::string *QualifiedMember = nullptr) {
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
              : AllowBuiltin && builtin(peek().Text) ? take()
@@ -403,14 +524,16 @@ class Parser {
           Application && !Root && !StringRef(Schema).contains("::");
       const bool Shadowed = Unqualified && (HiddenTypes.count(Schema) ||
                                             ValueReceivers.count(Schema));
-      auto MemberSchema = CurrentReceiver.Owner + "::" + Schema;
-      bool MemberBinding =
-          Unqualified && OwnMembers.count(MemberSchema) && !Types.count(Schema);
+      auto MemberSchema = Unqualified
+                              ? indexedMember(CurrentReceiver.Owner, Schema)
+                              : std::string();
+      bool MemberBinding = !MemberSchema.empty() && !Types.count(Schema);
       if (Application && StringRef(Schema).contains("::")) {
         auto [Owner, Member] = StringRef(Schema).rsplit("::");
         if (auto I = NominalReceivers.find((Root ? "::" : "") + Owner.str());
-            I != NominalReceivers.end() && !I->second.Owner.empty()) {
-          MemberSchema = (I->second.Owner + "::" + Member).str();
+            I != NominalReceivers.end() && !I->second.Owner.empty() &&
+            !SpecializedReceivers.count(I->second.Owner)) {
+          MemberSchema = indexedMember(I->second.Owner, Member);
           MemberBinding = Families.count(MemberSchema);
         }
       }
@@ -458,8 +581,11 @@ class Parser {
           Application->TemplateArgs = std::move(Args);
         }
       }
-      if (!eat("::"))
+      if (!eat("::")) {
+        if (QualifiedMember && !Unqualified)
+          *QualifiedMember = std::move(MemberSchema);
         break;
+      }
       Schema = AliasSchema(Schema);
       auto Next = Application && is("operator")      ? operatorName()
                   : is("forward") && T.Text == "std" ? take()
@@ -474,8 +600,12 @@ class Parser {
           TypeParameters.count(StringRef(Schema).split("::").first.str()))
         Receiver->Dependent = true;
       else if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
-               I != NominalReceivers.end())
-        *Receiver = I->second;
+               I != NominalReceivers.end()) {
+        if (SpecializedReceivers.count(I->second.Owner))
+          Receiver->Dependent = true;
+        else
+          *Receiver = I->second;
+      }
     }
     if (Root)
       T.Text = "::" + T.Text;
@@ -535,10 +665,15 @@ class Parser {
                                              known(peek().Text));
       if (T) {
         Node A(Node::TypeArg, peek());
+        if (!A.At.Text.empty() && llvm::isDigit(A.At.Text.front()))
+          fail(A.At, "expected a type argument");
         A.Type = type();
         Out.push_back(A);
-      } else
+      } else {
+        if (is("const") && peek(1).Text == "<")
+          fail(peek(), "expected a constant argument");
         Out.push_back(expr(1, true));
+      }
       if (Canonical) {
         if (I)
           *Canonical += ",";
@@ -663,6 +798,8 @@ class Parser {
       expect("(");
       Node Query(Node::TypeQuery, T);
       Query.Children.push_back(expr());
+      if (Receiver)
+        *Receiver = receiverType(Query.Children.front());
       expect(")");
       S = "$decltype." + std::to_string(T.Line) + "." +
           std::to_string(T.Column);
@@ -674,7 +811,11 @@ class Parser {
       closeAngle();
     } else if (eat("function")) {
       expect("<");
-      auto Return = type();
+      ReceiverType Result;
+      auto Return = type(nullptr, Receiver ? &Result : nullptr);
+      if (Receiver && Result.known())
+        Receiver->CallableResult =
+            std::make_shared<const ReceiverType>(std::move(Result));
       S = "function<" + Return + "(";
       auto Parameters = params();
       std::map<std::string, unsigned> Named;
@@ -744,7 +885,7 @@ class Parser {
       if (is("*") || is("&") || is("&&")) {
         auto Suffix = take().Text;
         S += Suffix;
-        if (Receiver && Suffix == "*" && !Receiver->Owner.empty())
+        if (Receiver && Suffix == "*" && Receiver->known())
           Receiver->Layers += '*';
         if (NominalSchema)
           NominalSchema->clear();
@@ -753,7 +894,7 @@ class Parser {
         expr();
         S += "[" + spelling(Begin) + "]";
         expect("]");
-        if (Receiver && !Receiver->Owner.empty())
+        if (Receiver && Receiver->known())
           Receiver->Layers += '[';
         if (NominalSchema)
           NominalSchema->clear();
@@ -849,8 +990,15 @@ class Parser {
       if (Reserved.count(T.Text) && T.Text != "operator")
         fail(T, "expected expression");
       N.K = Node::Name;
-      N.At = qualified(true, &N);
+      ReceiverType Nominal;
+      std::string QualifiedMember;
+      N.At = qualified(true, &N, nullptr, &Nominal, &QualifiedMember);
       N.Text = N.At.Text;
+      if (Nominal.known())
+        NominalExpressions[{N.At.Line, N.At.Column}] = std::move(Nominal);
+      if (!QualifiedMember.empty())
+        QualifiedMemberExpressions[{N.At.Line, N.At.Column}] =
+            std::move(QualifiedMember);
     } else
       fail(T, "expected expression");
     for (;;) {
@@ -1102,7 +1250,10 @@ class Parser {
       ValueReceivers[Id.Text] = std::move(Receiver);
       if (Types.count(Id.Text) || integerLibraryName(Id.Text, true))
         HiddenTypes.insert(Id.Text);
-      return object(Id, Ty, RO, CX);
+      auto O = object(Id, Ty, RO, CX);
+      if (Ty == "auto" && O.Children.size() == 1)
+        ValueReceivers[Id.Text] = receiverType(O.Children.front());
+      return O;
     }
     Node S(Node::Expression, peek());
     S.Children.push_back(expr());
@@ -1292,9 +1443,11 @@ class Parser {
         P.Text = P.At.Text;
       }
       if (is("(")) {
-        if (IndexingMembers)
+        if (IndexingMembers) {
+          if (peek(1).Text != ")")
+            P.Children.emplace_back(Node::Empty, peek(1));
           skipBalanced("(", ")");
-        else
+        } else
           P.Children = args();
       }
       if (BindReceivers && !P.Text.empty())
@@ -1758,6 +1911,11 @@ class Parser {
       OwnMembers.insert(Key);
       if (Member.K == Node::Function && !Member.Generics.empty())
         publishMemberFamily(Key, Member.Generics);
+      if (Member.K == Node::Function)
+        publishCallResult(
+            Key,
+            Index.ReceiverDeclarations.at({Member.At.Line, Member.At.Column}),
+            Member.Params);
       if (Member.K == Node::Field) {
         const auto &Type = Index.FieldReceivers.at(Key);
         FieldReceivers[Key] = Type;
@@ -1781,8 +1939,13 @@ class Parser {
           AliasSchemas.erase(Member.Text);
       }
       if ((Member.K == Node::Record || Member.K == Node::Union) &&
-          !Member.Prototype)
-        importRecordMembers(Index, Member, recordReceiver(Member), false);
+          !Member.Prototype) {
+        auto Nested = recordReceiver(Member);
+        if (auto I = Index.BaseReceivers.find(Nested.Owner);
+            I != Index.BaseReceivers.end())
+          BaseReceivers[Nested.Owner] = I->second;
+        importRecordMembers(Index, Member, Nested, false);
+      }
     }
   }
 
@@ -1843,6 +2006,8 @@ class Parser {
       }
       if (eat("{")) {
         if (NS) {
+          llvm::SaveAndRestore NamespaceScope(Namespace,
+                                              Namespace + N.Text + "::");
           llvm::SaveAndRestore NamespaceAliases(AliasSchemas);
           llvm::SaveAndRestore NamespaceTypes(NominalReceivers);
           llvm::SaveAndRestore NamespaceValues(ValueReceivers);
@@ -1961,9 +2126,8 @@ class Parser {
       R.Type = Kind;
       auto Receiver = recordReceiver(R);
       if (!Specialize) {
-        auto Bound = G.empty() ? Receiver : ReceiverType{};
-        NominalReceivers[R.Text] = Bound;
-        ReceiverDeclarations[{R.At.Line, R.At.Column}] = std::move(Bound);
+        NominalReceivers[R.Text] = Receiver;
+        ReceiverDeclarations[{R.At.Line, R.At.Column}] = Receiver;
       }
       auto RecordTypes = NominalReceivers;
       auto RecordValues = ValueReceivers;
@@ -1974,6 +2138,8 @@ class Parser {
           R.Text += "::" + name().Text;
         if (!Families.count(R.Text))
           fail(R.At, "specialization must name an existing type family");
+        if (auto I = NominalReceivers.find(R.Text); I != NominalReceivers.end())
+          SpecializedReceivers.insert(I->second.Owner);
         R.Pattern = templateArgs(R.Text);
         R.Settings["specialize"] = "1";
       }
@@ -1994,7 +2160,9 @@ class Parser {
         do {
           Node B(Node::TypeArg, peek());
           B.Definition = eat("virtual");
-          B.Type = type();
+          ReceiverType Base;
+          B.Type = type(nullptr, &Base);
+          BaseReceivers[Receiver.Owner].push_back(std::move(Base));
           R.TemplateArgs.push_back(B);
         } while (eat(","));
       }
@@ -2080,8 +2248,10 @@ class Parser {
       if (Virtual || Eval || (Static && !StorageStatic) || (Foreign && Static))
         fail(Id, "invalid object declaration modifier");
       ValueReceivers[Id.Text] = Receiver;
-      ReceiverDeclarations[{Id.Line, Id.Column}] = std::move(Receiver);
       auto O = object(Id, Ty, RO, CE);
+      if (Ty == "auto" && O.Children.size() == 1)
+        ValueReceivers[Id.Text] = receiverType(O.Children.front());
+      ReceiverDeclarations[{Id.Line, Id.Column}] = ValueReceivers.at(Id.Text);
       if (Static || ThreadLocal)
         O.Settings["storage"] = Static ? "static" : "thread_local";
       O.Foreign = Foreign;
@@ -2093,6 +2263,7 @@ class Parser {
         (StorageStatic && (CE || Eval)))
       fail(Id, "invalid function declaration modifier");
     Node F(Node::Function, Id);
+    ReceiverDeclarations[{Id.Line, Id.Column}] = Receiver;
     if (Static)
       F.Settings["static"] = "1";
     if (Virtual)
@@ -2112,6 +2283,11 @@ class Parser {
       F.TemplateArgs.push_back(std::move(Requires));
     llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
     F.Params = params(true);
+    if (Member)
+      publishCallResult(CurrentReceiver.Owner + "::" + Id.Text, Receiver,
+                        F.Params);
+    else if (Q.empty())
+      publishCallResult(Namespace + Id.Text, Receiver, F.Params);
     if ((Member && !Static) || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))

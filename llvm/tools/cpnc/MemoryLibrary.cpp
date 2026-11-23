@@ -13,8 +13,13 @@ std::optional<Value> Frame::memoryCall(const Node &Call,
                                        Value Receiver) {
   StringRef Name(Call.Text);
   Name.consume_front("::");
-  if (Call.K == Node::Name && Name == "transfer_storage")
+  if (Call.K == Node::Name && Name == "transfer_storage") {
+    if (Args.size() != 2 || !Call.TemplateArgs.empty())
+      fail(Call.At, "transfer_storage requires a source and a target owner");
+    for (const auto &Arg : Args)
+      unevaluatedType(Arg, false);
     fail(Call.At, "transfer_storage requires exclusive storage authority");
+  }
   if (Call.K != Node::Member || Receiver.Type != StorageViewType)
     return {};
   if (!Args.empty() || !Call.TemplateArgs.empty())

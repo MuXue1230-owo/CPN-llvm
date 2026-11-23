@@ -1,8 +1,18 @@
 #include "Sema.h"
+#include <array>
 using namespace cpn;
 namespace {
 using Bindings = std::map<std::string, std::string>;
-using Operation = std::pair<std::string, std::vector<std::string>>;
+enum class AssignmentKind { Unknown, LValue, ConstLValue, RValue, ConstRValue };
+struct Operation {
+  std::string Name;
+  std::vector<std::string> Types;
+  std::array<AssignmentKind, 2> Assignment = {};
+  bool operator<(const Operation &Other) const {
+    return std::tie(Name, Types, Assignment) <
+           std::tie(Other.Name, Other.Types, Other.Assignment);
+  }
+};
 struct Domain {
   Bindings Equal;
   std::map<std::string, bool> Predicates;
@@ -12,9 +22,9 @@ using Alternatives = std::vector<Domain>;
 
 bool needsWitness(const Node &N) {
   static const std::set<std::string> Binary = {
-      "+",   "-",   "*",  "/",  "%",  "|",  "&",  "^",  "<<",
-      ">>",  "+=",  "-=", "*=", "/=", "%=", "|=", "&=", "^=",
-      "<<=", ">>=", "==", "!=", "<",  ">",  "<=", ">="};
+      "+",  "-",   "*",   "/",  "%",  "|",  "&",  "^",  "<<",
+      ">>", "+=",  "-=",  "*=", "/=", "%=", "|=", "&=", "^=",
+      "=",  "<<=", ">>=", "==", "!=", "<",  ">",  "<=", ">="};
   static const std::set<std::string> Unary = {"+", "-", "~", "!", "++", "--"};
   return N.K == Node::Binary ? Binary.count(N.Text)
                              : N.K == Node::Unary && Unary.count(N.Text);
@@ -49,6 +59,7 @@ struct Checker {
   Frame Names;
   std::set<std::string> Parameters;
   Bindings Variables;
+  bool InConstructor = false;
   uint64_t Steps = 0;
   Checker(Context &U, const std::string &Prefix)
       : U(U), Names(U, nullptr, nullptr, Prefix) {}
@@ -78,44 +89,74 @@ struct Checker {
     return "";
   }
 
+  AssignmentKind assignmentKind(const Node &E, const Bindings &Scope) const {
+    if (E.K == Node::Name) {
+      if (auto I = Scope.find(E.Text); I != Scope.end()) {
+        auto Type = llvm::StringRef(I->second);
+        Type.consume_front("forward ");
+        return Type.starts_with("const<") ? AssignmentKind::ConstLValue
+                                          : AssignmentKind::LValue;
+      }
+    }
+    if (E.K == Node::Binary && E.Text == "=")
+      return assignmentKind(E.Children.front(), Scope);
+    if (E.K == Node::Call && E.Children.front().K == Node::Name) {
+      const auto &Name = E.Children.front().Text;
+      if (Name == "std::move" && E.Children.size() == 2) {
+        auto Kind = assignmentKind(E.Children.back(), Scope);
+        if (Kind == AssignmentKind::LValue)
+          return AssignmentKind::RValue;
+        if (Kind == AssignmentKind::ConstLValue)
+          return AssignmentKind::ConstRValue;
+        return Kind;
+      }
+      if (!Scope.count(Name) && (builtin(Name) || Parameters.count(Name)))
+        return AssignmentKind::RValue;
+    }
+    return AssignmentKind::Unknown;
+  }
+
   // A method designator is bound together with its arguments. It does not
   // independently require a data field with the same spelling.
   template <class Child>
-  static std::optional<Operation> operation(const Node &N,
-                                            const Bindings &Scope, Child type) {
+  std::optional<Operation> operation(const Node &N, const Bindings &Scope,
+                                     Child type) const {
     const auto &A = N.Children;
     Operation Op;
     if (N.K == Node::Call) {
       const auto &C = A.front();
       if (C.K == Node::Member) {
-        Op.first = "." + C.Text + "()";
-        Op.second.push_back(type(C.Children.front()));
-        if (C.Definition && llvm::StringRef(Op.second.front()).ends_with("*"))
-          Op.second.front().pop_back();
+        Op.Name = "." + C.Text + "()";
+        Op.Types.push_back(type(C.Children.front()));
+        if (C.Definition && llvm::StringRef(Op.Types.front()).ends_with("*"))
+          Op.Types.front().pop_back();
       } else if (C.K == Node::Name && Scope.count(C.Text)) {
-        Op.first = "()";
-        Op.second.push_back(type(C));
+        Op.Name = "()";
+        Op.Types.push_back(type(C));
       } else
         return {};
       for (const auto &Arg : llvm::ArrayRef(A).drop_front())
-        Op.second.push_back(type(Arg));
+        Op.Types.push_back(type(Arg));
       return Op;
     }
     if (N.K == Node::Member) {
-      Op.first = "." + N.Text;
-      Op.second.push_back(type(A.front()));
-      if (N.Definition && llvm::StringRef(Op.second.front()).ends_with("*"))
-        Op.second.front().pop_back();
+      Op.Name = "." + N.Text;
+      Op.Types.push_back(type(A.front()));
+      if (N.Definition && llvm::StringRef(Op.Types.front()).ends_with("*"))
+        Op.Types.front().pop_back();
       return Op;
     }
     if (N.K == Node::Index)
-      Op.first = "[]";
+      Op.Name = "[]";
     else if (needsWitness(N))
-      Op.first = operatorKey(N);
+      Op.Name = operatorKey(N);
     else
       return {};
     for (const auto &Arg : A)
-      Op.second.push_back(type(Arg));
+      Op.Types.push_back(type(Arg));
+    if (Op.Name == "=")
+      Op.Assignment = {assignmentKind(A[0], Scope),
+                       assignmentKind(A[1], Scope)};
     return Op;
   }
 
@@ -188,10 +229,11 @@ struct Checker {
       }
       Bindings Locals;
       for (auto &P : R.Params)
-        Locals[P.Text] = substitute(P.Type, Actual);
+        Locals[P.Text] = P.Type;
       for (auto &E : R.Children) {
-        if (auto Op = operation(
-                E, Locals, [&](const Node &N) { return operand(N, Locals); }))
+        if (auto Op = operation(E, Locals, [&](const Node &N) {
+              return substitute(operand(N, Locals), Actual);
+            }))
           for (auto &D : Alts)
             D.Operations[*Op] = substitute(E.Type, Actual);
       }
@@ -245,8 +287,12 @@ struct Checker {
           return valueType(Signature->Result.str());
         }
     }
-    auto Op =
-        operation(N, Variables, [&](const Node &C) { return visit(C, Alts); });
+    // A constructor's first write to a slot can start its lifetime. The
+    // specialized construction plan identifies those writes before lowering.
+    auto Op = InConstructor && N.K == Node::Binary && N.Text == "="
+                  ? std::optional<Operation>{}
+                  : operation(N, Variables,
+                              [&](const Node &C) { return visit(C, Alts); });
     if (!Op) {
       std::string First;
       for (size_t I = 0; I < N.Children.size(); ++I) {
@@ -258,7 +304,7 @@ struct Checker {
         Variables[N.Text] = N.Type == "auto" ? First : N.Type;
       return operand(N, Variables);
     }
-    const auto &Types = Op->second;
+    const auto &Types = Op->Types;
     if (llvm::any_of(Types, [](const auto &T) { return T.empty(); }))
       return "";
     bool Boolean = N.Text == "!" || N.Text == "==" || N.Text == "!=" ||
@@ -274,15 +320,25 @@ struct Checker {
         continue;
       auto W = llvm::find_if(D.Operations, [&](const auto &Entry) {
         const auto &Other = Entry.first;
-        if (Other.first != Op->first || Other.second.size() != Types.size())
+        if (Other.Name != Op->Name || Other.Types.size() != Types.size())
           return false;
         for (size_t I = 0; I < Types.size(); ++I)
-          if (representative(Other.second[I], D) != representative(Types[I], D))
+          if (representative(Other.Types[I], D) != representative(Types[I], D))
             return false;
+        if (Op->Name == "=") {
+          if (Op->Assignment[0] != AssignmentKind::LValue ||
+              Other.Assignment[0] != AssignmentKind::LValue ||
+              Op->Assignment[1] == AssignmentKind::Unknown)
+            return false;
+          return Other.Assignment[1] == Op->Assignment[1] ||
+                 (Other.Assignment[1] == AssignmentKind::ConstLValue &&
+                  Op->Assignment[1] == AssignmentKind::LValue &&
+                  representative(Types[0], D) == representative(Types[1], D));
+        }
         return true;
       });
       if (W == D.Operations.end())
-        fail(N.At, "dependent operation '" + Op->first +
+        fail(N.At, "dependent operation '" + Op->Name +
                        "' is not established by the declared constraints");
       Result = W->second;
     }
@@ -403,6 +459,8 @@ void Context::checkDomain(const Node &N, const std::string &Prefix,
       Alts = Check.refine(Q, true, std::move(Alts));
   auto Body = [&](const Node &D) {
     llvm::SaveAndRestore Scope(Check.Variables);
+    llvm::SaveAndRestore Constructor(Check.InConstructor,
+                                     D.K == Node::Constructor);
     for (auto &P : D.Params)
       Check.Variables[P.Text] = P.Type;
     for (const auto &Clause : D.Contracts) {

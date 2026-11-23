@@ -2,6 +2,7 @@
 #ifndef LLVM_TOOLS_CPNC_FRONTEND_H
 #define LLVM_TOOLS_CPNC_FRONTEND_H
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include <map>
 #include <optional>
@@ -160,6 +161,8 @@ std::string parameterEffects(const std::set<unsigned> &NoEscape,
                              const std::set<unsigned> &Consumes);
 std::vector<Node> parse(llvm::StringRef, const Options &);
 Node parseExpression(llvm::StringRef, const Options &);
+std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
+                     llvm::function_ref<bool(const std::string &)> Contains);
 void configure(Options &, const Node &, ConfigScope);
 void compile(llvm::Module &, const std::vector<Node> &, Options);
 } // namespace cpn
