@@ -326,6 +326,8 @@ class CompilerTests(unittest.TestCase):
             "generic<type T> void f(T& a,const<T>& b){a=b;}",
             "generic<type T> requires(Copies<T>) void f(T& a,T& b){a=std::move(b);}",
             "generic<type T> requires(Moves<T>) void f(T& a,T& b){a=b;}",
+            "generic<type T> void f(T& a,const<T>& b){"
+            "if constexpr(!SameType<T,const<T>>){a=b;}}",
         ):
             with self.subTest(definition=definition):
                 result = self.compile(requirements + definition, "--check")
@@ -1813,6 +1815,8 @@ class CompilerTests(unittest.TestCase):
                     Reader reader(){return Reader();}
                     Holder pick(i32 first,i32 second(0)){return Holder();}
                     Reader pick(){return Reader();}
+                    Holder select(i32 value){return Holder();}
+                    Reader select(bool value){return Reader();}
                     struct More {
                         Reader get_reader() const {return Reader();}
                         static Holder make(){return Holder();}
@@ -1836,9 +1840,11 @@ class CompilerTests(unittest.TestCase):
                         !(generic_inherited.get < 6 > (0)) ||
                         !(lib::More::make().get < 7 > (0)) ||
                         !(lib::pick(0).get < 8 > (0)) ||
-                        !(lib::More::pick(0).get < 9 > (0))) {return 0;}
-                    return more.get_reader().get<11>() + lib::reader().get<15>() +
-                           lib::pick().get<7>() + lib::More::pick().get<9>();
+                        !(lib::More::pick(0).get < 9 > (0)) ||
+                        !(lib::select(i32(0)).get < 10 > (0))) {return 0;}
+                    return more.get_reader().get<11>() + lib::reader().get<10>() +
+                           lib::pick().get<7>() + lib::More::pick().get<9>() +
+                           lib::select(true).get<5>();
                 }
                 i32 main(){return exercise(true);}
             """),

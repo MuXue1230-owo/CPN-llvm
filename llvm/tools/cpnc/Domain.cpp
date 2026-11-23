@@ -187,8 +187,14 @@ struct Checker {
     if (Q.K != Node::Name)
       return Alts;
     if (Q.Text == "SameType" && Q.TemplateArgs.size() == 2) {
-      auto L = substitute(Q.TemplateArgs[0].Type, Args),
-           R = substitute(Q.TemplateArgs[1].Type, Args);
+      const auto &Left = Q.TemplateArgs[0].Type;
+      const auto &Right = Q.TemplateArgs[1].Type;
+      auto L = substitute(Left, Args), R = substitute(Right, Args);
+      // The value-type equivalence used for operations cannot prove an exact
+      // type comparison between a symbolic type and a qualified version of it.
+      if (L == R && Left != Right &&
+          (valueType(Left) != Left || valueType(Right) != Right))
+        return Alts;
       llvm::erase_if(Alts, [&](Domain &D) {
         auto X = representative(L, D), Y = representative(R, D);
         if (X == Y)

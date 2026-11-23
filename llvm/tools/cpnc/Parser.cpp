@@ -140,6 +140,7 @@ class Parser {
     size_t Required;
     std::optional<size_t> Maximum;
     ReceiverType Result;
+    std::optional<std::vector<std::string>> ScalarParameters;
     bool accepts(size_t Count) const {
       return Count >= Required && (!Maximum || Count <= *Maximum);
     }
@@ -231,18 +232,27 @@ class Parser {
     Previous = Parameters;
   }
   void publishCallResult(const std::string &Key, const ReceiverType &Result,
-                         llvm::ArrayRef<Node> Params) {
+                         const Node &Function, bool FreeFunction) {
     CallShape Shape{0, std::nullopt, Result};
+    const auto Params = llvm::ArrayRef(Function.Params);
     if (llvm::none_of(Params, [](const Node &P) { return P.Pack; })) {
       Shape.Maximum = Params.size();
       auto Defaulted = llvm::find_if(
           Params, [](const Node &P) { return !P.Children.empty(); });
       Shape.Required = std::distance(Params.begin(), Defaulted);
+      if (FreeFunction && Function.Generics.empty() &&
+          llvm::all_of(Params, [](const Node &P) { return builtin(P.Type); })) {
+        Shape.ScalarParameters.emplace();
+        for (const auto &P : Params)
+          Shape.ScalarParameters->push_back(P.Type);
+      }
     }
     auto &Overloads = CallResults[Key];
     if (llvm::none_of(Overloads, [&](const CallShape &Existing) {
           return Existing.Required == Shape.Required &&
-                 Existing.Maximum == Shape.Maximum && Existing.Result == Result;
+                 Existing.Maximum == Shape.Maximum &&
+                 Existing.Result == Result &&
+                 Existing.ScalarParameters == Shape.ScalarParameters;
         }))
       Overloads.push_back(std::move(Shape));
   }
@@ -262,6 +272,24 @@ class Parser {
     };
     Search(Search, Owner);
     return Matches.size() == 1 ? *Matches.begin() : std::string();
+  }
+  StringRef scalarExpressionType(const Node &N) const {
+    if (N.K == Node::Character)
+      return "char";
+    if (N.K == Node::Name) {
+      if (N.Text == "true" || N.Text == "false")
+        return "bool";
+      if (N.Text == "nullptr")
+        return "nullptr_t";
+    }
+    if (N.K == Node::Call && N.Children.front().K == Node::Name) {
+      const auto &Name = N.Children.front().Text;
+      if (builtin(Name) && !HiddenTypes.count(Name) &&
+          !ValueReceivers.count(Name) && !TypeParameters.count(Name) &&
+          indexedMember(CurrentReceiver.Owner, Name).empty())
+        return Name;
+    }
+    return {};
   }
   ReceiverType callReceiver(const Node &Call) const {
     const auto &Callee = Call.Children.front();
@@ -299,19 +327,35 @@ class Parser {
         (Callable.Layers == "*" || Callable.Layers.empty()))
       return *Callable.CallableResult;
     if (auto I = CallResults.find(Key); I != CallResults.end()) {
-      const ReceiverType *Uniform = nullptr;
       const auto Args = llvm::ArrayRef(Call.Children).drop_front();
       const bool Expanded =
           llvm::any_of(Args, [](const Node &A) { return A.Pack; });
-      for (const auto &Overload : I->second) {
-        if (!Expanded && !Overload.accepts(Args.size()))
-          continue;
-        if (Uniform && !(*Uniform == Overload.Result))
-          return {};
-        Uniform = &Overload.Result;
+      llvm::SmallVector<const CallShape *, 4> Viable;
+      for (const auto &Overload : I->second)
+        if (Expanded || Overload.accepts(Args.size()))
+          Viable.push_back(&Overload);
+      auto Uniform = [](llvm::ArrayRef<const CallShape *> Group) {
+        return !Group.empty() && llvm::all_of(Group, [&](const CallShape *S) {
+          return S->Result == Group.front()->Result;
+        });
+      };
+      if (Uniform(Viable))
+        return Viable.front()->Result;
+      // An exact scalar value match dominates implicit conversions. A
+      // reference, member receiver, or generic family needs semantic ranking.
+      if (!Expanded && llvm::all_of(Viable, [](const CallShape *S) {
+            return S->ScalarParameters.has_value();
+          })) {
+        llvm::SmallVector<StringRef, 4> Types;
+        for (const auto &Arg : Args)
+          Types.push_back(scalarExpressionType(Arg));
+        llvm::erase_if(Viable, [&](const CallShape *S) {
+          return !std::equal(Types.begin(), Types.end(),
+                             S->ScalarParameters->begin());
+        });
+        if (Uniform(Viable))
+          return Viable.front()->Result;
       }
-      if (Uniform)
-        return *Uniform;
     }
     return {};
   }
@@ -1915,7 +1959,7 @@ class Parser {
         publishCallResult(
             Key,
             Index.ReceiverDeclarations.at({Member.At.Line, Member.At.Column}),
-            Member.Params);
+            Member, false);
       if (Member.K == Node::Field) {
         const auto &Type = Index.FieldReceivers.at(Key);
         FieldReceivers[Key] = Type;
@@ -2284,10 +2328,10 @@ class Parser {
     llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
     F.Params = params(true);
     if (Member)
-      publishCallResult(CurrentReceiver.Owner + "::" + Id.Text, Receiver,
-                        F.Params);
+      publishCallResult(CurrentReceiver.Owner + "::" + Id.Text, Receiver, F,
+                        false);
     else if (Q.empty())
-      publishCallResult(Namespace + Id.Text, Receiver, F.Params);
+      publishCallResult(Namespace + Id.Text, Receiver, F, true);
     if ((Member && !Static) || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))
