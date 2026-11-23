@@ -125,6 +125,11 @@ class Parser {
   std::map<std::pair<unsigned, unsigned>, ReceiverType> ReceiverDeclarations;
   ReceiverType CurrentReceiver;
   std::set<std::string> OwnMembers;
+  static ReceiverType recordReceiver(const Node &R) {
+    return {"$record." + std::to_string(R.At.Line) + "." +
+                std::to_string(R.At.Column),
+            {}};
+  }
   std::map<std::string, std::string> AliasSchemas;
   void publishReceiver(const Node &Decl, const std::string &Name) {
     auto I = ReceiverDeclarations.find({Decl.At.Line, Decl.At.Column});
@@ -255,6 +260,7 @@ class Parser {
     }
     return std::nullopt;
   }
+  bool IndexingMembers = false;
   unsigned Depth = 0;
   struct Nest {
     unsigned &D;
@@ -398,11 +404,12 @@ class Parser {
       const bool Shadowed = Unqualified && (HiddenTypes.count(Schema) ||
                                             ValueReceivers.count(Schema));
       auto MemberSchema = CurrentReceiver.Owner + "::" + Schema;
-      const auto &ArgumentSchema =
-          Unqualified && !Shadowed && !Types.count(Schema) &&
-                  ConflictingMemberSchemas.count(MemberSchema)
-              ? MemberSchema
-              : Schema;
+      const bool MemberBinding =
+          Unqualified && OwnMembers.count(MemberSchema) && !Types.count(Schema);
+      const auto &ArgumentSchema = MemberBinding ? MemberSchema : Schema;
+      const bool HasFamilySchema = !Shadowed && Families.count(ArgumentSchema);
+      const bool UnresolvedIndexType =
+          IndexingMembers && AllowBuiltin && !Application && !HasFamilySchema;
       std::optional<bool> BitArgumentsAreTypes;
       if (Application && is("<") && (Root || !HiddenTypes.count(T.Text)) &&
           bitExtractionName(T.Text))
@@ -418,8 +425,7 @@ class Parser {
              (known(peek(1).Text) || peek(1).Text == "::" ||
               peek(2).Text == "::"))));
       if (is("<") &&
-          ((!Shadowed && Families.count(ArgumentSchema)) ||
-           NumericApplication ||
+          (HasFamilySchema || UnresolvedIndexType || NumericApplication ||
            (Application &&
             (builtinPredicate(T.Text) || T.Text == "construct_at" ||
              T.Text == "destroy_base" || T.Text == "abandon_base" ||
@@ -431,8 +437,9 @@ class Parser {
           expect("<");
           Args.push_back(baseSelector());
           closeAngle();
-        } else if (Application &&
-                   ConflictingMemberSchemas.count(ArgumentSchema))
+        } else if (UnresolvedIndexType ||
+                   (Application &&
+                    ConflictingMemberSchemas.count(ArgumentSchema)))
           Args = deferredTemplateArgs();
         else
           Args = templateArgs(ArgumentSchema, &Canonical, BitArgumentsAreTypes);
@@ -720,8 +727,9 @@ class Parser {
       if (!is("::") && !identifier(peek().Text))
         fail(T, "unsupported or unknown type '" + T.Text + "'");
       S = qualified(true, nullptr, NominalSchema, Receiver).Text;
-      if (!known(S) && !(StringRef(S).contains("::") &&
-                         known(StringRef(S).split("::").first)))
+      if (!IndexingMembers && !known(S) &&
+          !(StringRef(S).contains("::") &&
+            known(StringRef(S).split("::").first)))
         fail(T, "unsupported or unknown type '" + S + "'");
     }
     for (;;) {
@@ -959,6 +967,21 @@ class Parser {
     expect(File ? "}" : ")");
     return M;
   }
+  void skipBalanced(StringRef Open, StringRef Close) {
+    expect(Open);
+    unsigned Groups = 1;
+    do {
+      const auto Word = take().Text;
+      Groups += (Word == Open) - (Word == Close);
+    } while (Groups);
+  }
+  Node declarationBody(bool Construction = false) {
+    if (!IndexingMembers)
+      return block(Construction);
+    Node Body(Node::Block, peek());
+    skipBalanced("{", "}");
+    return Body;
+  }
   Node block(bool Construction = false) {
     Nest Guard(Depth, peek());
     auto OuterTypes = Types;
@@ -990,15 +1013,19 @@ class Parser {
     O.Const = RO || CX;
     O.Required = CX;
     O.HasInitializer = is("(");
-    if (O.HasInitializer)
-      O.Children = args();
-    if (O.Type == "auto" && O.Children.size() != 1)
+    if (O.HasInitializer) {
+      if (IndexingMembers)
+        skipBalanced("(", ")");
+      else
+        O.Children = args();
+    }
+    if (!IndexingMembers && O.Type == "auto" && O.Children.size() != 1)
       fail(T, "auto requires a single initializer");
     if (eat("->")) {
       O.HasInitializer = true;
       if (O.Type == "auto")
         fail(T, "a construction tail requires a typed declaration");
-      auto B = block(true);
+      auto B = declarationBody(true);
       B.K = Node::Tail;
       O.Children.push_back(std::move(B));
     }
@@ -1256,8 +1283,12 @@ class Parser {
         P.At = name();
         P.Text = P.At.Text;
       }
-      if (is("("))
-        P.Children = args();
+      if (is("(")) {
+        if (IndexingMembers)
+          skipBalanced("(", ")");
+        else
+          P.Children = args();
+      }
       if (BindReceivers && !P.Text.empty())
         ValueReceivers[P.Text] = std::move(Receiver);
       V.push_back(std::move(P));
@@ -1408,9 +1439,9 @@ class Parser {
     } else if (eat("="))
       D.Settings["control"] = definitionControl();
     else {
-      D.Children.push_back(block(!Drop));
+      D.Children.push_back(declarationBody(!Drop));
       if (Drop && eat("cleanup"))
-        D.Children.push_back(block());
+        D.Children.push_back(declarationBody());
     }
   }
   struct Attributes : std::map<std::string, std::string> {
@@ -1526,7 +1557,7 @@ class Parser {
     return Result;
   }
   void applyAttributes(Node &D, const Attributes &Attrs) {
-    if (!Attrs.Contracts.empty()) {
+    if (!IndexingMembers && !Attrs.Contracts.empty()) {
       // Leading attributes precede generic and parameter declarations.
       // Parse their expressions with the type names of the owning declaration.
       llvm::SaveAndRestore Cursor(Pos);
@@ -1603,6 +1634,168 @@ class Parser {
         fail(D.At, "duplicate attribute");
     }
   }
+  void recordMembers(Node &R, const ReceiverType &Receiver, bool Class,
+                     bool Union) {
+    std::string Access = Class ? "private" : "public";
+    while (!eat("}")) {
+      if (is("public") || is("private") || is("protected")) {
+        Access = take().Text;
+        expect(":");
+        continue;
+      }
+      if (Union && (is("default") || is("case"))) {
+        bool Default = eat("default");
+        expect("case");
+        Node C(Node::Variant, name());
+        C.Definition = Default;
+        if (eat("(")) {
+          std::set<std::string> Fields;
+          do {
+            bool RO = is("const") && peek(1).Text != "<";
+            if (RO)
+              take();
+            auto Ty = type();
+            Node Field(Node::Parameter, name());
+            Field.Type = Ty;
+            Field.Const = RO;
+            if (!Fields.insert(Field.Text).second)
+              fail(Field.At, "duplicate union payload field");
+            C.Params.push_back(std::move(Field));
+          } while (eat(","));
+          expect(")");
+        }
+        expect(";");
+        R.Children.push_back(std::move(C));
+        continue;
+      }
+      if (!Union && eat("destruction_owner")) {
+        Node D(Node::DestructionOwner, peek());
+        expect("<");
+        D.Type = type();
+        closeAngle();
+        expect("=");
+        D.TemplateArgs.push_back(baseSelector());
+        expect(";");
+        R.Children.push_back(std::move(D));
+        continue;
+      }
+      // Leading attributes belong to special members as well as ordinary
+      // member declarations. The latter keep the same decoration order.
+      auto Leading = attributes();
+      const bool HasLeading = !Leading.empty() || !Leading.Contracts.empty();
+      if (HasLeading && is("configured"))
+        fail(peek(), "configuration wrappers must precede attributes");
+      bool SpecialProto =
+          is("declare") && ((peek(1).Text == R.Text && peek(2).Text == "(") ||
+                            peek(1).Text == "~" ||
+                            (peek(1).Text == "virtual" && peek(2).Text == "~"));
+      if (SpecialProto)
+        take();
+      bool Virt = is("virtual") && peek(1).Text == "~" && eat("virtual");
+      Node D;
+      if (is("Complete")) {
+        if (HasLeading)
+          fail(peek(), "attributes are unavailable on destruction markers");
+        take();
+        Node I(Node::Init, peek());
+        I.Type = "Complete";
+        if (!is(";")) {
+          I.Text = name().Text;
+          if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
+            I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type();
+            closeAngle();
+          }
+        } else
+          I.Text = "*";
+        expect(";");
+        R.Children.push_back(I);
+        continue;
+      }
+      if ((is(R.Text) && peek(1).Text == "(") || is("~")) {
+        bool Drop = eat("~");
+        D = Node(Drop ? Node::Destructor : Node::Constructor, expect(R.Text));
+        if (!Drop && Virt)
+          fail(D.At, "a constructor cannot be virtual");
+        specialBody(D, SpecialProto);
+      } else {
+        D = declaration(false, true);
+      }
+      applyAttributes(D, Leading);
+      if (D.K == Node::Object && !D.Settings.count("storage") &&
+          (D.Settings.count("static_id") || D.Settings.count("init_after") ||
+           D.Settings.count("init_cancel") || D.Settings.count("init_effect")))
+        fail(D.At, "static initialization metadata requires static storage");
+      if (D.K == Node::Object)
+        D.K = Node::Field;
+      if (Virt)
+        D.Settings["virtual"] = "1";
+      D.Settings["access"] = Access;
+      auto Key = Receiver.Owner + "::" + D.Text;
+      OwnMembers.insert(Key);
+      if (!D.Generics.empty() && D.K == Node::Function)
+        publishMemberFamily(Key, D.Generics);
+      if (D.K == Node::Field)
+        FieldReceivers[Key] = ValueReceivers.at(D.Text);
+      R.Children.push_back(std::move(D));
+    }
+  }
+
+  void importRecordMembers(const Parser &Index, const Node &R,
+                           const ReceiverType &Receiver, bool Current) {
+    for (const auto &Member : R.Children) {
+      if (Member.K == Node::Variant || Member.K == Node::DestructionOwner ||
+          Member.K == Node::Init)
+        continue;
+      auto Key = Receiver.Owner + "::" + Member.Text;
+      OwnMembers.insert(Key);
+      if (Member.K == Node::Function && !Member.Generics.empty())
+        publishMemberFamily(Key, Member.Generics);
+      if (Member.K == Node::Field) {
+        const auto &Type = Index.FieldReceivers.at(Key);
+        FieldReceivers[Key] = Type;
+        if (Current)
+          ValueReceivers[Member.Text] = Type;
+      }
+      if (Current &&
+          (Member.K == Node::Record || Member.K == Node::Union ||
+           Member.K == Node::Enumeration || Member.K == Node::Alias)) {
+        Types.insert(Member.Text);
+        if (!Member.Generics.empty() && !Member.Settings.count("specialize"))
+          Families[Member.Text] = Member.Generics;
+        const auto Site = std::pair(Member.At.Line, Member.At.Column);
+        if (auto I = Index.ReceiverDeclarations.find(Site);
+            I != Index.ReceiverDeclarations.end())
+          NominalReceivers[Member.Text] = I->second;
+        if (auto I = Index.AliasDeclarations.find(Site);
+            I != Index.AliasDeclarations.end())
+          AliasSchemas[Member.Text] = I->second;
+        else
+          AliasSchemas.erase(Member.Text);
+      }
+      if ((Member.K == Node::Record || Member.K == Node::Union) &&
+          !Member.Prototype)
+        importRecordMembers(Index, Member, recordReceiver(Member), false);
+    }
+  }
+
+  void indexRecordMembers(const Node &R, const ReceiverType &Receiver,
+                          bool Class, bool Union) {
+    if (IndexingMembers)
+      return;
+    // Collect the owning record's member names before parsing any of its
+    // executable bodies. The indexing parser has its own lexical state.
+    Parser Index(*this);
+    Index.IndexingMembers = true;
+    Node Header = R;
+    try {
+      Index.recordMembers(Header, Receiver, Class, Union);
+    } catch (const Diagnostic &) {
+      // The normal parse owns diagnostics for headers.
+      return;
+    }
+    importRecordMembers(Index, Header, Receiver, true);
+  }
+
   Node declaration(bool Foreign = false, bool Member = false) {
     llvm::SaveAndRestore Binders(TypeParameters);
     Nest Guard(Depth, peek());
@@ -1757,9 +1950,7 @@ class Parser {
       bool Union = Kind == "union", Class = Kind == "class";
       bool Manual = Class && eat("Manual");
       Node R(Union ? Node::Union : Node::Record, name());
-      ReceiverType Receiver{"$record." + std::to_string(R.At.Line) + "." +
-                                std::to_string(R.At.Column),
-                            {}};
+      auto Receiver = recordReceiver(R);
       if (!Specialize) {
         auto Bound = G.empty() ? Receiver : ReceiverType{};
         NominalReceivers[R.Text] = Bound;
@@ -1799,110 +1990,8 @@ class Parser {
         } while (eat(","));
       }
       expect("{");
-      std::string Access = Class ? "private" : "public";
-      while (!eat("}")) {
-        if (is("public") || is("private") || is("protected")) {
-          Access = take().Text;
-          expect(":");
-          continue;
-        }
-        if (Union && (is("default") || is("case"))) {
-          bool Default = eat("default");
-          expect("case");
-          Node C(Node::Variant, name());
-          C.Definition = Default;
-          if (eat("(")) {
-            std::set<std::string> Fields;
-            do {
-              bool RO = is("const") && peek(1).Text != "<";
-              if (RO)
-                take();
-              auto Ty = type();
-              Node Field(Node::Parameter, name());
-              Field.Type = Ty;
-              Field.Const = RO;
-              if (!Fields.insert(Field.Text).second)
-                fail(Field.At, "duplicate union payload field");
-              C.Params.push_back(std::move(Field));
-            } while (eat(","));
-            expect(")");
-          }
-          expect(";");
-          R.Children.push_back(std::move(C));
-          continue;
-        }
-        if (!Union && eat("destruction_owner")) {
-          Node D(Node::DestructionOwner, peek());
-          expect("<");
-          D.Type = type();
-          closeAngle();
-          expect("=");
-          D.TemplateArgs.push_back(baseSelector());
-          expect(";");
-          R.Children.push_back(std::move(D));
-          continue;
-        }
-        // Leading attributes belong to special members as well as ordinary
-        // member declarations. The latter keep the same decoration order.
-        auto Leading = attributes();
-        const bool HasLeading = !Leading.empty() || !Leading.Contracts.empty();
-        if (HasLeading && is("configured"))
-          fail(peek(), "configuration wrappers must precede attributes");
-        bool SpecialProto =
-            is("declare") &&
-            ((peek(1).Text == R.Text && peek(2).Text == "(") ||
-             peek(1).Text == "~" ||
-             (peek(1).Text == "virtual" && peek(2).Text == "~"));
-        if (SpecialProto)
-          take();
-        bool Virt = is("virtual") && peek(1).Text == "~" && eat("virtual");
-        Node D;
-        if (is("Complete")) {
-          if (HasLeading)
-            fail(peek(), "attributes are unavailable on destruction markers");
-          take();
-          Node I(Node::Init, peek());
-          I.Type = "Complete";
-          if (!is(";")) {
-            I.Text = name().Text;
-            if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
-              I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type();
-              closeAngle();
-            }
-          } else
-            I.Text = "*";
-          expect(";");
-          R.Children.push_back(I);
-          continue;
-        }
-        if ((is(R.Text) && peek(1).Text == "(") || is("~")) {
-          bool Drop = eat("~");
-          D = Node(Drop ? Node::Destructor : Node::Constructor, expect(R.Text));
-          if (!Drop && Virt)
-            fail(D.At, "a constructor cannot be virtual");
-          specialBody(D, SpecialProto);
-        } else {
-          D = declaration(false, true);
-        }
-        applyAttributes(D, Leading);
-        if (D.K == Node::Object && !D.Settings.count("storage") &&
-            (D.Settings.count("static_id") || D.Settings.count("init_after") ||
-             D.Settings.count("init_cancel") ||
-             D.Settings.count("init_effect")))
-          fail(D.At, "static initialization metadata requires static storage");
-        if (D.K == Node::Object)
-          D.K = Node::Field;
-        if (Virt)
-          D.Settings["virtual"] = "1";
-        D.Settings["access"] = Access;
-        auto Key = Receiver.Owner + "::" + D.Text;
-        OwnMembers.insert(Key);
-        if (!D.Generics.empty() && D.K == Node::Function)
-          publishMemberFamily(Key, D.Generics);
-        if (D.K == Node::Field)
-          FieldReceivers[Key] = ValueReceivers.at(D.Text);
-        R.Children.push_back(std::move(D));
-      }
+      indexRecordMembers(R, Receiver, Class, Union);
+      recordMembers(R, Receiver, Class, Union);
       expect(";");
       Types = std::move(Saved);
       Types.insert(R.Text);
@@ -2037,7 +2126,7 @@ class Parser {
       for (const auto &P : F.Params)
         if (Types.count(P.Text) || integerLibraryName(P.Text, true))
           HiddenTypes.insert(P.Text);
-      F.Children.push_back(block());
+      F.Children.push_back(declarationBody());
       HiddenTypes = std::move(OuterHidden);
     }
     Types = std::move(Saved);

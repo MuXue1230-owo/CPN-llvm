@@ -761,6 +761,41 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(pending_base.returncode, 1)
         self.assertIn("LIFE002", pending_base.stderr)
 
+    def test_construction_checks_exact_returned_pointer_aliases(self):
+        source = """
+            declare struct Box;
+            [[effects(read(view))]] declare i32 read_box(const<Box>* view);
+            [[effects(none),returns_borrowed_from(ptr)]]
+            Box* identity(Box* ptr){return ptr;}
+            struct Box {
+                i32 field;
+                i32 result;
+                Box(){ CTOR }
+            };
+            [[effects(read(view))]] i32 read_box(const<Box>* view){return view->field;}
+            i32 main(){Box box;return box.result;}
+        """
+        pending = self.compile(
+            source.replace("CTOR", "init field(read_box(identity(this)));"),
+            "--check",
+        )
+        self.assertEqual(pending.returncode, 1)
+        self.assertIn("LIFE002", pending.stderr)
+        for mode in ("local", "interprocedural"):
+            with self.subTest(mode=mode):
+                self.assertEqual(
+                    self.program(
+                        "configuration {construction.analysis="
+                        + mode
+                        + ";};"
+                        + source.replace(
+                            "CTOR",
+                            "init field(42);init result(0);result=read_box(identity(this));",
+                        )
+                    ),
+                    42,
+                )
+
     def test_construction_state_respects_closed_nonaccessing_call_contracts(self):
         source = """
             struct PureMethod {
@@ -1581,6 +1616,136 @@ class CompilerTests(unittest.TestCase):
             """),
             42,
         )
+
+    def test_complete_record_index_binds_forward_member_applications(self):
+        self.assertEqual(
+            self.program("""
+                generic<type T> i32 needle(){return -1;}
+                struct Range {bool operator>(i32 x) const {return x==0;}};
+                struct Needle {Range operator<(i32 x) const {return Range();}};
+                struct Both {
+                    generic<type T> i32 get() const {return i32(sizeof(T));}
+                    i32 use() const {
+                        if (!(needle < 1 > (0))) {return 1;}
+                        {Needle get;if (!(get < 1 > (0))) {return 2;}}
+                        return get<i32>() + this->get<38>();
+                    }
+                    generic<const i32 N> i32 get() const {return N;}
+                    Needle needle;
+                };
+                i32 main(){Both both;return both.use();}
+            """),
+            42,
+        )
+
+    def test_forward_field_receiver_selects_its_nested_record_schema(self):
+        self.assertEqual(
+            self.program("""
+                struct Both {
+                    i32 use() const {
+                        Local local;
+                        return child.get<i32>() + this->child.get<34>() + local.get<i32>();
+                    }
+                    struct Node {
+                        generic<type T> i32 get() const {return i32(sizeof(T));}
+                        generic<const i32 N> i32 get() const {return N;}
+                    };
+                    alias Local=Node;
+                    Node child;
+                };
+                i32 main(){Both both;return both.use();}
+            """),
+            42,
+        )
+
+    def test_nested_type_family_binds_before_its_definition(self):
+        self.assertEqual(
+            self.program("""
+                struct Owner {
+                    Item<type_of> item(type_of n) const {return Item<type_of>(n);}
+                    alias type_of=i32;
+                    generic<type T> struct Item { T value; };
+                };
+                i32 main(){Owner owner;return owner.item(42).value;}
+            """),
+            42,
+        )
+
+    def test_nested_type_binds_in_earlier_field_and_payload_layout(self):
+        self.assertEqual(
+            self.program("""
+                struct Outer {
+                    Node stored;
+                    struct Node { i32 n; };
+                };
+                union Response {
+                    case Good(Payload value);
+                    struct Payload { i32 n; };
+                };
+                i32 main(){
+                    Outer outer(Outer::Node(12));
+                    Response value(Response::Good(Response::Payload(30)));
+                    match(value){
+                        case Response::Good(ref found) {return outer.stored.n + found.n;}
+                    }
+                }
+            """),
+            42,
+        )
+
+    def test_record_aliases_bind_forward_dependencies_and_reject_cycles(self):
+        self.assertEqual(
+            self.program("""
+                struct Box {
+                    alias Payload=Box::Stored;
+                    Payload field;
+                    struct Stored { Number n; };
+                    alias Number=Word;
+                    alias Word=i32;
+                };
+                i32 main(){Box box(Box::Payload(42));return box.field.n;}
+            """),
+            42,
+        )
+        cycle = self.compile(
+            "struct Box { alias First=Second; alias Second=Box::First; };",
+            "--check",
+        )
+        self.assertEqual(cycle.returncode, 1)
+        self.assertIn("cyclic nested type alias", cycle.stderr)
+        chain = "".join(f"alias T{i}=T{i + 1};" for i in range(1024))
+        self.assertEqual(
+            self.program(
+                "struct Box {"
+                + chain
+                + "alias T1024=i32; T0 field; };"
+                + "i32 main(){Box box(42);return box.field;}"
+            ),
+            42,
+        )
+
+    def test_chained_relational_comparison_warns_unless_grouped(self):
+        source = """
+            struct Bound {i32 mark;};
+            bool operator<(bool lower,const<Bound>& bound){
+                return lower && bound.mark==42;
+            }
+            bool inside(const<Bound>& bound){return EXPRESSION;}
+            i32 main(){Bound bound(42);return inside(bound) ? 42 : 1;}
+        """
+        for expression, warning in (
+            ("1 < 2 < bound", True),
+            ("(1 < 2) < bound", False),
+        ):
+            with self.subTest(expression=expression):
+                program = source.replace("EXPRESSION", expression)
+                result = self.compile(program, "--check")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    "WARNING: chained relational comparison" in result.stderr,
+                    warning,
+                )
+                self.assertEqual(self.program(program), 42)
 
     def test_never_paths_and_nullptr_object_representation(self):
         program = """

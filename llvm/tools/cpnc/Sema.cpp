@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -447,7 +448,7 @@ std::optional<std::string> Frame::memberQualifier(const std::string &S,
                      }) ||
         !scopeKey(Prefix, Head, [&](const std::string &K) {
            return U.Records.count(K) || U.Aliases.count(K) ||
-                  U.Families.count(K);
+                  U.Families.count(K) || U.MemberAliasSites.count(K);
          }).empty()) {
       Tail = S.substr(Member + 2);
       return resolve(Qualifier, At);
@@ -541,8 +542,8 @@ std::string Frame::resolve(std::string S, const Token &At) {
     if (It == U.MemberTypes.end())
       fail(At, "unknown nested type '" + Tail + "'");
     checkAccess(It->second.second, *Owner, At);
-    if (U.Aliases.count(Key))
-      return U.Aliases.at(Key);
+    if (It->second.second.K == Node::Alias)
+      return U.bindMemberAlias(Key);
     if (U.Records.count(Key) || U.Enums.count(Key))
       return Key;
     // Instantiate a nested family using the fully resolved owning scope.
@@ -552,11 +553,14 @@ std::string Frame::resolve(std::string S, const Token &At) {
   auto Base = S.substr(0, S.find('<'));
   auto Key = scopeKey(Prefix, Base, [&](const std::string &K) {
     return U.Aliases.count(K) || U.Records.count(K) || U.Enums.count(K) ||
-           U.Families.count(K);
+           U.Families.count(K) || U.MemberAliasSites.count(K);
   });
   if (!Key.empty()) {
-    if (auto It = U.MemberTypes.find(Key); It != U.MemberTypes.end())
+    if (auto It = U.MemberTypes.find(Key); It != U.MemberTypes.end()) {
       checkAccess(It->second.second, It->second.first, At);
+      if (It->second.second.K == Node::Alias)
+        return U.bindMemberAlias(Key);
+    }
     if (U.Families.count(Key) && S.find('<') != std::string::npos) {
       auto Fam = U.Families.at(Key);
       std::vector<Node> Explicit;
@@ -1067,10 +1071,69 @@ void Context::enumeration(Frame &F, const Node &D, const std::string &Name) {
   }
 }
 
+void Context::indexMemberAliases(llvm::ArrayRef<Node> Members,
+                                 const std::string &Owner) {
+  for (const auto &D : Members) {
+    if (D.K != Node::Alias)
+      continue;
+    auto Key = Owner + "::" + D.Text;
+    if (!MemberTypes.try_emplace(Key, Owner, D).second)
+      fail(D.At, "duplicate nested type alias");
+    MemberAliasSites.emplace(Key, site());
+  }
+}
+
+std::string Context::bindMemberAlias(const std::string &Key) {
+  if (auto Bound = Aliases.find(Key); Bound != Aliases.end())
+    return Bound->second;
+  llvm::SaveAndRestore Depth(MemberAliasDepth, MemberAliasDepth + 1);
+  if (MemberAliasDepth > 128)
+    throw ResourceExhausted{{MemberTypes.at(Key).second.At,
+                             "nested type alias dependency depth exhausted"}};
+
+  llvm::SmallVector<std::string> Pending;
+  auto Done = llvm::scope_exit([&] {
+    for (const auto &Name : Pending)
+      BindingMemberAliases.erase(Name);
+  });
+  // Follow plain sibling names without recursing through type resolution.
+  const auto *Next = &Key;
+  while (true) {
+    const auto &[Owner, D] = MemberTypes.at(*Next);
+    if (!BindingMemberAliases.insert(*Next).second)
+      fail(D.At, "cyclic nested type alias");
+    Pending.push_back(*Next);
+    if (!identifier(D.Type) || Records.at(Owner).Env.Types.count(D.Type))
+      break;
+    auto Target = MemberAliasSites.find(Owner + "::" + D.Type);
+    if (Target == MemberAliasSites.end() || Aliases.count(Target->first))
+      break;
+    Next = &Target->first;
+  }
+  for (const auto &Name : llvm::reverse(Pending)) {
+    const auto &[Owner, D] = MemberTypes.at(Name);
+    EnterDefinition Definition(*this, MemberAliasSites.at(Name));
+    for (const auto &Config : D.Policies)
+      configure(Opt, Config, ConfigScope::Declaration);
+    Frame Check(*this, nullptr, nullptr, Owner + "::");
+    Check.Env = Records.at(Owner).Env;
+    Aliases.emplace(Name, Check.resolve(D.Type, D.At));
+  }
+  return Aliases.at(Key);
+}
+
+void Context::bindMemberAliases(llvm::ArrayRef<Node> Members,
+                                const std::string &Owner) {
+  for (const auto &D : Members)
+    if (D.K == Node::Alias)
+      bindMemberAlias(Owner + "::" + D.Text);
+}
+
 bool Context::nestedType(const Node &D, const std::string &Owner,
                          Frame &Check) {
-  if (D.K != Node::Alias && D.K != Node::Enumeration && D.K != Node::Record &&
-      D.K != Node::Union)
+  if (D.K == Node::Alias)
+    return true;
+  if (D.K != Node::Enumeration && D.K != Node::Record && D.K != Node::Union)
     return false;
   std::string Prefix = Owner + "::", Key = Prefix + D.Text;
   auto [It, New] = MemberTypes.try_emplace(Key, Owner, D);
@@ -1088,9 +1151,6 @@ bool Context::nestedType(const Node &D, const std::string &Owner,
     checkDomain(D, Prefix);
     if (!Families.emplace(Key, Family{D, Prefix, site(), Parent.Env}).second)
       fail(D.At, "duplicate nested generic declaration");
-  } else if (D.K == Node::Alias) {
-    if (!Aliases.emplace(Key, Check.resolve(D.Type, D.At)).second)
-      fail(D.At, "duplicate nested type alias");
   } else if (D.K == Node::Enumeration)
     enumeration(Check, D, Key);
   else if (D.K == Node::Record)
@@ -1119,6 +1179,7 @@ void Context::record(const Node &N, const std::string &Name,
   R.Env.Types[N.Text] = Name;
   Frame Check(*this, nullptr, nullptr, Name + "::");
   Check.Env = R.Env;
+  indexMemberAliases(N.Children, Name);
   std::vector<llvm::Type *> Layout;
   std::vector<std::pair<std::string, bool>> Direct;
   std::set<std::string> Seen;
@@ -1162,14 +1223,16 @@ void Context::record(const Node &N, const std::string &Name,
   for (auto &D : N.Children) {
     if (nestedType(D, Name, Check))
       continue;
-    if (D.K == Node::Field) {
-      if (D.Settings.count("storage")) {
-        if (!StaticMembers
-                 .emplace(Name + "::" + D.Text, std::make_pair(Name, D))
-                 .second)
-          fail(D.At, "duplicate static member");
-        continue;
-      }
+    if (D.K == Node::Field && D.Settings.count("storage") &&
+        !StaticMembers.emplace(Name + "::" + D.Text, std::make_pair(Name, D))
+             .second)
+      fail(D.At, "duplicate static member");
+  }
+  // Field layout uses the member type index even when a type's definition
+  // follows the field that uses it. The layout still follows field order.
+  bindMemberAliases(N.Children, Name);
+  for (auto &D : N.Children) {
+    if (D.K == Node::Field && !D.Settings.count("storage")) {
       llvm::SaveAndRestore Policy(Check.Opt);
       for (const auto &Config : D.Policies)
         configure(Check.Opt, Config, ConfigScope::Declaration);

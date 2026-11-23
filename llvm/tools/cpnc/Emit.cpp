@@ -20,6 +20,22 @@ bool assignment(StringRef Op) {
          Op == "%=" || Op == "&=" || Op == "|=" || Op == "^=" || Op == "<<=" ||
          Op == ">>=";
 }
+bool relational(StringRef Op) {
+  return Op == "<" || Op == "<=" || Op == ">" || Op == ">=";
+}
+bool returnsPointerParameter(const Function &D, unsigned Index) {
+  if (D.Decl.Foreign || D.Slot >= 0 || !ends(D.Result, "*") ||
+      D.Params[Index] != D.Result || D.Decl.Children.size() != 1)
+    return false;
+  const auto &Body = D.Decl.Children.front();
+  if (Body.K != Node::Block || Body.Children.size() != 1)
+    return false;
+  const auto &Return = Body.Children.front();
+  if (Return.K != Node::Return || Return.Children.size() != 1)
+    return false;
+  const auto &Returned = Return.Children.front();
+  return Returned.K == Node::Name && Returned.Text == D.Decl.Params[Index].Text;
+}
 } // namespace
 Value Frame::lookup(const Token &T, bool NeedLive) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
@@ -718,6 +734,9 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
   }
   case Node::Conditional:
   case Node::Binary: {
+    if (relational(Op) && A[0].K == Node::Binary && relational(A[0].Text) &&
+        !A[0].Grouped)
+      Opt.warn(N.At, "chained relational comparison without explicit grouping");
     if (N.K == Node::Conditional || Op == "&&" || Op == "||") {
       auto C = boolean(A[0]);
       if (!IR) {
@@ -1495,6 +1514,13 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     if (Index < Actual.size()) {
       Returned.Origins = Actual[Index].Origins;
       Returned.Storage = Actual[Index].Storage;
+    }
+    if (Transaction && !TypeQuery && Opt.InterproceduralConstruction &&
+        returnsPointerParameter(D, Index)) {
+      // The definition proves designation identity. Retain it so accesses
+      // through the returned pointer still use the caller's live frontier.
+      Returned.IR = Cells[Index].IR;
+      Returned.ConstructionBase = Cells[Index].ConstructionBase;
     }
   } else
     for (auto I : D.BorrowedResult)

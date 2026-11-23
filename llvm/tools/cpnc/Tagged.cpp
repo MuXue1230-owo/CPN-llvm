@@ -64,6 +64,7 @@ void Context::tagged(const Node &D, const std::string &Name,
   R.Env.Types[D.Text] = Name;
   Frame F(*this, nullptr, nullptr, Name + "::");
   F.Env = R.Env;
+  indexMemberAliases(D.Children, Name);
   const auto &DL = M.getDataLayout();
   uint64_t Size = 0;
   llvm::Type *AlignType = llvm::Type::getInt8Ty(C);
@@ -88,8 +89,13 @@ void Context::tagged(const Node &D, const std::string &Name,
           Decl.Settings.at("control") == "default")
         fail(Decl.At,
              "union assignment requires an active-case replacement contract");
-      continue;
     }
+  }
+  // Payload types are resolved after all nested type declarations are bound.
+  bindMemberAliases(D.Children, Name);
+  for (const auto &Decl : D.Children) {
+    if (Decl.K != Node::Variant)
+      continue;
     auto Key = Name + "::" + Decl.Text;
     if (Cases.count(Key))
       fail(Decl.At, "duplicate union case");

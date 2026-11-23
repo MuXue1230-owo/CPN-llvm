@@ -265,6 +265,9 @@ struct Context {
       DispatchTables;
   std::map<std::string, std::pair<std::string, Node>> StaticMembers,
       MemberTypes;
+  std::map<std::string, DefinitionSite> MemberAliasSites;
+  std::set<std::string> BindingMemberAliases;
+  unsigned MemberAliasDepth = 0;
   std::map<std::string, Value> Globals, ExternalObjects;
   std::map<std::string, Function *> ExternalFunctions;
   std::map<std::string, llvm::Function *> CleanupEntries;
@@ -381,6 +384,9 @@ struct Context {
   void attachGenericBody(Function &, const Family &);
   void setGenericBody(Family &, Node, DefinitionSite, Substitution = {});
   void enumeration(Frame &, const Node &, const std::string &);
+  void indexMemberAliases(llvm::ArrayRef<Node>, const std::string &);
+  void bindMemberAliases(llvm::ArrayRef<Node>, const std::string &);
+  std::string bindMemberAlias(const std::string &);
   bool nestedType(const Node &, const std::string &, Frame &);
   void tagged(const Node &, const std::string &, const std::string &,
               const Substitution & = {});
