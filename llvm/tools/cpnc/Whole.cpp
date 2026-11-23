@@ -214,6 +214,10 @@ llvm::Value *Frame::wholeEpoch() {
 void Frame::exitWhole() {
   endExpression();
   cleanup(0);
+  if (Transaction)
+    Transaction->rollback(*this);
+  if (UnionPayloadConstructed)
+    dropPayload(Self);
   exitInvariantConstructionLifetimes();
   if (InlineReturn)
     branch(InlineReturn);

@@ -1264,6 +1264,8 @@ Value Frame::bindReference(Value V, const std::string &Ty, const Token &At) {
   if (!V.Address && IR) {
     V.Address = allocate(T, At);
     B.CreateStore(V.IR, V.Address);
+    if (!TypeQuery)
+      Temps.push_back(V);
   }
   V.Readonly |= T != baseRef(Ty);
   return V;
@@ -1839,6 +1841,55 @@ void Frame::runConstructionTail(Value Object, const Node *Tail,
   Scopes.pop_back();
 }
 
+llvm::Value *Frame::beginConstructionPrefix(Value Object,
+                                            const Case *Alternative) {
+  if (!IR || !U.Whole)
+    return nullptr;
+  unsigned First = Object.BaseView ? U.Records.at(Object.Type).VirtualCount : 0;
+  llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
+  auto *Progress =
+      Entry.CreateAlloca(B.getInt64Ty(), nullptr, "construction.progress");
+  B.CreateStore(B.getInt64(First), Progress);
+  Object.ConstructionProgress = Progress;
+  Object.ConstructionCase = Alternative;
+  Scopes.back().Drops.push_back(Object);
+  return Progress;
+}
+
+void Frame::endConstructionPrefix(llvm::Value *Progress) {
+  if (Progress) {
+    assert(Scopes.back().Drops.back().ConstructionProgress == Progress);
+    Scopes.back().Drops.pop_back();
+  }
+}
+
+void Frame::rollbackConstructionPrefix(Value Object, llvm::Value *Count) {
+  if (ends(Object.Type, "]")) {
+    dropArrayPrefix(Object, Count);
+    return;
+  }
+  const auto &R = U.Records.at(Object.Type);
+  unsigned First = Object.BaseView ? R.VirtualCount : 0;
+  const auto *Alternative = Object.ConstructionCase;
+  size_t Slots = Alternative ? Alternative->Types.size() : R.Fields.size();
+  for (size_t I = Slots; I > First; --I) {
+    auto *Retire = block("ctor.rollback.slot");
+    auto *Next = block("ctor.rollback.next");
+    B.CreateCondBr(B.CreateICmpUGE(Count, B.getInt64(I)), Retire, Next);
+    B.SetInsertPoint(Retire);
+    if (Alternative) {
+      Value Child{Alternative->Types[I - 1], nullptr,
+                  payloadAddress(*Alternative, Object.Address, I - 1)};
+      dropChild(Object, Child);
+    } else {
+      Value Child{R.Fields[I - 1].Type, nullptr, fieldAddress(Object, I - 1)};
+      dropChild(Object, Child, I <= R.Bases.size());
+    }
+    branch(Next);
+    B.SetInsertPoint(Next);
+  }
+}
+
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase) {
@@ -1876,6 +1927,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     auto *Array = llvm::cast<llvm::ArrayType>(Ty);
     auto Count = ends(T, "[0]") ? 0 : Array->getNumElements();
     auto E = element(T);
+    Value V{T, nullptr, Ptr};
+    auto *Progress = beginConstructionPrefix(V);
     std::optional<Initializer> First;
     if (Args.size() == 1) {
       First = deferInitializer(
@@ -1883,7 +1936,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Args.front().K == Node::Unary && Args.front().Text == "&" ? E : "");
       if (First->Result.Type == T) {
         materialize(runInitializer(*First, {T, nullptr, Ptr}, At), At, Ptr);
-        Value V{T, nullptr, Ptr};
+        endConstructionPrefix(Progress);
         V.Prvalue = V.Expiring = !Dest;
         if (!Dest)
           Temps.push_back(V);
@@ -1896,6 +1949,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), B.getInt64(I)});
       if (!First) {
         construct(E, {Args[I]}, At, P);
+        if (Progress)
+          B.CreateStore(B.getInt64(I + 1), Progress);
         continue;
       }
       auto V = runInitializer(*First, {E, nullptr, P}, At);
@@ -1909,6 +1964,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         construct(E, {Ref}, At, P);
         Scopes.pop_back();
       }
+      if (Progress)
+        B.CreateStore(B.getInt64(I + 1), Progress);
     }
     if (Args.size() < Count) {
       // Generate the recursive default producer once, even for large extents.
@@ -1921,13 +1978,15 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), Index});
       size_t Mark = Temps.size();
       construct(E, {}, At, P);
-      endExpression(Mark);
       auto *Next = B.CreateAdd(Index, B.getInt64(1));
+      if (Progress)
+        B.CreateStore(Next, Progress);
+      endExpression(Mark);
       Index->addIncoming(Next, B.GetInsertBlock());
       B.CreateCondBr(B.CreateICmpULT(Next, B.getInt64(Count)), Loop, End);
       B.SetInsertPoint(End);
     }
-    Value V{T, nullptr, Ptr};
+    endConstructionPrefix(Progress);
     runConstructionTail(V, Tail);
     V.Prvalue = V.Expiring = !Dest;
     if (!Dest)
@@ -1979,6 +2038,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     Value Obj{T, nullptr, Ptr};
     auto &R = U.Records.at(T);
     Obj.BaseView = AsBase;
+    auto *Progress = beginConstructionPrefix(Obj);
     auto *Previous = pushInvariantLifetime(Obj, Tail);
     if (!AsBase)
       bindVirtualLayout(Obj);
@@ -2038,6 +2098,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         if (Producers.empty())
           invoke(*D, Actual, At, Obj, true);
         else {
+          auto *Before = wholeEpoch();
           Frame Root(U, D, IR);
           Root.B.SetInsertPoint(B.GetInsertBlock());
           Root.BaseLayer = AsBase;
@@ -2054,6 +2115,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           }
           Root.branch(Root.InlineReturn);
           B.SetInsertPoint(Root.InlineReturn);
+          propagateWhole(Before);
           Producers.clear();
         }
       } else {
@@ -2096,6 +2158,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
               Producers.erase(Found);
           }
           finishVirtualBase(Obj, I);
+          if (Progress)
+            B.CreateStore(B.getInt64(I + 1), Progress);
           PendingSlots.erase(Field.Decl.Text);
           Scopes.back().Names[Field.Decl.Text] = {Field.Type, nullptr, P};
           if (I + 1 == R.Bases.size())
@@ -2108,6 +2172,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     }
     if (!Producers.empty())
       fail(At, "unknown initialization target");
+    endConstructionPrefix(Progress);
     runConstructionTail(Obj, Tail, true);
     popInvariantLifetime(Previous);
     checkInvariants(Obj);
@@ -2150,6 +2215,13 @@ void Frame::drop(Value V, bool AsBase) {
     return;
   V = V.objectDesignation();
   requirePredicateCleanup(V.Type, F ? F->Decl.At : Token{});
+  if (V.ConstructionProgress) {
+    auto *Count = B.CreateLoad(B.getInt64Ty(), V.ConstructionProgress);
+    const auto First = V.BaseView ? U.Records.at(V.Type).VirtualCount : 0;
+    B.CreateStore(B.getInt64(First), V.ConstructionProgress);
+    rollbackConstructionPrefix(V, Count);
+    return;
+  }
   if (V.Rollback) {
     dropLayer(V, V.BaseView, true);
     return;
@@ -2171,23 +2243,8 @@ void Frame::drop(Value V, bool AsBase) {
 }
 void Frame::dropLayer(Value V, bool AsBase, bool Rollback) {
   if (ends(V.Type, "]")) {
-    auto E = unconst(element(V.Type));
-    if (ends(V.Type, "[0]") ||
-        (!TracksStorage && !U.Records.count(E) && !ends(E, "]")))
-      return;
     auto *Ty = llvm::cast<llvm::ArrayType>(U.ir(V.Type));
-    auto *Entry = B.GetInsertBlock(), *Loop = block("array.drop"),
-         *Done = block("array.end");
-    branch(Loop);
-    B.SetInsertPoint(Loop);
-    auto *Count = B.CreatePHI(B.getInt64Ty(), 2);
-    Count->addIncoming(B.getInt64(Ty->getNumElements()), Entry);
-    auto *Index = B.CreateSub(Count, B.getInt64(1));
-    auto *Ptr = B.CreateInBoundsGEP(Ty, V.Address, {B.getInt32(0), Index});
-    dropChild(V, {E, nullptr, Ptr});
-    Count->addIncoming(Index, B.GetInsertBlock());
-    B.CreateCondBr(B.CreateIsNotNull(Index), Loop, Done);
-    B.SetInsertPoint(Done);
+    dropArrayPrefix(V, B.getInt64(Ty->getNumElements()));
     return;
   }
   if (!U.Records.count(V.Type))
@@ -2213,6 +2270,25 @@ void Frame::dropLayer(Value V, bool AsBase, bool Rollback) {
     else
       dropChild(V, Child, Base);
   }
+}
+void Frame::dropArrayPrefix(Value V, llvm::Value *PrefixSize) {
+  auto E = unconst(element(V.Type));
+  if (ends(V.Type, "[0]") ||
+      (!TracksStorage && !U.Records.count(E) && !ends(E, "]")))
+    return;
+  auto *Ty = llvm::cast<llvm::ArrayType>(U.ir(V.Type));
+  auto *Entry = B.GetInsertBlock(), *Loop = block("array.drop"),
+       *Done = block("array.end");
+  B.CreateCondBr(B.CreateIsNotNull(PrefixSize), Loop, Done);
+  B.SetInsertPoint(Loop);
+  auto *Count = B.CreatePHI(B.getInt64Ty(), 2);
+  Count->addIncoming(PrefixSize, Entry);
+  auto *Index = B.CreateSub(Count, B.getInt64(1));
+  auto *Ptr = B.CreateInBoundsGEP(Ty, V.Address, {B.getInt32(0), Index});
+  dropChild(V, {E, nullptr, Ptr});
+  Count->addIncoming(Index, B.GetInsertBlock());
+  B.CreateCondBr(B.CreateIsNotNull(Index), Loop, Done);
+  B.SetInsertPoint(Done);
 }
 void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
   for (size_t I = Scopes.size(); I > From; --I)
@@ -2251,15 +2327,21 @@ void Frame::endExpression(size_t From) {
       V.ConstantTemporary->ConstantIdentity.Storage.reset();
       continue;
     }
-    if (V.OptionalTemp) {
+    if (V.OptionalTemp && U.aggregate(V.Type)) {
       auto *Run = block("temporary.drop"), *Done = block("temporary.done");
       B.CreateCondBr(B.CreateIsNotNull(V.Address), Run, Done);
       B.SetInsertPoint(Run);
       drop(V);
       branch(Done);
       B.SetInsertPoint(Done);
-    } else
+    } else if (U.aggregate(V.Type))
       drop(V);
+    // Keep the lifetime boundary for local borrow checking, without adding
+    // instrumentation to the generated module.
+    if (IR && llvm::isa_and_nonnull<llvm::AllocaInst>(V.Address)) {
+      auto *End = B.CreateLifetimeEnd(V.Address);
+      End->setMetadata("cpn.borrow.temporary.end", llvm::MDNode::get(U.C, {}));
+    }
   }
 }
 void Frame::object(const Node &N, bool Global) {

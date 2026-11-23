@@ -50,10 +50,6 @@ llvm::Constant *Context::typeID(const std::string &T) {
   return ID;
 }
 bool Frame::usesStorage(const Node &N) {
-  if (llvm::StringRef(N.Type).contains("Ref<") ||
-      (N.K == Node::Name && llvm::StringRef(N.Text).contains("Ref<")) ||
-      (N.K == Node::Member && (N.Text == "try_value" || N.Text == "try_error")))
-    return true;
   if (N.K == Node::Lambda &&
       llvm::any_of(N.TemplateArgs, [](const Node &Capture) {
         return Capture.Type == "borrow" || Capture.Type == "this";

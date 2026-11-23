@@ -1242,6 +1242,63 @@ class CompilerTests(unittest.TestCase):
                 source = declarations + f"i32 main(){{return {expression};}}"
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
 
+    def test_instance_generic_arguments_follow_the_typed_receiver(self):
+        source = """
+            struct Counts {
+                generic<const i32 N> i32 take() const { return N; }
+            };
+            namespace lib {
+                enum Tag:i32 { case Answer(7) };
+                struct Arg { i32 n; };
+                struct Tags {
+                    generic<const Tag K> i32 take() const {
+                        return K==Tag::Answer ? 7 : 0;
+                    }
+                };
+                struct Types {
+                    generic<type T> i32 take(const<T>& item) const {
+                        return sizeof(T)==4 ? 3 : 0;
+                    }
+                };
+            }
+            struct Mixed { Counts count; lib::Types typed; };
+            struct Plain { i32 take; };
+            alias CountPtr=const<Counts>*;
+            i32 select(const<Counts>& source, CountPtr ptr, const<lib::Tags>& tags){
+                return source.take<9>() + ptr->take<10>() + tags.take<lib::Tag::Answer>();
+            }
+        """
+        self.assertEqual(
+            self.program(
+                source
+                + """
+                i32 main(){
+                    Mixed mixed;
+                    Counts[2] items;
+                    lib::Tags tags;
+                    lib::Arg argument;
+                    Plain plain(1);
+                    if(plain.take < 2){
+                        return select(mixed.count,&mixed.count,tags) +
+                               mixed.typed.take<lib::Arg>(argument) + items[0].take<13>();
+                    }
+                    return 0;
+                }
+                """
+            ),
+            42,
+        )
+        for expression in (
+            "mixed.count.take<lib::Arg>()",
+            "mixed.typed.take<13>(argument)",
+        ):
+            with self.subTest(expression=expression):
+                invalid = (
+                    source
+                    + f"i32 main(){{Mixed mixed;lib::Arg argument;return {expression};}}"
+                )
+                self.assertEqual(self.compile(invalid, "--check").returncode, 1)
+
     def test_never_paths_and_nullptr_object_representation(self):
         program = """
           never diverge(){for(;;){}}
@@ -5065,6 +5122,158 @@ class CompilerTests(unittest.TestCase):
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("virtual base", invalid.stderr)
 
+    def test_whole_rolls_back_completed_constructor_slots(self):
+        source = """
+            i32 trace;
+            declare struct Outer;
+            declare i32 request(Outer* owner);
+            struct Parent{~Parent(){trace=trace*10+1;}};
+            struct Stage{~Stage(){trace=trace*10+2;}};
+            struct Future {
+              Future(i32 mode){trace=trace*10+4;}
+              ~Future(){trace=trace*10+5;}
+            };
+            struct Work {
+              Stage finished;
+              SLOTS
+              CONSTRUCTOR
+              ~Work(){trace=trace*10+9;}
+            };
+            struct Outer:Parent {
+              Complete base<Parent>;
+              ~Outer(){OBJECT trace=trace*10+7;}
+              cleanup{trace=trace*10+3;}
+            };
+            i32 request(Outer* owner){destroy_base<Parent>(owner);return 0;}
+            i32 main(){{Outer value;}return trace==123?42:1;}
+        """
+        ordinary = "Work(Outer* owner){request(owner);trace=trace*10+8;}"
+        for slots, constructor, obj in (
+            ("", ordinary, "Work partial(this);"),
+            (
+                "",
+                "Work(Outer* owner){delegate(owner,42);trace=trace*10+8;}"
+                "Work(Outer* owner,i32 n){request(owner);trace=trace*10+6;}",
+                "Work partial(this);",
+            ),
+            (
+                "i32 marker;",
+                ordinary,
+                "Work partial(this) -> {init marker(42);trace=trace*10+5;};",
+            ),
+            (
+                "Future pending;",
+                "Work(Outer* owner){init pending(request(owner));trace=trace*10+8;}",
+                "Work partial(this);",
+            ),
+        ):
+            with self.subTest(slots=slots, constructor=constructor, object=obj):
+                self.assertEqual(
+                    self.program(
+                        source.replace("SLOTS", slots)
+                        .replace("CONSTRUCTOR", constructor)
+                        .replace("OBJECT", obj)
+                    ),
+                    42,
+                )
+
+    def test_whole_rolls_back_aggregate_array_and_tagged_payload_prefixes(self):
+        source = """
+            i32 trace;
+            declare struct Outer;
+            declare void request(Outer* owner);
+            struct Parent{~Parent(){trace=trace*10+1;}};
+            struct Stage{~Stage(){trace=trace*10+2;}};
+            Outer* active;
+            i32 count;
+            WORK
+            struct Outer:Parent {
+              Complete base<Parent>;
+              ~Outer(){active=this;OBJECT trace=trace*10+7;}
+              cleanup{trace=trace*10+3;}
+            };
+            void request(Outer* owner){destroy_base<Parent>(owner);}
+            i32 main(){{Outer value;}return trace==EXPECTED?42:1;}
+        """
+        explicit_array = """
+            struct Work {
+              Work(i32 step){if(step==2){request(active);}}
+              ~Work(){trace=trace*10+2;}
+            };
+        """
+        cases = {
+            "explicit elements": (
+                explicit_array,
+                "Work[2] partial(Work(1),Work(2));",
+                123,
+            ),
+            "empty prefix": (explicit_array, "Work[2] partial(Work(2),Work(1));", 13),
+            "defaulted elements": (
+                "struct Work{Work(){if(++count==2){request(active);}}"
+                "~Work(){trace=trace*10+2;}};",
+                "Work[3] partial;",
+                123,
+            ),
+            "array copy": (
+                "struct Work{Work(){}Work(const<Work>& other){if(++count==2){request(active);}}"
+                "~Work(){trace=trace*10+2;}};",
+                "Work[2] original;Work[2] partial(original);",
+                12223,
+            ),
+            "aggregate": (
+                "struct Work{Stage nested;Work(Outer* owner){request(owner);}"
+                "~Work(){trace=trace*10+9;}};"
+                "struct Aggregate{Stage first;Work pending;};",
+                "Aggregate partial -> {init pending(active);};",
+                1223,
+            ),
+            "memberwise copy": (
+                "struct StageCopy{StageCopy(){}StageCopy(const<StageCopy>& other){}"
+                "~StageCopy(){trace=trace*10+2;}};"
+                "struct PendingCopy{PendingCopy(){}PendingCopy(const<PendingCopy>& other)"
+                "{request(active);}~PendingCopy(){trace=trace*10+8;}};"
+                "struct Work{StageCopy first;PendingCopy second;Work(const<Work>& other)=default;"
+                "~Work(){trace=trace*10+9;}};",
+                "Work original;Work partial(original);",
+                129823,
+            ),
+            "tagged case": (
+                "struct Pending{Pending(i32 code){request(active);}"
+                "~Pending(){trace=trace*10+8;}};"
+                "union Work{case Chosen(Stage first,Pending second);"
+                "~Work(){trace=trace*10+9;}};",
+                "Work partial(Work::Chosen(Stage(),Pending(1)));",
+                123,
+            ),
+            "tagged copy": (
+                "struct StageCopy{StageCopy(){}StageCopy(const<StageCopy>& other){}"
+                "~StageCopy(){trace=trace*10+2;}};"
+                "struct PendingCopy{PendingCopy(){}PendingCopy(const<PendingCopy>& other)"
+                "{request(active);}~PendingCopy(){trace=trace*10+8;}};"
+                "union Work{case Chosen(StageCopy first,PendingCopy second);"
+                "Work(const<Work>& other)=default;~Work(){trace=trace*10+9;}};",
+                "Work original(Work::Chosen(StageCopy(),PendingCopy()));Work partial(original);",
+                129823,
+            ),
+            "authored tagged constructor": (
+                "union Work{default case Chosen(Stage value);"
+                "Work(i32 step){request(active);trace=trace*10+8;}"
+                "~Work(){trace=trace*10+9;}};",
+                "Work partial(1);",
+                123,
+            ),
+        }
+        for name, (work, obj, expected) in cases.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.program(
+                        source.replace("WORK", work)
+                        .replace("OBJECT", obj)
+                        .replace("EXPECTED", str(expected))
+                    ),
+                    42,
+                )
+
     def test_direct_base_request_exits_the_destructor_body(self):
         for request in ("destroy_base<Parent>(this);", "this->Parent::~Parent();"):
             with self.subTest(request=request):
@@ -6810,6 +7019,44 @@ class CompilerTests(unittest.TestCase):
                 rejected = self.compile(source, "--check")
                 self.assertEqual(rejected.returncode, 1)
                 self.assertIn(diagnosis, rejected.stderr)
+
+    def test_ref_rejects_proven_use_after_full_expression(self):
+        for declarations, target, field in (
+            ("i32 make(){return 42;}", "i32", ""),
+            (
+                "struct Box {i32 answer; Box(i32 n){init answer(n);}};"
+                "Box make(){return Box(42);}",
+                "Box",
+                ".answer",
+            ),
+        ):
+            with self.subTest(referent=target):
+                ref = f"std::Ref<const<{target}>>"
+                self.assertEqual(
+                    self.program(
+                        declarations
+                        + f"i32 main(){{return {ref}(make()).get(){field};}}"
+                    ),
+                    42,
+                )
+                ir = self.src.with_suffix(".ll").read_text()
+                self.assertNotIn("@malloc", ir)
+                self.assertNotIn("@llvm.lifetime.end", ir)
+                expired = self.compile(
+                    declarations
+                    + f"i32 main(){{{ref} kept(make());return kept.get(){field};}}",
+                    "--check",
+                )
+                self.assertEqual(expired.returncode, 1)
+                self.assertIn("ended full-expression temporary", expired.stderr)
+        for invalid in ("void", "i32&", "Forward", "const<Forward>"):
+            with self.subTest(invalid_referent=invalid):
+                invalid_type = self.compile(
+                    f"declare struct Forward; alias R=std::Ref<{invalid}>;",
+                    "--check",
+                )
+                self.assertEqual(invalid_type.returncode, 1)
+                self.assertIn("constraint is not satisfied", invalid_type.stderr)
 
     def test_scalar_domain_conversions_use_exact_integer_values(self):
         source = """

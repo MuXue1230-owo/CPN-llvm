@@ -7,6 +7,7 @@
 using namespace cpn;
 namespace {
 constexpr llvm::StringRef BorrowMetadata = "cpn.borrow.call";
+constexpr llvm::StringRef TemporaryEnd = "cpn.borrow.temporary.end";
 enum CallField {
   Line,
   Column,
@@ -484,6 +485,40 @@ class EscapeCheck {
     Active.erase(&Current);
   }
 
+  void verifyTemporaryGet(
+      llvm::CallBase &Getter, const Token &At,
+      const llvm::SmallPtrSetImpl<llvm::Function *> &Constructors) const {
+    const auto Target = slot(Getter.getArgOperand(0));
+    auto *Block = Getter.getParent();
+    auto Current = Getter.getIterator();
+    llvm::SmallPtrSet<llvm::Value *, 4> Expired;
+    for (unsigned Budget = 256; Block && Budget; --Budget) {
+      if (Current == Block->begin()) {
+        Block = Block->getSinglePredecessor();
+        if (Block)
+          Current = Block->end();
+        continue;
+      }
+      auto &I = *--Current;
+      if (auto *C = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        if (C->getMetadata(TemporaryEnd))
+          Expired.insert(C->getArgOperand(0));
+        if (Constructors.contains(C->getCalledFunction())) {
+          const auto Output = slot(C->getArgOperand(0));
+          if (Output.Base == Target.Base && Output.Offset == Target.Offset) {
+            const auto Referent = slot(C->getArgOperand(1));
+            if (Expired.contains(Referent.Base))
+              fail(callSite(Getter, At),
+                   "Ref designates an ended full-expression temporary");
+            return;
+          }
+        }
+      }
+      if (mayChange(I, Target))
+        return;
+    }
+  }
+
 public:
   EscapeCheck(Context &U, Function &D, llvm::Function &F,
               const std::map<llvm::Value *, llvm::Type *> &Globals,
@@ -525,7 +560,10 @@ public:
       llvm::append_range(Work, llvm::successors(BB));
     }
   }
-  void verify(const Token &At) const {
+  void
+  verify(const Token &At,
+         const llvm::SmallPtrSetImpl<llvm::Function *> &RefGetters,
+         const llvm::SmallPtrSetImpl<llvm::Function *> &RefConstructors) const {
     auto IsAutomatic = [&](llvm::Value *V) {
       return llvm::isa<llvm::AllocaInst>(V) || Automatic.contains(V);
     };
@@ -546,6 +584,9 @@ public:
     };
     for (auto *BB : Reachable)
       for (auto &I : *BB) {
+        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+            Call && RefGetters.contains(Call->getCalledFunction()))
+          verifyTemporaryGet(*Call, At, RefConstructors);
         if (auto *R = llvm::dyn_cast<llvm::ReturnInst>(&I))
           if (auto *V = R->getReturnValue(); V && V->getType()->isPointerTy())
             Check(V, true, true);
@@ -618,10 +659,22 @@ void Context::checkBorrowEscapes() {
       Types.push_back(Cases.at(Case).Payload);
   }
   llvm::SmallPtrSet<llvm::Function *, 32> Definitions;
+  llvm::SmallPtrSet<llvm::Function *, 8> RefGetters, RefConstructors;
   for (auto &D : Functions)
     for (auto *F : {D.IR, D.BaseIR})
-      if (F && !F->empty())
+      if (F && !F->empty()) {
         Definitions.insert(F);
+        if (!llvm::StringRef(D.Owner).starts_with("std::Ref<"))
+          continue;
+        const auto &Owner = Records.at(D.Owner);
+        if (Owner.Decl.At.Line != 0)
+          continue;
+        if (D.Decl.Text == "get" && D.Params.empty())
+          RefGetters.insert(F);
+        if (D.Decl.K == Node::Constructor && D.Params.size() == 1 &&
+            D.Params.front() == element(Owner.Fields.front().Type) + "&")
+          RefConstructors.insert(F);
+      }
   for (const auto &[Name, R] : Records)
     if (R.ClosureEntry && !R.ClosureEntry->empty())
       Definitions.insert(R.ClosureEntry);
@@ -656,8 +709,15 @@ void Context::checkBorrowEscapes() {
       if (Definitions.contains(F))
         EscapeCheck(*this, D, *F, StaticObjects, Payloads, Definitions,
                     TrivialDrops, StableRegistrations)
-            .verify(D.Decl.At);
+            .verify(D.Decl.At, RefGetters, RefConstructors);
   for (auto &F : M)
-    for (auto &I : llvm::instructions(F))
-      I.setMetadata(BorrowMetadata, nullptr);
+    for (auto &I : llvm::make_early_inc_range(llvm::instructions(F))) {
+      if (I.getMetadata(TemporaryEnd))
+        I.eraseFromParent();
+      else
+        I.setMetadata(BorrowMetadata, nullptr);
+    }
+  for (auto &F : llvm::make_early_inc_range(M))
+    if (F.getIntrinsicID() == llvm::Intrinsic::lifetime_end && F.use_empty())
+      F.eraseFromParent();
 }

@@ -112,7 +112,27 @@ class Parser {
   std::vector<Token> Tokens;
   size_t Pos = 0;
   std::set<std::string> Types, HiddenTypes, TypeParameters;
+  // The owner is the declaration identity, which survives lexical shadowing
+  // of its name. Only pointer (*) and array ([) layers affect member syntax.
+  struct ReceiverType {
+    std::string Owner, Layers;
+  };
+  using Receivers = std::map<std::string, ReceiverType>;
+  Receivers NominalReceivers, ValueReceivers, FieldReceivers;
+  std::map<std::pair<unsigned, unsigned>, ReceiverType> ReceiverDeclarations;
+  ReceiverType CurrentReceiver;
+  std::set<std::string> OwnMembers;
   std::map<std::string, std::string> AliasSchemas;
+  void publishReceiver(const Node &Decl, const std::string &Name) {
+    auto I = ReceiverDeclarations.find({Decl.At.Line, Decl.At.Column});
+    if (I == ReceiverDeclarations.end())
+      return;
+    auto &Bindings = Decl.K == Node::Object || Decl.K == Node::Field
+                         ? ValueReceivers
+                         : NominalReceivers;
+    Bindings[Name] = I->second;
+    Bindings["::" + Name] = I->second;
+  }
   std::map<std::pair<unsigned, unsigned>, std::string> AliasDeclarations;
   void publishAlias(const Node &Alias, const std::string &Name) {
     auto I = AliasDeclarations.find({Alias.At.Line, Alias.At.Column});
@@ -137,6 +157,7 @@ class Parser {
     AliasSchemas["::" + Name] = std::move(Canonical);
   }
   void publishRootAliases(const Node &Decl) {
+    publishReceiver(Decl, Decl.Text);
     if (Decl.K == Node::Alias)
       publishAlias(Decl, Decl.Text);
     else if (Decl.K == Node::Linkage)
@@ -146,6 +167,7 @@ class Parser {
   void publishMemberNames(const Node &Owner, const std::string &Prefix) {
     for (const auto &C : Owner.Children) {
       auto Key = Prefix + C.Text;
+      publishReceiver(C, Key);
       if (C.K == Node::Record || C.K == Node::Alias ||
           C.K == Node::Enumeration || C.K == Node::Union)
         Types.insert(Key);
@@ -159,6 +181,58 @@ class Parser {
   }
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
+  ReceiverType receiverType(const Node &N) const {
+    if (N.K == Node::Name) {
+      if (N.Text == "this" && !CurrentReceiver.Owner.empty())
+        return {CurrentReceiver.Owner, "*"};
+      if (auto I = ValueReceivers.find(N.Text); I != ValueReceivers.end())
+        return I->second;
+      return {};
+    }
+    if (N.K == Node::Configured)
+      return receiverType(N.Children.front());
+    if (N.K == Node::Member) {
+      auto Base = receiverType(N.Children.front());
+      if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
+        return {};
+      if (auto I = FieldReceivers.find(Base.Owner + "::" + N.Text);
+          I != FieldReceivers.end())
+        return I->second;
+      return {};
+    }
+    if (N.K != Node::Unary && N.K != Node::Index)
+      return {};
+    auto Base = receiverType(N.Children.front());
+    if (Base.Owner.empty())
+      return {};
+    if (N.K == Node::Unary && N.Text == "&") {
+      Base.Layers += '*';
+      return Base;
+    }
+    if (N.K == Node::Index || N.Text == "*") {
+      if (StringRef(Base.Layers).ends_with("*")) {
+        Base.Layers.pop_back();
+        return Base;
+      }
+      if (N.K == Node::Index && StringRef(Base.Layers).ends_with("[")) {
+        Base.Layers.pop_back();
+        return Base;
+      }
+    }
+    return {};
+  }
+  std::string memberFamily(const Node &N, const Token &Member,
+                           bool Pointer) const {
+    auto Type = receiverType(N);
+    if (!Type.Owner.empty() && Type.Layers == (Pointer ? "*" : "")) {
+      auto Key = Type.Owner + "::" + Member.Text;
+      if (Families.count(Key))
+        return Key;
+      if (OwnMembers.count(Key))
+        return {};
+    }
+    return Families.count(Member.Text) ? Member.Text : std::string();
+  }
   unsigned Depth = 0;
   struct Nest {
     unsigned &D;
@@ -280,7 +354,8 @@ class Parser {
     return std::nullopt;
   }
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr,
-                  std::string *NominalSchema = nullptr) {
+                  std::string *NominalSchema = nullptr,
+                  ReceiverType *Receiver = nullptr) {
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
              : AllowBuiltin && builtin(peek().Text) ? take()
@@ -343,6 +418,12 @@ class Parser {
     }
     if (NominalSchema)
       *NominalSchema = (Root ? "::" : "") + AliasSchema(Schema);
+    if (Receiver && (Root || !TypeParameters.count(
+                                 StringRef(Schema).split("::").first.str()))) {
+      if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
+          I != NominalReceivers.end())
+        *Receiver = I->second;
+    }
     if (Root)
       T.Text = "::" + T.Text;
     return T;
@@ -422,12 +503,13 @@ class Parser {
       *Canonical += ">";
     return Out;
   }
-  std::string type(std::string *NominalSchema = nullptr) {
+  std::string type(std::string *NominalSchema = nullptr,
+                   ReceiverType *Receiver = nullptr) {
     Nest Guard(Depth, peek());
     auto T = peek();
     std::string S;
     if (eat("(")) {
-      S = type(NominalSchema);
+      S = type(NominalSchema, Receiver);
       expect(")");
     } else if (eat("decltype")) {
       expect("(");
@@ -440,7 +522,7 @@ class Parser {
       TypeQueries[S] = std::move(Query);
     } else if (eat("const")) {
       expect("<");
-      S = "const<" + type() + ">";
+      S = "const<" + type(nullptr, Receiver) + ">";
       closeAngle();
     } else if (eat("function")) {
       expect("<");
@@ -504,14 +586,17 @@ class Parser {
     } else {
       if (!is("::") && !identifier(peek().Text))
         fail(T, "unsupported or unknown type '" + T.Text + "'");
-      S = qualified(true, nullptr, NominalSchema).Text;
+      S = qualified(true, nullptr, NominalSchema, Receiver).Text;
       if (!known(S) && !(StringRef(S).contains("::") &&
                          known(StringRef(S).split("::").first)))
         fail(T, "unsupported or unknown type '" + S + "'");
     }
     for (;;) {
       if (is("*") || is("&") || is("&&")) {
-        S += take().Text;
+        auto Suffix = take().Text;
+        S += Suffix;
+        if (Receiver && Suffix == "*" && !Receiver->Owner.empty())
+          Receiver->Layers += '*';
         if (NominalSchema)
           NominalSchema->clear();
       } else if (eat("[")) {
@@ -519,6 +604,8 @@ class Parser {
         expr();
         S += "[" + spelling(Begin) + "]";
         expect("]");
+        if (Receiver && !Receiver->Owner.empty())
+          Receiver->Layers += '[';
         if (NominalSchema)
           NominalSchema->clear();
       } else
@@ -578,7 +665,8 @@ class Parser {
       if (eat("async"))
         fail(T, "async closures require asynchronous execution");
       N.Type = type();
-      N.Params = params();
+      llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
+      N.Params = params(true);
       N.Const = !eat("mutable");
       N.Noexcept = eat("noexcept");
       applyAttributes(N, attributes());
@@ -646,9 +734,12 @@ class Parser {
           N = std::move(C);
         } else {
           Node M(Node::Member, Id);
-          if (is("<") && Families.count(Id.Text)) {
-            M.TemplateArgs = templateArgs(Id.Text);
-            M.ExplicitApplication = true;
+          if (is("<")) {
+            auto Schema = memberFamily(N, Id, Ptr);
+            if (!Schema.empty()) {
+              M.TemplateArgs = templateArgs(Schema);
+              M.ExplicitApplication = true;
+            }
           }
           M.Children.push_back(std::move(N));
           M.Definition = Ptr;
@@ -732,6 +823,8 @@ class Parser {
     auto OuterTypes = Types;
     auto OuterHidden = HiddenTypes;
     llvm::SaveAndRestore LocalSchemas(AliasSchemas);
+    llvm::SaveAndRestore LocalTypes(NominalReceivers);
+    llvm::SaveAndRestore LocalValues(ValueReceivers);
     Node B(Node::Block, expect("{"));
     while (!eat("}")) {
       if (Construction && eat("init")) {
@@ -827,8 +920,10 @@ class Parser {
       take();
     bool CX = !RO && eat("constexpr");
     if (RO || CX || is("auto") || typeBefore(true)) {
-      auto Ty = eat("auto") ? std::string("auto") : type();
+      ReceiverType Receiver;
+      auto Ty = eat("auto") ? std::string("auto") : type(nullptr, &Receiver);
       auto Id = name();
+      ValueReceivers[Id.Text] = std::move(Receiver);
       if (Types.count(Id.Text) || integerLibraryName(Id.Text, true))
         HiddenTypes.insert(Id.Text);
       return object(Id, Ty, RO, CX);
@@ -877,6 +972,7 @@ class Parser {
       return N;
     }
     if (eat("for")) {
+      llvm::SaveAndRestore LoopValues(ValueReceivers);
       auto OuterTypes = Types;
       auto OuterHidden = HiddenTypes;
       Node N(Node::For, T);
@@ -912,6 +1008,9 @@ class Parser {
             expect(")");
           }
         }
+        llvm::SaveAndRestore ArmValues(ValueReceivers);
+        for (const auto &P : Arm.Params)
+          ValueReceivers[P.Text] = {};
         Arm.Children = {block()};
         N.Children.push_back(Arm);
       }
@@ -989,7 +1088,7 @@ class Parser {
     }
     return simple();
   }
-  std::vector<Node> params() {
+  std::vector<Node> params(bool BindReceivers = false) {
     expect("(");
     std::vector<Node> V;
     if (eat(")"))
@@ -1000,7 +1099,8 @@ class Parser {
       if (P.Const)
         take();
       bool Forward = eat("forward");
-      P.Type = type();
+      ReceiverType Receiver;
+      P.Type = type(nullptr, BindReceivers ? &Receiver : nullptr);
       if (Forward)
         P.Type = "forward " + P.Type;
       if (P.Const && P.Type.back() == '&') {
@@ -1017,6 +1117,8 @@ class Parser {
       }
       if (is("("))
         P.Children = args();
+      if (BindReceivers && !P.Text.empty())
+        ValueReceivers[P.Text] = std::move(Receiver);
       V.push_back(std::move(P));
     } while (eat(","));
     expect(")");
@@ -1149,7 +1251,8 @@ class Parser {
   }
   void specialBody(Node &D, bool Proto, bool Separate = false) {
     bool Drop = D.K == Node::Destructor;
-    D.Params = params();
+    llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
+    D.Params = params(true);
     if (Drop && !D.Params.empty())
       fail(D.At, "a destructor takes no parameters");
     D.Noexcept = eat("noexcept");
@@ -1374,6 +1477,8 @@ class Parser {
       if (eat("{")) {
         if (NS) {
           llvm::SaveAndRestore NamespaceAliases(AliasSchemas);
+          llvm::SaveAndRestore NamespaceTypes(NominalReceivers);
+          llvm::SaveAndRestore NamespaceValues(ValueReceivers);
           while (!eat("}"))
             N.Children.push_back(declaration(Foreign));
         } else
@@ -1405,7 +1510,8 @@ class Parser {
           expect(";");
         } else {
           expect("expression");
-          Rule.Params = params();
+          llvm::SaveAndRestore RequirementValues(ValueReceivers);
+          Rule.Params = params(true);
           expect("{");
           while (!eat("}")) {
             size_t End = Pos, Arrow = Tokens.size();
@@ -1439,12 +1545,15 @@ class Parser {
       Node N(Node::Alias, name());
       expect("=");
       std::string Schema;
-      N.Type = type(&Schema);
+      ReceiverType Receiver;
+      N.Type = type(&Schema, &Receiver);
       expect(";");
       Types.insert(N.Text);
       HiddenTypes.erase(N.Text);
       AliasSchemas[N.Text] = Schema;
       AliasDeclarations[{N.At.Line, N.At.Column}] = std::move(Schema);
+      NominalReceivers[N.Text] = Receiver;
+      ReceiverDeclarations[{N.At.Line, N.At.Column}] = std::move(Receiver);
       return N;
     }
     auto Saved = Types;
@@ -1481,6 +1590,17 @@ class Parser {
       bool Union = Kind == "union", Class = Kind == "class";
       bool Manual = Class && eat("Manual");
       Node R(Union ? Node::Union : Node::Record, name());
+      ReceiverType Receiver{"$record." + std::to_string(R.At.Line) + "." +
+                                std::to_string(R.At.Column),
+                            {}};
+      if (!Specialize) {
+        auto Bound = G.empty() ? Receiver : ReceiverType{};
+        NominalReceivers[R.Text] = Bound;
+        ReceiverDeclarations[{R.At.Line, R.At.Column}] = std::move(Bound);
+      }
+      auto RecordTypes = NominalReceivers;
+      auto RecordValues = ValueReceivers;
+      llvm::SaveAndRestore ReceiverScope(CurrentReceiver, Receiver);
       R.Generics = G;
       if (Specialize) {
         while (eat("::"))
@@ -1608,12 +1728,20 @@ class Parser {
         if (Virt)
           D.Settings["virtual"] = "1";
         D.Settings["access"] = Access;
+        auto Key = Receiver.Owner + "::" + D.Text;
+        OwnMembers.insert(Key);
+        if (!D.Generics.empty() && D.K == Node::Function)
+          Families[Key] = D.Generics;
+        if (D.K == Node::Field)
+          FieldReceivers[Key] = ValueReceivers.at(D.Text);
         R.Children.push_back(std::move(D));
       }
       expect(";");
       Types = std::move(Saved);
       Types.insert(R.Text);
       AliasSchemas = std::move(OuterAliases);
+      NominalReceivers = std::move(RecordTypes);
+      ValueReceivers = std::move(RecordValues);
       publishMemberNames(R, R.Text + "::");
       return R;
     }
@@ -1667,7 +1795,8 @@ class Parser {
     bool CE = !RO && eat("constexpr"), Eval = !RO && !CE && eat("consteval");
     bool Static = StorageStatic || (!ThreadLocal && !RO && eat("static"));
     bool Virtual = !Static && !ThreadLocal && !RO && eat("virtual");
-    auto Ty = eat("auto") ? std::string("auto") : type();
+    ReceiverType Receiver;
+    auto Ty = eat("auto") ? std::string("auto") : type(nullptr, &Receiver);
     std::string Q;
     bool Dtor = false;
     std::vector<Node> Owners;
@@ -1681,6 +1810,8 @@ class Parser {
         fail(Id, "an external object initializer requires define");
       if (Virtual || Eval || (Static && !StorageStatic) || (Foreign && Static))
         fail(Id, "invalid object declaration modifier");
+      ValueReceivers[Id.Text] = Receiver;
+      ReceiverDeclarations[{Id.Line, Id.Column}] = std::move(Receiver);
       auto O = object(Id, Ty, RO, CE);
       if (Static || ThreadLocal)
         O.Settings["storage"] = Static ? "static" : "thread_local";
@@ -1710,7 +1841,8 @@ class Parser {
       Families[Id.Text] = G;
     if (Requires.K != Node::Empty)
       F.TemplateArgs.push_back(std::move(Requires));
-    F.Params = params();
+    llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
+    F.Params = params(true);
     if ((Member && !Static) || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))

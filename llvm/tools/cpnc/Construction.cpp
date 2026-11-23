@@ -27,7 +27,8 @@ const Node *site(const Node &N, bool Conditional = false) {
 Construction::Construction(Frame &Em, Function &Root, Value Obj,
                            const Node *Tail, Frame *Caller)
     : Object(Obj), TailFrame(Caller) {
-  if (Em.BaseLayer)
+  Object.BaseView |= Em.BaseLayer;
+  if (Object.BaseView)
     Frontier = Em.U.Records.at(Obj.Type).VirtualCount;
   for (auto &F : Em.U.Records.at(Obj.Type).Fields)
     Order.push_back(F.Decl.Text);
@@ -87,7 +88,7 @@ Construction::Construction(Frame &Em, Function &Root, Value Obj,
     Tmp->eraseFromParent();
   }
   findReservations(Em);
-  if (Em.IR && !Reserved.empty()) {
+  if (Em.IR && (!Reserved.empty() || Em.U.Whole)) {
     Cursor = Em.allocate("i32", Root.Decl.At);
     publish(Em);
   }
@@ -206,6 +207,18 @@ void Construction::run(Frame &Root) {
   if (positions() != Positions{Order.size()})
     fail(Root.F->Decl.At, "incomplete construction plan");
 }
+void Construction::rollback(Frame &Em) const {
+  if (MethodContract || !Cursor)
+    return;
+  // A continuing transfer can leave from a producer activation or from an
+  // initializing helper. Use the published progress shared by those calls.
+  const auto &R = Em.U.Records.at(Object.Type);
+  unsigned First = Object.BaseView ? R.VirtualCount : 0;
+  auto *Complete = Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor);
+  Em.B.CreateStore(Em.B.getInt32(First), Cursor);
+  Em.rollbackConstructionPrefix(Object,
+                                Em.B.CreateZExt(Complete, Em.B.getInt64Ty()));
+}
 void Construction::delegate(Frame &Em, const Node &N) {
   size_t I = 0;
   while (I < Chain.size() && Chain[I].first != Em.F)
@@ -224,6 +237,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
     Em.HasDelegated = true;
     return;
   }
+  auto *Before = Em.wholeEpoch();
   Next.B.SetInsertPoint(Em.B.GetInsertBlock());
   Next.BaseLayer = Em.BaseLayer;
   Next.Self = Object;
@@ -238,6 +252,7 @@ void Construction::delegate(Frame &Em, const Node &N) {
   }
   Next.branch(Next.InlineReturn);
   Em.B.SetInsertPoint(Next.InlineReturn);
+  Em.propagateWhole(Before);
   Em.HasDelegated = true;
 }
 

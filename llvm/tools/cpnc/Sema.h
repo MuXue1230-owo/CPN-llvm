@@ -21,6 +21,7 @@ struct JumpCleanups {
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
 struct ConstantPlace;
+struct Case;
 struct Value;
 struct ConstantStorageSlot {
   bool Ended = false;
@@ -90,6 +91,8 @@ struct Value {
   }
   bool BaseView = false, Prvalue = false;
   bool Rollback = false;
+  llvm::Value *ConstructionProgress = nullptr;
+  const Case *ConstructionCase = nullptr;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
         bool RO = false)
@@ -520,6 +523,7 @@ public:
   std::map<std::string, llvm::Value *> FieldFlags;
   std::set<std::string> ManualDropSlots;
   bool InDestructorCleanup = false;
+  bool UnionPayloadConstructed = false;
   void retirement();
   void checkAbandon(const std::string &, const Token &);
   void endField(const std::string &, const Token &, bool RunDestructor,
@@ -674,6 +678,10 @@ public:
   void object(const Node &, bool Global = false);
   void drop(Value, bool AsBase = false);
   void dropLayer(Value, bool AsBase, bool Rollback = false);
+  llvm::Value *beginConstructionPrefix(Value, const Case * = nullptr);
+  void endConstructionPrefix(llvm::Value *);
+  void rollbackConstructionPrefix(Value, llvm::Value *Count);
+  void dropArrayPrefix(Value, llvm::Value *Count);
   BasePath selectBase(const Record &, const BasePath &, const Node &);
   Value transferOwner(const Node &, const Node &);
   Value baseRequest(const Node &, const Node &);
@@ -809,6 +817,7 @@ class Construction {
 public:
   Construction(Frame &, Function &, Value, const Node *, Frame *);
   void run(Frame &);
+  void rollback(Frame &) const;
   Value constantResult() const { return Object; }
   Construction(Frame &, Function &Method);
   llvm::Value *admitCall(Frame &, const Function &, const Token &);

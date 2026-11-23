@@ -175,6 +175,9 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     return V;
   }
   auto *Ptr = Dest ? Dest : allocate(C.Owner, At);
+  auto *Progress = C.Types.empty()
+                       ? nullptr
+                       : beginConstructionPrefix({C.Owner, nullptr, Ptr}, &C);
   for (size_t I = 0; I < C.Types.size(); ++I) {
     auto *Slot = payloadAddress(C, Ptr, I);
     if (Default)
@@ -183,7 +186,10 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
       auto V = convert(eval(Args[I], C.Types[I], Slot), C.Types[I], Args[I].At);
       materialize(V, Args[I].At, Slot);
     }
+    if (Progress)
+      B.CreateStore(B.getInt64(I + 1), Progress);
   }
+  endConstructionPrefix(Progress);
   B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(U.ir(C.Owner), Ptr, 0));
   Value V{C.Owner, B.CreateLoad(U.ir(C.Owner), Ptr), Ptr};
   if (CheckInvariant)
@@ -345,10 +351,20 @@ void Frame::transferPayload(Value Source, llvm::Value *Dest,
                             SpecialOperation Op, const Token &At) {
   auto *Ty = U.ir(Source.Type);
   visitPayload(Source, [&](const Case &C) {
-    for (size_t I = 0; I < C.Types.size(); ++I)
+    const bool Construct = Op == SpecialOperation::CopyConstruct ||
+                           Op == SpecialOperation::MoveConstruct;
+    auto *Progress =
+        Construct && !C.Types.empty()
+            ? beginConstructionPrefix({Source.Type, nullptr, Dest}, &C)
+            : nullptr;
+    for (size_t I = 0; I < C.Types.size(); ++I) {
       transfer({C.Types[I], nullptr, payloadAddress(C, Source.Address, I),
                 Source.Readonly || C.Decl.Params[I].Const},
                payloadAddress(C, Dest, I), Op, At);
+      if (Progress)
+        B.CreateStore(B.getInt64(I + 1), Progress);
+    }
+    endConstructionPrefix(Progress);
     B.CreateStore(B.getInt32(C.Tag), B.CreateStructGEP(Ty, Dest, 0));
   });
 }

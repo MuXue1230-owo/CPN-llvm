@@ -80,6 +80,10 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     auto Elem = element(Source.Type);
     if (carriesPointerBounds(Elem) || U.Records.count(unconst(Elem)) ||
         llvm::isa<llvm::ArrayType>(Array->getElementType())) {
+      auto *Progress =
+          assignment(Op)
+              ? nullptr
+              : beginConstructionPrefix({Source.Type, nullptr, Dest});
       auto *Preheader = B.GetInsertBlock(), *Loop = block("array.transfer"),
            *Done = block("array.done");
       branch(Loop);
@@ -90,10 +94,13 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
       auto *To = B.CreateGEP(Array, Dest, {B.getInt32(0), Index});
       transfer({Elem, nullptr, From, Source.Readonly}, To, Op, At);
       auto *Next = B.CreateAdd(Index, B.getInt64(1));
+      if (Progress)
+        B.CreateStore(Next, Progress);
       Index->addIncoming(Next, B.GetInsertBlock());
       B.CreateCondBr(B.CreateICmpULT(Next, B.getInt64(Array->getNumElements())),
                      Loop, Done);
       B.SetInsertPoint(Done);
+      endConstructionPrefix(Progress);
       return;
     }
     const auto &Layout = U.M.getDataLayout();
@@ -157,6 +164,7 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
   }
   if (!assignment(Op) && R.Fields.empty())
     B.CreateStore(llvm::Constant::getNullValue(Ty), Dest);
+  auto *Progress = assignment(Op) ? nullptr : beginConstructionPrefix(Result);
   for (size_t I = AsBase ? R.VirtualCount : 0; I < R.Fields.size(); ++I) {
     auto &Field = R.Fields[I];
     auto *From = fieldAddress(Source, I);
@@ -165,7 +173,10 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
              I < R.Bases.size());
     if (!assignment(Op))
       finishVirtualBase(Result, I);
+    if (Progress)
+      B.CreateStore(B.getInt64(I + 1), Progress);
   }
+  endConstructionPrefix(Progress);
   if (!assignment(Op))
     installTables(Result);
   Complete();

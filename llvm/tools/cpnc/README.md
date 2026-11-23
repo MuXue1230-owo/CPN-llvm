@@ -71,13 +71,16 @@ The minimal `std::Result` binding supports case queries, receiver-qualified
 Wrong-case checked access selects ContractTrap. `try_value()` and `try_error()`
 return `WrongCase` on an inactive case and preserve payload references through
 the corresponding const-qualified or mutable `std::Ref` on success. Mapping
-adapters remain incomplete.
+adapters remain incomplete. Borrow checking rejects proved escapes through
+these aggregates and proved use of a direct `Ref` after its referent's
+full-expression lifetime. Borrow flow through joined temporary Results
+remains partial.
 
 ### Outstanding Core coverage
 
-* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Out-of-line generic member definitions bind both the owner and member parameters, including packed and nested owners. Qualified static generic calls can use chained type aliases. More complete computed comparisons and receiver-dependent template argument parsing remain partial.
+* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Out-of-line generic member definitions bind both the owner and member parameters. Known declared receivers select the proper member template schema even when other owners declare same-name members with different parameter kinds. Chained type aliases work in qualified static generic calls. More complete computed comparisons and member template parsing for inferred, dependent or unresolved inherited receivers remain partial.
 * Contract proof is conservative. Override checking proves supported predicate implications against each inherited declaration and its receiver view. Indirect callable types retain selected predicate-check effects and published borrow origins. Stronger proof rules and opaque foreign lifetime contracts remain partial.
-* Construction checks recognize immutable receiver aliases and diagnose proved early inherited access. Cleanup checks the reverse frontier and retains reconstructed slots' cleanup rank. Construction contracts through less direct aliases, rollback on continuing failures, and other access and lifecycle checks remain partial.
+* Construction checks recognize immutable receiver aliases and diagnose proved early inherited access. Cleanup checks the reverse frontier and retains reconstructed slots' cleanup rank. A continuing Whole transfer rolls back completed construction prefixes for authored and aggregate constructors, array elements, memberwise copies, and tagged payloads. Construction contracts through less direct aliases and some access and lifecycle checks remain partial.
 * Complete objects and individually selected member and array-element extents support replacement, including by another fitting type. Pointer provenance after untracked foreign writes or raw storage reinterpretation, whole-program escape checking, storage transfer, and allocator ownership remain incomplete.
 * Constant evaluation supports generation-checked replacement of complete automatic objects, ordinary record members and array elements. Replacement of a tagged union by an explicit case is supported. StorageView exposes capacity, alignment and identity in native and constant execution. Direct tagged-payload transitions and stronger shared-base and closure lifetime checks remain partial.
 * Floating-point arithmetic covers f32 and f64. Additional FP context APIs and provider controls remain unavailable.

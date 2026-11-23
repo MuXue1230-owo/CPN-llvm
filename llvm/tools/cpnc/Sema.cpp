@@ -1523,7 +1523,9 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
       if (S.K == Node::Init)
         fail(S.At, "a union case is not a common field initializer");
     F.beginUnionConstructor();
+    F.UnionPayloadConstructed = true;
     F.stmt(Body);
+    F.UnionPayloadConstructed = false;
   } else if (D.Decl.K == Node::Constructor) {
     Construction Transaction(F, D, F.Self, nullptr, nullptr);
     Transaction.run(F);

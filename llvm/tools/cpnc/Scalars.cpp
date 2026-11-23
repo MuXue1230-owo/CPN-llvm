@@ -15,7 +15,7 @@ void Context::bindScalarLibrary() {
         AccessError(const<AccessError>& other)=default;
         AccessError(AccessError&& other)=default;
       };
-      generic<type T> class Ref {
+      generic<type T> requires (CompleteType<T>) class Ref {
         T* referent;
       public:
         Ref(T& object) noexcept [[effects(write(this))]] { init referent(&object); }
@@ -23,7 +23,7 @@ void Context::bindScalarLibrary() {
         Ref(Ref&& other)=default;
         constexpr T& get() const noexcept { return *referent; }
       };
-      generic<type T> specialize class Ref<const<T>> {
+      generic<type T> requires (CompleteType<T>) specialize class Ref<const<T>> {
         const<T>* referent;
         constexpr static const<T>* address(const<T>& object) noexcept
             [[returns_borrowed_from(object)]] { return &object; }
