@@ -90,7 +90,7 @@ Value Frame::lookup(const Token &T, bool NeedLive) {
       Qualified = Qualified.rsplit("::").first;
       if (auto It = U.MemberTypes.find(Qualified.str());
           It != U.MemberTypes.end())
-        checkAccess(It->second.second, It->second.first, T);
+        checkAccess(It->second.first(), It->second.Owner, T);
     }
     if (auto I = U.StaticMembers.find(Key); I != U.StaticMembers.end())
       checkAccess(I->second.second, I->second.first, T);
@@ -145,8 +145,8 @@ Value Frame::member(Value Obj, const Token &T, bool NeedLive) {
           PendingSlots.count(T.Text))
         fail(T, "use before initialization");
       bool Own = Obj.Address == Self.Address && Obj.Type == Self.Type;
-      if (Transaction && IR && NeedLive && Own)
-        Transaction->checkAccess(*this, T);
+      if (Transaction && IR && NeedLive && Obj.Address && Obj.Type == Self.Type)
+        Transaction->checkAccess(*this, T, Obj.Address);
       if (NeedLive && Own && InDestructorCleanup && I >= R.Bases.size()) {
         const auto IsManual = [&](const cpn::Field &Slot) {
           return ManualDropSlots.count(Slot.Decl.Text);
@@ -246,9 +246,10 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual,
             Default.At);
       Scopes.pop_back();
     }
-    if (ends(Type, "&"))
+    if (ends(Type, "&")) {
       V = bindReference(V, Type, Param.At);
-    else {
+      V.Prvalue = V.Expiring = false;
+    } else {
       if (!IR) {
         V = materialize(convert(V, Type, Param.At), Param.At);
         if (!llvm::isa_and_nonnull<llvm::Constant>(V.IR))
@@ -1458,7 +1459,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       if (!TypeQuery)
         fail(T, "LIFE001: initializes requires Pending receiver slots");
       Values.push_back(llvm::PoisonValue::get(B.getPtrTy()));
-    }
+    } else if (Transaction && Receiver.Address)
+      Transaction->checkReceiver(*this, D, T, Receiver.Address);
   }
   auto *Before = wholeEpoch();
   llvm::Value *Target =
@@ -1666,6 +1668,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     return *Result;
   if (auto Scalar = scalarConversion(C, Name, Args))
     return *Scalar;
+  if (auto Diagnostic = libraryDiagnostic(C, Args))
+    return *Diagnostic;
   if (InPredicate &&
       (Name == "destroy" || Name == "abandon" || Name == "construct_at" ||
        Name == "storage_of" || Name == "destroy_base" ||
@@ -1677,15 +1681,31 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
                     ExpressionDestination.Type.empty())
                        ? ExpressionDestination.Address
                        : nullptr);
-  if (Name == "std::forward" && C.TemplateArgs.size() == 1 &&
-      Args.size() == 1) {
+  if (Name == "std::forward" || Name == "::std::forward") {
+    if (C.TemplateArgs.size() != 1 || Args.size() != 1)
+      fail(C.At, "std::forward requires one type argument and one parameter");
+    const auto &Arg = Args.front();
+    if (!F || Arg.K != Node::Name)
+      fail(Arg.At, "std::forward requires the named forwarding parameter");
+    const auto &Params = F->Decl.Params;
+    auto I = llvm::find_if(Params, [&](const Node &Param) {
+      return Param.Text == Arg.Text &&
+             StringRef(Param.Type).starts_with("forward ");
+    });
+    if (I == Params.end() ||
+        llvm::any_of(llvm::ArrayRef(Scopes).drop_front(), [&](const Local &S) {
+          return S.Names.count(Arg.Text) || S.Aliases.count(Arg.Text);
+        }))
+      fail(Arg.At, "std::forward requires the named forwarding parameter");
     auto Ty = resolve(C.TemplateArgs[0].Type, C.At);
-    auto V = eval(Args[0]);
+    if (Ty != resolve(I->Type.substr(8), C.At))
+      fail(C.At, "std::forward type must match the forwarding parameter");
+    auto V = eval(Arg);
     V.Prvalue = false;
-    V.Expiring = !ends(Ty, "&");
+    V.Expiring = ends(F->Params[I - Params.begin()], "&&");
     return V;
   }
-  if (Name == "std::move" && Args.size() == 1) {
+  if ((Name == "std::move" || Name == "::std::move") && Args.size() == 1) {
     auto V = eval(Args[0]);
     V.Prvalue = false;
     V.Expiring = true;

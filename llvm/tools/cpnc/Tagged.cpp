@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Analysis/ConstantFolding.h"
 using namespace cpn;
 
@@ -60,18 +61,20 @@ void Context::tagged(const Node &D, const std::string &Name,
     R.IR = llvm::StructType::create(C, "cpn." + Name);
   if (D.Prototype)
     return;
+  llvm::SaveAndRestore Depth(RecordLayoutDepth, RecordLayoutDepth + 1);
+  const auto PendingOnEntry = PendingRecordBodies.size();
+  auto DiscardBodies =
+      llvm::scope_exit([&] { PendingRecordBodies.resize(PendingOnEntry); });
   R.Env = Env;
   R.Env.Types[D.Text] = Name;
   Frame F(*this, nullptr, nullptr, Name + "::");
   F.Env = R.Env;
-  indexMemberAliases(D.Children, Name);
+  indexMemberTypes(D.Children, Name);
   const auto &DL = M.getDataLayout();
   uint64_t Size = 0;
   llvm::Type *AlignType = llvm::Type::getInt8Ty(C);
   auto &Alternatives = Variants[Name];
   for (const auto &Decl : D.Children) {
-    if (nestedType(Decl, Name, F))
-      continue;
     if (Decl.K != Node::Variant) {
       if (Decl.K == Node::Field && Decl.Settings.count("storage") &&
           Decl.Settings.at("storage") == "static") {
@@ -91,8 +94,6 @@ void Context::tagged(const Node &D, const std::string &Name,
              "union assignment requires an active-case replacement contract");
     }
   }
-  // Payload types are resolved after all nested type declarations are bound.
-  bindMemberAliases(D.Children, Name);
   for (const auto &Decl : D.Children) {
     if (Decl.K != Node::Variant)
       continue;
@@ -127,14 +128,20 @@ void Context::tagged(const Node &D, const std::string &Name,
                  llvm::ArrayType::get(Word, llvm::divideCeil(Size, Unit))});
   R.Layer = R.IR;
   R.Complete = true;
+  completeMemberTypes(D.Children, Name);
   declareMembers(Name, Name + "::");
+  finishRecordBodies();
+  DiscardBodies.release();
+}
+
+void Context::validateDefaultCase(const std::string &Name) {
   // Default case viability is a declaration requirement, even if the root
   // unit never default-constructs this union.
   if (auto I = DefaultCase.find(Name); I != DefaultCase.end()) {
     auto &Case = Cases.at(I->second);
     if (!Case.Types.empty()) {
       auto *Probe = llvm::Function::Create(
-          llvm::FunctionType::get(F.B.getVoidTy(), false),
+          llvm::FunctionType::get(llvm::Type::getVoidTy(C), false),
           llvm::GlobalValue::InternalLinkage, "cpn.union.default.check", M);
       Frame Check(*this, nullptr, Probe, Name + "::");
       Check.B.SetInsertPoint(Check.block("entry"));

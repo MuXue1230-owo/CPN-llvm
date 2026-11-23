@@ -9,6 +9,17 @@ void Context::bindScalarLibrary() {
   // layout as ordinary unions, including in required constant evaluation.
   auto Library = parse(R"cpn(
     namespace std {
+      struct Unit {
+        Unit() noexcept = default;
+        Unit(const<Unit>& other) noexcept = default;
+        Unit(Unit&& other) noexcept = default;
+        Unit& operator=(const<Unit>& other) noexcept = default;
+        Unit& operator=(Unit&& other) noexcept = default;
+        constexpr bool operator==(const<Unit>& other) const noexcept
+            [[effects(none)]] { return true; }
+        constexpr bool operator!=(const<Unit>& other) const noexcept
+            [[effects(none)]] { return false; }
+      };
       union AccessError {
         case MissingValue;
         case WrongCase;
@@ -173,6 +184,38 @@ Value tryResultPayload(Frame &F, const Node &Call, const Node &Method,
   return F.callResult(Type, nullptr, Call.At, Storage);
 }
 } // namespace
+
+std::optional<Value> Frame::libraryDiagnostic(const Node &Call,
+                                              const std::vector<Node> &Args) {
+  if (Call.K != Node::Name)
+    return {};
+  auto Name = StringRef(Call.Text);
+  Name.consume_front("::");
+  const bool Discard = Name == "std::discard";
+  const bool Debug = Name == "std::debug_assert";
+  if (!Discard && !Debug && Name != "std::ensure")
+    return {};
+  if (Args.size() != 1 || !Call.TemplateArgs.empty())
+    fail(Call.At, Name.str() + " expects one argument");
+  const auto &Arg = Args.front();
+  if (Debug && !Opt.DebugAssertions) {
+    auto Type = unevaluatedType(Arg, false);
+    if (Type != "bool" && Type != "never")
+      fail(Arg.At, "condition requires bool");
+    return Value{"void"};
+  }
+  auto Argument = eval(Arg);
+  if (Argument.Type == "never")
+    return Argument;
+  if (Discard)
+    return Value{"void"};
+  if (Argument.Type != "bool")
+    fail(Arg.At, "condition requires bool");
+  if (!IR && !llvm::cast<llvm::ConstantInt>(Argument.IR)->isOne())
+    fail(Call.At, "assertion selects ContractTrap in constant evaluation");
+  guard(B.CreateNot(Argument.IR), "contract");
+  return Value{"void"};
+}
 
 std::optional<Value> Frame::resultObserver(const Node &Call,
                                            const std::vector<Node> &Args,

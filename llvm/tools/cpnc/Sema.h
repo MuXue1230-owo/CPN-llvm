@@ -263,9 +263,15 @@ struct Context {
   std::map<std::string, Record> Records;
   std::map<llvm::GlobalVariable *, std::pair<std::string, size_t>>
       DispatchTables;
-  std::map<std::string, std::pair<std::string, Node>> StaticMembers,
-      MemberTypes;
-  std::map<std::string, DefinitionSite> MemberAliasSites;
+  std::map<std::string, std::pair<std::string, Node>> StaticMembers;
+  struct MemberType {
+    std::string Owner;
+    std::vector<Node> Declarations;
+    DefinitionSite Site;
+    bool Binding = false, Bound = false;
+    const Node &first() const { return Declarations.front(); }
+  };
+  std::map<std::string, MemberType> MemberTypes;
   std::set<std::string> BindingMemberAliases;
   unsigned MemberAliasDepth = 0;
   std::map<std::string, Value> Globals, ExternalObjects;
@@ -348,6 +354,15 @@ struct Context {
   void defineFamilyMember(const Node &, const std::string &);
   void bindFamilyMember(const std::string &, const MemberBody &);
   void declareMembers(const std::string &, const std::string &);
+  struct RecordBodies {
+    std::string Owner;
+    DefinitionSite Site;
+    std::vector<Function *> Members;
+  };
+  unsigned RecordLayoutDepth = 0;
+  std::vector<RecordBodies> PendingRecordBodies;
+  void finishRecordBodies();
+  void validateDefaultCase(const std::string &);
   void validateInvariants(const std::string &);
   bool hasCheckedInvariant(const Function &) const;
   bool Whole = false;
@@ -384,10 +399,10 @@ struct Context {
   void attachGenericBody(Function &, const Family &);
   void setGenericBody(Family &, Node, DefinitionSite, Substitution = {});
   void enumeration(Frame &, const Node &, const std::string &);
-  void indexMemberAliases(llvm::ArrayRef<Node>, const std::string &);
-  void bindMemberAliases(llvm::ArrayRef<Node>, const std::string &);
+  void indexMemberTypes(llvm::ArrayRef<Node>, const std::string &);
+  void completeMemberTypes(llvm::ArrayRef<Node>, const std::string &);
+  void completeMemberType(const std::string &, const Token &);
   std::string bindMemberAlias(const std::string &);
-  bool nestedType(const Node &, const std::string &, Frame &);
   void tagged(const Node &, const std::string &, const std::string &,
               const Substitution & = {});
   void record(const Node &, const std::string &, const std::string &,
@@ -626,6 +641,8 @@ public:
                                       Value Receiver);
   std::optional<Value> scalarConversion(const Node &, llvm::StringRef,
                                         const std::vector<Node> &);
+  std::optional<Value> libraryDiagnostic(const Node &,
+                                         const std::vector<Node> &);
   std::optional<Value> memoryCall(const Node &, const std::vector<Node> &,
                                   Value Receiver);
   std::optional<Value> namedInteger(const Node &, llvm::StringRef,
@@ -828,6 +845,8 @@ class Construction {
   void publish(Frame &);
   void advance(Frame &);
   void enter(Frame &, size_t);
+  void checkSlot(Frame &, size_t, const Token &,
+                 llvm::Value *Designated = nullptr) const;
 
 public:
   Construction(Frame &, Function &, Value, const Node *, Frame *);
@@ -842,8 +861,11 @@ public:
   Positions positions() const;
   void restore(const Positions &);
   void restoreFlow(const Node &, bool Exit = false);
-  void checkAccess(Frame &, const Token &) const;
+  void checkAccess(Frame &, const Token &,
+                   llvm::Value *Designated = nullptr) const;
   void checkBaseAccess(Frame &, const Value &, const Token &) const;
+  void checkReceiver(Frame &, const Function &, const Token &,
+                     llvm::Value *Designated = nullptr) const;
   static bool mayAccess(const EffectBound &, const EffectSet &Predicate,
                         llvm::StringRef Region);
   void checkCallArguments(Frame &, llvm::ArrayRef<Value>,

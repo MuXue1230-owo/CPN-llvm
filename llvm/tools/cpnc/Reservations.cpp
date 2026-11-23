@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/Analysis/Loads.h"
 using namespace cpn;
 namespace {
 // For each path, only the first use of a slot affects its eligibility. Joining
@@ -67,10 +68,11 @@ struct SourceAnalysis {
   Function *Owner = nullptr;
   std::vector<const Node *> Declarations;
   Views ReceiverAliases;
+  Options Policy;
   SourceAnalysis(Frame &Em, const std::string &Slot,
                  const std::vector<std::pair<Function *, const Node *>> &Chain,
                  std::map<const Node *, Function *> &Selected)
-      : Em(Em), Slot(Slot), Chain(Chain), Selected(Selected) {}
+      : Em(Em), Slot(Slot), Chain(Chain), Selected(Selected), Policy(Em.Opt) {}
   Function *method(const Node &Call, const Names &Locals) {
     const auto &Callee = Call.Children.front();
     bool Self = Callee.K == Node::Name && !Locals.count(Callee.Text);
@@ -240,6 +242,11 @@ struct SourceAnalysis {
   unsigned expression(const Node &N, unsigned S, const Names &Locals) {
     if (!S)
       return 0;
+    if (N.K == Node::Configured) {
+      llvm::SaveAndRestore Scope(Policy);
+      configure(Policy, N, ConfigScope::Expression);
+      return expression(N.Children.front(), S, Locals);
+    }
     if (N.K == Node::Unary && (N.Text == "sizeof" || N.Text == "alignof"))
       return S;
     if (N.K == Node::Lambda) {
@@ -274,6 +281,11 @@ struct SourceAnalysis {
       return S | expression(N.Children[1], S, Locals);
     }
     if (N.K == Node::Call) {
+      const auto &Callee = N.Children.front();
+      if (Callee.K == Node::Name && !Policy.DebugAssertions &&
+          (Callee.Text == "std::debug_assert" ||
+           Callee.Text == "::std::debug_assert"))
+        return S;
       if (auto *D = method(N, Locals)) {
         S = addressExpression(N.Children.front(), S, Locals);
         S = callArguments(N, S, Locals, D->Params, D->Effects,
@@ -291,7 +303,6 @@ struct SourceAnalysis {
                    ? observe(S, Read)
                    : S;
       }
-      const auto &Callee = N.Children.front();
       if (auto *D = freeFunction(Callee, Locals))
         return callArguments(N, S, Locals, D->Params, D->Effects,
                              D->PredicateEffects);
@@ -307,6 +318,7 @@ struct SourceAnalysis {
   unsigned activation(size_t Depth, unsigned S) {
     auto *D = Chain[Depth].first;
     llvm::SaveAndRestore Current(Owner, D);
+    llvm::SaveAndRestore DefinitionPolicy(Policy, D->Definition.Configuration);
     llvm::SaveAndRestore Environment(Declarations);
     llvm::SaveAndRestore Aliases(ReceiverAliases,
                                  Views{{"this", {true, D->Decl.Const}}});
@@ -447,8 +459,11 @@ struct SourceAnalysis {
       } while (Header != Previous);
       return Out;
     }
-    case Node::Configured:
+    case Node::Configured: {
+      llvm::SaveAndRestore Scope(Policy);
+      configure(Policy, N, ConfigScope::Block);
       return statement(A[0], S, Locals, Depth);
+    }
     case Node::Label:
       return statement(A[0], S, Locals, Depth, N.Text);
     case Node::Goto:
@@ -544,22 +559,76 @@ void Construction::publish(Frame &Em) {
   if (Cursor)
     Em.B.CreateStore(Em.B.getInt32(Frontier), Cursor);
 }
-void Construction::checkAccess(Frame &Em, const Token &T) const {
-  auto I = std::find(Order.begin(), Order.end(), T.Text);
-  if (I == Order.end())
-    return;
-  size_t Slot = I - Order.begin();
-  auto States = positions();
-  if (*States.rbegin() <= Slot)
-    fail(T, "LIFE002: use before initialization");
-  if (*States.begin() <= Slot) {
-    Em.Opt.diagnose(T, Severity::Anomaly, "LIFE003",
-                    "slot lifetime depends on the incoming path");
-    if (Em.Opt.RawValidation)
-      Em.guard(Em.B.CreateICmpULE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
-                                  Em.B.getInt32(Slot)),
-               "lifecycle");
+namespace {
+enum class LayerAlias { NoEvidence, Exact, Possible };
+
+LayerAlias layerAlias(llvm::Value *Pointer, llvm::Value *Receiver) {
+  llvm::SmallVector<llvm::Value *> Pending{Pointer};
+  llvm::SmallPtrSet<llvm::Value *, 8> Seen;
+  bool Match = false, Other = false;
+  unsigned Budget = 64;
+  while (!Pending.empty() && Budget--) {
+    auto *V = Pending.pop_back_val()->stripPointerCasts();
+    if (!Seen.insert(V).second)
+      continue;
+    if (V == Receiver) {
+      Match = true;
+    } else if (auto *Select = llvm::dyn_cast<llvm::SelectInst>(V)) {
+      Pending.push_back(Select->getTrueValue());
+      Pending.push_back(Select->getFalseValue());
+    } else if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(V)) {
+      llvm::append_range(Pending, Phi->incoming_values());
+    } else if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(V);
+               Load && Load->isSimple()) {
+      auto Start = Load->getIterator();
+      if (auto *Stored = llvm::FindAvailableLoadedValue(Load, Load->getParent(),
+                                                        Start, 64);
+          Stored && Stored->getType()->isPointerTy())
+        Pending.push_back(Stored);
+      else
+        Other = true;
+    } else {
+      Other = true;
+    }
   }
+  if (!Match)
+    return LayerAlias::NoEvidence;
+  return Other || !Pending.empty() ? LayerAlias::Possible : LayerAlias::Exact;
+}
+} // namespace
+
+void Construction::checkSlot(Frame &Em, size_t Slot, const Token &At,
+                             llvm::Value *Designated) const {
+  auto States = positions();
+  if (*States.begin() > Slot || (Designated && Em.TypeQuery))
+    return;
+  auto Alias =
+      Designated ? layerAlias(Designated, Object.Address) : LayerAlias::Exact;
+  if (Alias == LayerAlias::NoEvidence)
+    return;
+  bool AlwaysPending = *States.rbegin() <= Slot;
+  if (AlwaysPending && Alias == LayerAlias::Exact)
+    fail(At, "LIFE002: use before initialization");
+  Em.Opt.diagnose(At, Severity::Anomaly, "LIFE003",
+                  Alias == LayerAlias::Possible
+                      ? "access can designate a pending construction slot"
+                      : "slot lifetime depends on the incoming path");
+  if (Em.IR && Em.Opt.RawValidation) {
+    llvm::Value *Bad =
+        AlwaysPending
+            ? Em.B.getTrue()
+            : Em.B.CreateICmpULE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
+                                 Em.B.getInt32(Slot));
+    if (Alias == LayerAlias::Possible)
+      Bad = Em.B.CreateAnd(Bad, Em.B.CreateICmpEQ(Designated, Object.Address));
+    Em.guard(Bad, "lifecycle");
+  }
+}
+void Construction::checkAccess(Frame &Em, const Token &T,
+                               llvm::Value *Designated) const {
+  auto I = llvm::find(Order, T.Text);
+  if (I != Order.end())
+    checkSlot(Em, I - Order.begin(), T, Designated);
 }
 void Construction::checkBaseAccess(Frame &Em, const Value &View,
                                    const Token &At) const {

@@ -86,6 +86,68 @@ class CompilerTests(unittest.TestCase):
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("CFG001", r.stderr)
 
+    def test_minimal_unit_and_diagnostic_operations(self):
+        self.assertEqual(
+            self.program("""
+                i32 count;
+                bool bump(){++count;return true;}
+                i32 main(){
+                    std::Unit value;
+                    std::Unit copy(value);
+                    std::Unit moved(::std::move(copy));
+                    copy=moved;
+                    constexpr bool single(std::Unit()==std::Unit());
+                    if(!single || copy!=value || !(moved==value)){return 0;}
+                    configured(library.debug_assertions=false) (std::debug_assert(bump()));
+                    std::ensure(bump());
+                    std::discard(bump());
+                    return count+40;
+                }
+            """),
+            42,
+        )
+        assertions = """
+            i32 count;
+            bool check(){++count;return true;}
+            i32 main(){::std::debug_assert(check());return count;}
+        """
+        self.assertEqual(self.program(assertions, "--preset", "Debug"), 1)
+        self.assertEqual(self.program(assertions, "--preset", "Release"), 0)
+        self.assertEqual(
+            self.program(
+                "i32 main(){std::ensure(false);return 0;}", "--preset", "Release"
+            ),
+            -signal.SIGILL,
+        )
+        wrong = self.compile(
+            "i32 main(){std::debug_assert(i32(1));return 0;}",
+            "--preset",
+            "Release",
+            "--check",
+        )
+        self.assertEqual(wrong.returncode, 1, wrong.stderr)
+        self.assertIn("condition requires bool", wrong.stderr)
+        self.assertEqual(
+            self.program("""
+                struct Part {
+                    i32 number;
+                    Part(i32 n){init number(n);}
+                    Part& operator=(Part&& other)=delete;
+                };
+                struct Parent {
+                    Part part;
+                    Parent(){
+                        configured(library.debug_assertions=false) {
+                            std::debug_assert(part.number==0);
+                        }
+                        part=Part(42);
+                    }
+                };
+                i32 main(){Parent p;return p.part.number;}
+            """),
+            42,
+        )
+
     def test_nested_type_scopes_and_structural_requirements(self):
         self.assertEqual(
             self.program("""
@@ -121,6 +183,67 @@ class CompilerTests(unittest.TestCase):
             "struct A{struct X{};}; X outside;",
         ):
             self.assertNotEqual(self.compile(source, "--check").returncode, 0)
+
+    def test_nested_nominals_complete_in_layout_dependency_order(self):
+        self.assertEqual(
+            self.program("""
+                struct Envelope {
+                    struct Cell {
+                        Envelope* owner;
+                        Payload payload;
+                        Number number;
+                        i32 read(){
+                            return owner->id + payload.get()
+                                + i32(std::to_underlying(number));
+                        }
+                    };
+                    union Payload {
+                        case Number(i32 data);
+                        i32 get() const {
+                            match(*this){case Payload::Number(value i){return i;}}
+                        }
+                    };
+                    alias Number=Scalar;
+                    enum Scalar:i32 { case Answer(2) };
+                    i32 id;
+                    Cell cell;
+                };
+                i32 main(){
+                    Envelope env(20,Envelope::Cell(nullptr,
+                        Envelope::Payload::Number(20),Envelope::Scalar::Answer));
+                    env.cell.owner=&env;
+                    return env.cell.read();
+                }
+            """),
+            42,
+        )
+        recur = self.compile(
+            "struct Graph{struct Left{Right r;};struct Right{Left l;};};",
+            "--check",
+        )
+        self.assertEqual(recur.returncode, 1, recur.stderr)
+        self.assertIn("field requires a complete object type", recur.stderr)
+
+    def test_nested_sibling_pointer_cycles_and_qualified_calls(self):
+        self.assertEqual(
+            self.program("""
+                struct Graph {
+                    struct Left {
+                        Right* right;
+                        i32 number;
+                        i32 read(){return right->read() + Right::add<2>();}
+                    };
+                    struct Right {
+                        Left* left;
+                        i32 read(){return left->number;}
+                        generic<const i32 N> static i32 add(){return N;}
+                    };
+                };
+                i32 main(){Graph::Left lhs;Graph::Right rhs(&lhs);
+                    lhs.right=&rhs;lhs.number=40;return lhs.read();}
+            """),
+            42,
+        )
 
     def test_generic_methods_inherit_and_keep_owner_substitutions(self):
         self.assertEqual(
@@ -794,6 +917,38 @@ class CompilerTests(unittest.TestCase):
                         )
                     ),
                     42,
+                )
+
+    def test_construction_checks_conditional_aliases_before_access(self):
+        source = """
+            declare struct Box;
+            [[effects(read(view))]] declare i32 read_box(const<Box>* view);
+            struct Box {
+                i32 field;
+                Box(i32 n){init field(n);}
+                i32 read() const {return field;}
+                Box(bool select_self, Box* other){init field(EXPRESSION);}
+            };
+            [[effects(read(view))]] i32 read_box(const<Box>* view) {
+                return view->field;
+            }
+            i32 main(){Box alive(42);Box chosen(SELECT_SELF,&alive);return chosen.field;}
+        """
+        for expression in (
+            "read_box(select_self?this:other)",
+            "(select_self?this:other)->field",
+            "(select_self?this:other)->read()",
+        ):
+            with self.subTest(expression=expression):
+                program = source.replace("EXPRESSION", expression)
+                good = program.replace("SELECT_SELF", "false")
+                result = self.compile(good, "--check")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("LIFE003", result.stderr)
+                self.assertEqual(self.program(good), 42)
+                self.assertEqual(
+                    self.program(program.replace("SELECT_SELF", "true")),
+                    -signal.SIGILL,
                 )
 
     def test_construction_state_respects_closed_nonaccessing_call_contracts(self):
@@ -3849,6 +4004,36 @@ class CompilerTests(unittest.TestCase):
             }"""),
             42,
         )
+
+    def test_forward_preserves_const_reference_and_recorded_category(self):
+        self.assertEqual(
+            self.program("""
+                struct Item {
+                    constexpr i32 kind() & {return 13;}
+                    constexpr i32 kind() const & {return 11;}
+                    constexpr i32 kind() && {return 18;}
+                };
+                generic<type T> requires (SameType<T,Item&> ||
+                    SameType<T,const<Item>&> || SameType<T,Item>)
+                constexpr i32 kind(forward T item){
+                    return ::std::forward<T>(item).kind();
+                }
+                constexpr i32 expiring(kind(Item()));
+                i32 main(){Item item;const Item read_only;
+                    return kind(item)+kind(read_only)+expiring;
+                }
+            """),
+            42,
+        )
+        for source in (
+            "i32 main(){i32 n(42);return std::forward<i32>(n);}",
+            "generic<type T> i32 f(forward T n){return std::forward<i32>(n);}"
+            "i32 main(){i32 n(42);return f(n);}",
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("std::forward", result.stderr)
 
     def test_pack_expansion_and_forwarding(self):
         self.assertEqual(

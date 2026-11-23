@@ -38,6 +38,9 @@ struct Check {
   bool known(const std::string &S) const {
     static const std::set<std::string> Intrinsics = {"std::move",
                                                      "std::forward",
+                                                     "std::ensure",
+                                                     "std::debug_assert",
+                                                     "std::discard",
                                                      "std::to_underlying",
                                                      "std::from_underlying",
                                                      "std::try_from_underlying",
@@ -53,9 +56,12 @@ struct Check {
                                                      "nullptr",
                                                      "true",
                                                      "false"};
-    if (Names.count(S) || Intrinsics.count(S) || integerLibraryName(S) ||
-        floatingSpecialName(S) || builtin(S) || builtinPredicate(S) ||
-        U.Aliases.count(S) || U.Cases.count(S))
+    auto Intrinsic = llvm::StringRef(S);
+    if (Intrinsic.starts_with("::std::"))
+      Intrinsic = Intrinsic.drop_front(2);
+    if (Names.count(S) || Intrinsics.count(Intrinsic.str()) ||
+        integerLibraryName(S) || floatingSpecialName(S) || builtin(S) ||
+        builtinPredicate(S) || U.Aliases.count(S) || U.Cases.count(S))
       return true;
     if (auto Enclosing =
             U.Records.find(llvm::StringRef(Prefix).rtrim(':').str());

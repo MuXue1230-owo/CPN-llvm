@@ -47,6 +47,7 @@ struct Options {
   bool ASCII = false, Check = false, IR = false;
   bool CustomPreset = false;
   bool RawValidation = true;
+  bool DebugAssertions = true;
   bool InterproceduralConstruction = true, InterproceduralEffects = true;
   bool StrictEffectDiagnostics = false;
   Severity Minimum = Severity::Warning;

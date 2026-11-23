@@ -404,8 +404,16 @@ class Parser {
       const bool Shadowed = Unqualified && (HiddenTypes.count(Schema) ||
                                             ValueReceivers.count(Schema));
       auto MemberSchema = CurrentReceiver.Owner + "::" + Schema;
-      const bool MemberBinding =
+      bool MemberBinding =
           Unqualified && OwnMembers.count(MemberSchema) && !Types.count(Schema);
+      if (Application && StringRef(Schema).contains("::")) {
+        auto [Owner, Member] = StringRef(Schema).rsplit("::");
+        if (auto I = NominalReceivers.find((Root ? "::" : "") + Owner.str());
+            I != NominalReceivers.end() && !I->second.Owner.empty()) {
+          MemberSchema = (I->second.Owner + "::" + Member).str();
+          MemberBinding = Families.count(MemberSchema);
+        }
+      }
       const auto &ArgumentSchema = MemberBinding ? MemberSchema : Schema;
       const bool HasFamilySchema = !Shadowed && Families.count(ArgumentSchema);
       const bool UnresolvedIndexType =
@@ -1950,6 +1958,7 @@ class Parser {
       bool Union = Kind == "union", Class = Kind == "class";
       bool Manual = Class && eat("Manual");
       Node R(Union ? Node::Union : Node::Record, name());
+      R.Type = Kind;
       auto Receiver = recordReceiver(R);
       if (!Specialize) {
         auto Bound = G.empty() ? Receiver : ReceiverType{};
@@ -2136,8 +2145,8 @@ class Parser {
 public:
   explicit Parser(std::vector<Token> T)
       : Tokens(std::make_shared<std::vector<Token>>(std::move(T))) {
-    Types.insert(
-        {"std::AccessError", "std::Ref", "std::ScalarError", "std::Result"});
+    Types.insert({"std::Unit", "std::AccessError", "std::Ref",
+                  "std::ScalarError", "std::Result"});
     Types.insert({"std::mem::StorageView", "std::mem::StorageIdentity"});
     Types.insert({"std::numeric::NumericResult", "std::numeric::NumericStatus",
                   "std::numeric::NumericErrorCode", "std::numeric::FPFlag",
@@ -2214,6 +2223,7 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     Default("effects.inference", O.InterproceduralEffects, Debug);
     Default("effects.diagnostics", O.StrictEffectDiagnostics, false);
     Default("memory.raw_validation", O.RawValidation, Debug);
+    Default("library.debug_assertions", O.DebugAssertions, Debug);
     Default("numeric.fp.profile", O.FPProfile, Debug ? "strict" : "native");
     Default("numeric.integer.overflow", O.Overflow,
             Debug ? "checked" : "native");
@@ -2285,6 +2295,12 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       if (V != "available" && V != "contract")
         fail(N.At, "CFG001: invalid raw memory validation policy");
       O.RawValidation = V == "available";
+      continue;
+    }
+    if (K == "library.debug_assertions") {
+      if (V != "true" && V != "false")
+        fail(N.At, "CFG001: expected Boolean library.debug_assertions");
+      O.DebugAssertions = V == "true";
       continue;
     }
     if (StringRef(K).starts_with("contracts.")) {

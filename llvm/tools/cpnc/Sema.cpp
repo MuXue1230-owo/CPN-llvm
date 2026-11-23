@@ -141,8 +141,10 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     fail(At, "function type requires a pointer");
   if (Enums.count(T))
     return ir(Enums.at(T), At);
-  if (Records.count(T))
+  if (Records.count(T)) {
+    completeMemberType(T, At);
     return Records.at(T).IR;
+  }
   fail(At, "unsupported or unknown type '" + T + "'");
 }
 Frame::Frame(Context &U, Function *F, llvm::Function *IR, std::string P)
@@ -448,7 +450,7 @@ std::optional<std::string> Frame::memberQualifier(const std::string &S,
                      }) ||
         !scopeKey(Prefix, Head, [&](const std::string &K) {
            return U.Records.count(K) || U.Aliases.count(K) ||
-                  U.Families.count(K) || U.MemberAliasSites.count(K);
+                  U.Families.count(K) || U.MemberTypes.count(K);
          }).empty()) {
       Tail = S.substr(Member + 2);
       return resolve(Qualifier, At);
@@ -539,11 +541,18 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (auto Owner = memberQualifier(S, At, Tail)) {
     auto Key = *Owner + "::" + Tail.substr(0, Tail.find('<'));
     auto It = U.MemberTypes.find(Key);
+    if (It == U.MemberTypes.end()) {
+      U.completeMemberType(*Owner, At);
+      It = U.MemberTypes.find(Key);
+    }
     if (It == U.MemberTypes.end())
       fail(At, "unknown nested type '" + Tail + "'");
-    checkAccess(It->second.second, *Owner, At);
-    if (It->second.second.K == Node::Alias)
+    const auto &Decl = It->second.first();
+    checkAccess(Decl, *Owner, At);
+    if (Decl.K == Node::Alias)
       return U.bindMemberAlias(Key);
+    if (Decl.K == Node::Enumeration)
+      U.completeMemberType(Key, At);
     if (U.Records.count(Key) || U.Enums.count(Key))
       return Key;
     // Instantiate a nested family using the fully resolved owning scope.
@@ -553,13 +562,16 @@ std::string Frame::resolve(std::string S, const Token &At) {
   auto Base = S.substr(0, S.find('<'));
   auto Key = scopeKey(Prefix, Base, [&](const std::string &K) {
     return U.Aliases.count(K) || U.Records.count(K) || U.Enums.count(K) ||
-           U.Families.count(K) || U.MemberAliasSites.count(K);
+           U.Families.count(K) || U.MemberTypes.count(K);
   });
   if (!Key.empty()) {
     if (auto It = U.MemberTypes.find(Key); It != U.MemberTypes.end()) {
-      checkAccess(It->second.second, It->second.first, At);
-      if (It->second.second.K == Node::Alias)
+      const auto &Decl = It->second.first();
+      checkAccess(Decl, It->second.Owner, At);
+      if (Decl.K == Node::Alias)
         return U.bindMemberAlias(Key);
+      if (Decl.K == Node::Enumeration || !Decl.Generics.empty())
+        U.completeMemberType(Key, At);
     }
     if (U.Families.count(Key) && S.find('<') != std::string::npos) {
       auto Fam = U.Families.at(Key);
@@ -1071,15 +1083,36 @@ void Context::enumeration(Frame &F, const Node &D, const std::string &Name) {
   }
 }
 
-void Context::indexMemberAliases(llvm::ArrayRef<Node> Members,
-                                 const std::string &Owner) {
+static bool isMemberType(const Node &D) {
+  return D.K == Node::Alias || D.K == Node::Enumeration ||
+         D.K == Node::Record || D.K == Node::Union;
+}
+
+void Context::indexMemberTypes(llvm::ArrayRef<Node> Members,
+                               const std::string &Owner) {
   for (const auto &D : Members) {
-    if (D.K != Node::Alias)
+    if (!isMemberType(D))
       continue;
     auto Key = Owner + "::" + D.Text;
-    if (!MemberTypes.try_emplace(Key, Owner, D).second)
-      fail(D.At, "duplicate nested type alias");
-    MemberAliasSites.emplace(Key, site());
+    auto [It, New] =
+        MemberTypes.try_emplace(Key, MemberType{Owner, {}, site()});
+    auto &Entry = It->second;
+    if (!New) {
+      const auto &First = Entry.first();
+      if (D.K == Node::Alias && First.K == Node::Alias)
+        fail(D.At, "duplicate nested type alias");
+      if (First.K != D.K || (D.K == Node::Record && First.Type != D.Type) ||
+          First.Settings.at("access") != D.Settings.at("access"))
+        fail(D.At, "conflicting nested type declaration");
+    }
+    Entry.Declarations.push_back(D);
+    if (New && D.Generics.empty() &&
+        (D.K == Node::Record || D.K == Node::Union)) {
+      // A pointer or reference needs the nominal identity, even on a cycle.
+      auto &R = Records[Key];
+      R.Decl = D;
+      R.IR = llvm::StructType::create(C, "cpn." + Key);
+    }
   }
 }
 
@@ -1088,7 +1121,7 @@ std::string Context::bindMemberAlias(const std::string &Key) {
     return Bound->second;
   llvm::SaveAndRestore Depth(MemberAliasDepth, MemberAliasDepth + 1);
   if (MemberAliasDepth > 128)
-    throw ResourceExhausted{{MemberTypes.at(Key).second.At,
+    throw ResourceExhausted{{MemberTypes.at(Key).first().At,
                              "nested type alias dependency depth exhausted"}};
 
   llvm::SmallVector<std::string> Pending;
@@ -1099,20 +1132,25 @@ std::string Context::bindMemberAlias(const std::string &Key) {
   // Follow plain sibling names without recursing through type resolution.
   const auto *Next = &Key;
   while (true) {
-    const auto &[Owner, D] = MemberTypes.at(*Next);
+    const auto &Entry = MemberTypes.at(*Next);
+    const auto &Owner = Entry.Owner;
+    const auto &D = Entry.first();
     if (!BindingMemberAliases.insert(*Next).second)
       fail(D.At, "cyclic nested type alias");
     Pending.push_back(*Next);
     if (!identifier(D.Type) || Records.at(Owner).Env.Types.count(D.Type))
       break;
-    auto Target = MemberAliasSites.find(Owner + "::" + D.Type);
-    if (Target == MemberAliasSites.end() || Aliases.count(Target->first))
+    auto Target = MemberTypes.find(Owner + "::" + D.Type);
+    if (Target == MemberTypes.end() ||
+        Target->second.first().K != Node::Alias || Aliases.count(Target->first))
       break;
     Next = &Target->first;
   }
   for (const auto &Name : llvm::reverse(Pending)) {
-    const auto &[Owner, D] = MemberTypes.at(Name);
-    EnterDefinition Definition(*this, MemberAliasSites.at(Name));
+    const auto &Entry = MemberTypes.at(Name);
+    const auto &Owner = Entry.Owner;
+    const auto &D = Entry.first();
+    EnterDefinition Definition(*this, Entry.Site);
     for (const auto &Config : D.Policies)
       configure(Opt, Config, ConfigScope::Declaration);
     Frame Check(*this, nullptr, nullptr, Owner + "::");
@@ -1122,42 +1160,53 @@ std::string Context::bindMemberAlias(const std::string &Key) {
   return Aliases.at(Key);
 }
 
-void Context::bindMemberAliases(llvm::ArrayRef<Node> Members,
-                                const std::string &Owner) {
+void Context::completeMemberTypes(llvm::ArrayRef<Node> Members,
+                                  const std::string &Owner) {
   for (const auto &D : Members)
-    if (D.K == Node::Alias)
-      bindMemberAlias(Owner + "::" + D.Text);
+    if (isMemberType(D))
+      completeMemberType(Owner + "::" + D.Text, D.At);
 }
 
-bool Context::nestedType(const Node &D, const std::string &Owner,
-                         Frame &Check) {
-  if (D.K == Node::Alias)
-    return true;
-  if (D.K != Node::Enumeration && D.K != Node::Record && D.K != Node::Union)
-    return false;
-  std::string Prefix = Owner + "::", Key = Prefix + D.Text;
-  auto [It, New] = MemberTypes.try_emplace(Key, Owner, D);
-  if (!New &&
-      (It->second.second.K != D.K ||
-       It->second.second.Settings.at("access") != D.Settings.at("access")))
-    fail(D.At, "conflicting nested type declaration");
+void Context::completeMemberType(const std::string &Key, const Token &At) {
+  auto It = MemberTypes.find(Key);
+  if (It == MemberTypes.end() || It->second.Bound)
+    return;
+  auto &Entry = It->second;
+  const auto &Owner = Entry.Owner;
+  if (Entry.Binding) {
+    if (Records.count(Key) || Enums.count(Key))
+      return;
+    fail(At, "cyclic nested type dependency");
+  }
+  if (Entry.first().K == Node::Alias) {
+    bindMemberAlias(Key);
+    Entry.Bound = true;
+    return;
+  }
+  llvm::SaveAndRestore Binding(Entry.Binding, true);
+  if (RecordLayoutDepth > 128)
+    throw ResourceExhausted{{At, "nested type definition depth exhausted"}};
+  auto Prefix = Owner + "::";
   auto &Parent = Records.at(Owner);
-  llvm::SaveAndRestore Policy(Opt);
-  for (auto &Config : D.Policies)
-    configure(Opt, Config, ConfigScope::Declaration);
-  llvm::SaveAndRestore LocalPolicy(Check.Opt, Opt);
-  if (!D.Generics.empty()) {
-    validate(D, Prefix);
-    checkDomain(D, Prefix);
-    if (!Families.emplace(Key, Family{D, Prefix, site(), Parent.Env}).second)
-      fail(D.At, "duplicate nested generic declaration");
-  } else if (D.K == Node::Enumeration)
-    enumeration(Check, D, Key);
-  else if (D.K == Node::Record)
-    record(D, Key, Prefix, Parent.Env);
-  else
-    tagged(D, Key, Prefix, Parent.Env);
-  return true;
+  for (const auto &D : Entry.Declarations) {
+    EnterDefinition Definition(*this, Entry.Site);
+    for (const auto &Config : D.Policies)
+      configure(Opt, Config, ConfigScope::Declaration);
+    if (!D.Generics.empty()) {
+      validate(D, Prefix);
+      checkDomain(D, Prefix);
+      if (!Families.emplace(Key, Family{D, Prefix, site(), Parent.Env}).second)
+        fail(D.At, "duplicate nested generic declaration");
+    } else if (D.K == Node::Enumeration) {
+      Frame Check(*this, nullptr, nullptr, Prefix);
+      Check.Env = Parent.Env;
+      enumeration(Check, D, Key);
+    } else if (D.K == Node::Record)
+      record(D, Key, Prefix, Parent.Env);
+    else
+      tagged(D, Key, Prefix, Parent.Env);
+  }
+  Entry.Bound = true;
 }
 
 void Context::record(const Node &N, const std::string &Name,
@@ -1165,7 +1214,7 @@ void Context::record(const Node &N, const std::string &Name,
   auto &R = Records[Name];
   if (R.Complete)
     fail(N.At, "duplicate record definition");
-  if (R.IR && R.Decl.K != Node::Record)
+  if (R.IR && (R.Decl.K != Node::Record || R.Decl.Type != N.Type))
     fail(N.At, "conflicting nominal declaration");
   if (!R.IR)
     R.IR = llvm::StructType::create(C, "cpn." + Name);
@@ -1173,18 +1222,23 @@ void Context::record(const Node &N, const std::string &Name,
     R.Decl = N;
     return;
   }
+  llvm::SaveAndRestore Depth(RecordLayoutDepth, RecordLayoutDepth + 1);
+  const auto PendingOnEntry = PendingRecordBodies.size();
+  auto DiscardBodies =
+      llvm::scope_exit([&] { PendingRecordBodies.resize(PendingOnEntry); });
   R.Decl = N;
   R.EnclosingScope = StringRef(P).rtrim(':').str();
   R.Env = E;
   R.Env.Types[N.Text] = Name;
   Frame Check(*this, nullptr, nullptr, Name + "::");
   Check.Env = R.Env;
-  indexMemberAliases(N.Children, Name);
+  indexMemberTypes(N.Children, Name);
   std::vector<llvm::Type *> Layout;
   std::vector<std::pair<std::string, bool>> Direct;
   std::set<std::string> Seen;
   for (const auto &Base : N.TemplateArgs) {
     auto T = Check.resolve(Base.Type, Base.At);
+    completeMemberType(T, Base.At);
     if (!Records.count(T) || !Records.at(T).Complete ||
         Records.at(T).Decl.K != Node::Record)
       fail(Base.At, "base requires a complete record");
@@ -1220,17 +1274,11 @@ void Context::record(const Node &N, const std::string &Name,
                                llvm::Type::getInt8Ty(C), 0))
                          : Records.at(T).Layer);
   }
-  for (auto &D : N.Children) {
-    if (nestedType(D, Name, Check))
-      continue;
+  for (auto &D : N.Children)
     if (D.K == Node::Field && D.Settings.count("storage") &&
         !StaticMembers.emplace(Name + "::" + D.Text, std::make_pair(Name, D))
              .second)
       fail(D.At, "duplicate static member");
-  }
-  // Field layout uses the member type index even when a type's definition
-  // follows the field that uses it. The layout still follows field order.
-  bindMemberAliases(N.Children, Name);
   for (auto &D : N.Children) {
     if (D.K == Node::Field && !D.Settings.count("storage")) {
       llvm::SaveAndRestore Policy(Check.Opt);
@@ -1280,7 +1328,10 @@ void Context::record(const Node &N, const std::string &Name,
   }
   R.IR->setBody(Layout);
   R.Complete = true;
+  completeMemberTypes(N.Children, Name);
   declareMembers(Name, Name + "::");
+  finishRecordBodies();
+  DiscardBodies.release();
 }
 void Context::declareMembers(const std::string &Name, const std::string &P) {
   auto &R = Records.at(Name);
@@ -1374,16 +1425,33 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
     Check.object(D, true);
   }
   buildTables(Name, Members);
-  for (auto *F : Members)
-    bindContracts(*F);
-  validateOverrides(Name, Members);
-  validateInvariants(Name);
-  if (auto Bodies = OwnerBodies.find({N.At.Line, N.At.Column});
-      Bodies != OwnerBodies.end())
-    for (const auto &[Site, Definition] : Bodies->second)
-      bindFamilyMember(Name, Definition);
-  for (auto *F : Members)
-    emit(*F);
+  PendingRecordBodies.push_back({Name, site(), std::move(Members)});
+}
+
+void Context::finishRecordBodies() {
+  if (RecordLayoutDepth != 1)
+    return;
+  llvm::SaveAndRestore Depth(RecordLayoutDepth, 0u);
+  auto Pending = std::move(PendingRecordBodies);
+  PendingRecordBodies.clear();
+  for (const auto &Record : Pending) {
+    EnterDefinition Definition(*this, Record.Site);
+    for (auto *F : Record.Members)
+      bindContracts(*F);
+  }
+  for (const auto &[Name, Site, Members] : Pending) {
+    EnterDefinition Definition(*this, Site);
+    validateOverrides(Name, Members);
+    validateInvariants(Name);
+    const auto &N = Records.at(Name).Decl;
+    if (auto Bodies = OwnerBodies.find({N.At.Line, N.At.Column});
+        Bodies != OwnerBodies.end())
+      for (const auto &[Position, Body] : Bodies->second)
+        bindFamilyMember(Name, Body);
+    for (auto *F : Members)
+      emit(*F);
+    validateDefaultCase(Name);
+  }
 }
 void Context::defineQualified(const Node &D, const std::string &P,
                               const Substitution *Bindings) {

@@ -362,8 +362,12 @@ std::optional<OwnerPattern> matchOwnerPattern(const Context &U,
 std::string deductionType(StringRef Formal, const Value &Actual,
                           StringRef &Pattern) {
   auto Type = Actual.Type;
-  if (Formal.consume_front("forward ") && Actual.Address && !Actual.Expiring)
-    Type += "&";
+  if (Formal.consume_front("forward ")) {
+    if (Actual.Readonly)
+      Type = qualifyConst(Type);
+    if ((Actual.Address || Actual.Location) && !Actual.Expiring)
+      Type += "&";
+  }
   while (Formal.consume_back("&")) {
   }
   if (Formal.starts_with("const<") && Formal.ends_with(">"))

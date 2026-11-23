@@ -419,10 +419,9 @@ void Construction::checkCallArguments(Frame &Em, llvm::ArrayRef<Value> Actual,
                                                          : nullptr;
     if (!Designated)
       continue;
-    const bool Layer = Designated == Object.Address &&
-                       (Argument.Type == Object.Type ||
-                        (Parameter.ends_with("*") &&
-                         unconst(element(Argument.Type)) == Object.Type));
+    const bool Layer = Argument.Type == Object.Type ||
+                       (Parameter.ends_with("*") &&
+                        unconst(element(Argument.Type)) == Object.Type);
     const bool Base = Argument.ConstructionBase &&
                       Argument.ConstructionBase->first == Object.Address;
     if (!Layer && !Base)
@@ -431,12 +430,20 @@ void Construction::checkCallArguments(Frame &Em, llvm::ArrayRef<Value> Actual,
       continue;
     if (Base)
       checkBaseAccess(Em, Argument, At);
-    else if (!Order.empty()) {
-      auto Last = At;
-      Last.Text = Order.back();
-      checkAccess(Em, Last);
-    }
+    else if (!Order.empty())
+      checkSlot(Em, Order.size() - 1, At, Designated);
   }
+}
+
+void Construction::checkReceiver(Frame &Em, const Function &D, const Token &At,
+                                 llvm::Value *Designated) const {
+  if (D.Owner != Object.Type)
+    return;
+  for (auto I : D.RequiresAlive)
+    checkSlot(Em, I, At, Designated);
+  if (D.Initializes.empty() && D.RequiresAlive.empty() && !Order.empty() &&
+      mayAccess(D.Effects, D.PredicateEffects, "this"))
+    checkSlot(Em, Order.size() - 1, At, Designated);
 }
 
 llvm::Value *Construction::admitCall(Frame &Em, const Function &D,
@@ -447,20 +454,9 @@ llvm::Value *Construction::admitCall(Frame &Em, const Function &D,
            "LIFE001: initializes requires Pending slots in the receiver layer");
     return nullptr;
   }
-  for (auto I : D.RequiresAlive) {
-    auto T = At;
-    T.Text = Order[I];
-    checkAccess(Em, T);
-  }
-  if (D.Initializes.empty()) {
-    if (D.RequiresAlive.empty() && !Order.empty() &&
-        mayAccess(D.Effects, D.PredicateEffects, "this")) {
-      auto Last = At;
-      Last.Text = Order.back();
-      checkAccess(Em, Last);
-    }
+  checkReceiver(Em, D, At);
+  if (D.Initializes.empty())
     return nullptr;
-  }
   auto States = positions();
   unsigned First = *D.Initializes.begin();
   if (!States.count(First))
