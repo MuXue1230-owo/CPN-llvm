@@ -41,6 +41,8 @@ struct Invocation {
   llvm::CallBase &Call;
   const Invocation *Caller;
 };
+using UnionPayloads =
+    std::map<llvm::Type *, llvm::SmallVector<llvm::Type *, 2>>;
 
 // Trace a pointer through native spills. Only a reaching store to the same
 // slot establishes its source. An intervening possible alias makes it unknown.
@@ -53,6 +55,7 @@ class EscapeCheck {
   llvm::Value *Result;
   llvm::Type *ResultType;
   const std::map<llvm::Value *, llvm::Type *> &Globals;
+  const UnionPayloads &Payloads;
   const llvm::SmallPtrSetImpl<llvm::Function *> &Definitions;
   const llvm::SmallPtrSetImpl<llvm::Function *> &TrivialDrops;
   bool StableRegistrations;
@@ -62,6 +65,16 @@ class EscapeCheck {
     int64_t Offset = 0;
     auto *Base = llvm::GetPointerBaseWithConstantOffset(P, Offset, DL);
     return {Base, Offset};
+  }
+  std::optional<Slot> callerSlot(Slot Target,
+                                 const Invocation &Activation) const {
+    auto *A = llvm::dyn_cast<llvm::Argument>(Target.Base);
+    if (!A)
+      return Target;
+    auto Actual = slot(Activation.Call.getArgOperand(A->getArgNo()));
+    if (llvm::AddOverflow(Actual.Offset, Target.Offset, Actual.Offset))
+      return std::nullopt;
+    return Actual;
   }
   bool disjoint(Slot A, Slot B, uint64_t Size) const {
     if (A.Base == B.Base) {
@@ -222,11 +235,11 @@ class EscapeCheck {
           auto *A = llvm::dyn_cast<llvm::Argument>(Target.Base);
           if (!A)
             return std::nullopt;
-          auto &Call = Activation->Call;
-          auto Actual = slot(Call.getArgOperand(A->getArgNo()));
-          if (llvm::AddOverflow(Actual.Offset, Target.Offset, Actual.Offset))
+          auto Actual = callerSlot(Target, *Activation);
+          if (!Actual)
             return std::nullopt;
-          return reachingStore(Actual, Call.getParent(), Call.getIterator(),
+          auto &Call = Activation->Call;
+          return reachingStore(*Actual, Call.getParent(), Call.getIterator(),
                                Budget, Activation->Caller);
         }
         BB = BB->getSinglePredecessor();
@@ -281,6 +294,13 @@ class EscapeCheck {
         return !Offset;
       if (auto *S = llvm::dyn_cast<llvm::StructType>(T)) {
         auto *Layout = DL.getStructLayout(S);
+        if (auto U = Payloads.find(S); U != Payloads.end()) {
+          const uint64_t Start = Layout->getElementOffset(2);
+          return Offset >= Start &&
+                 llvm::any_of(U->second, [&](llvm::Type *Alternative) {
+                   return pointerAt(Alternative, Offset - Start);
+                 });
+        }
         unsigned I = Layout->getElementContainingOffset(Offset);
         Offset -= Layout->getElementOffset(I);
         T = S->getElementType(I);
@@ -340,9 +360,14 @@ class EscapeCheck {
                          const Invocation *Activation) const {
     if (!survivesReturn(S, Dest, Budget))
       return false;
-    for (; Activation; Activation = Activation->Caller)
+    for (; Activation; Activation = Activation->Caller) {
+      auto Actual = callerSlot(Dest, *Activation);
+      if (!Actual)
+        return false;
+      Dest = *Actual;
       if (!survivesReturn(Activation->Call, Dest, Budget))
         return false;
+    }
     return true;
   }
 
@@ -406,20 +431,37 @@ class EscapeCheck {
           }
           continue;
         }
-        // A known callee can retain a caller's borrow by storing it in a
-        // static cell. Check the value surviving all the enclosing calls.
+        // A known callee can retain a borrow through a static cell or a field
+        // built directly in the caller's result storage.
         auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I);
         if (!Activation || !Store ||
             !Store->getValueOperand()->getType()->isPointerTy())
           continue;
         auto Dest = slot(Store->getPointerOperand());
-        auto Global = Globals.find(Dest.Base);
-        if (Global == Globals.end() || Dest.Offset < 0 ||
-            !pointerAt(Global->second, Dest.Offset))
+        std::optional<Slot> Published = Dest;
+        for (auto *A = Activation; A && Published; A = A->Caller)
+          Published = callerSlot(*Published, *A);
+        if (!Published || Published->Offset < 0)
           continue;
+        const bool Returning = Published->Base == Result;
+        auto Global = Globals.find(Published->Base);
+        auto *Type = Returning                 ? ResultType
+                     : Global != Globals.end() ? Global->second
+                                               : nullptr;
+        if (!Type || !pointerAt(Type, Published->Offset))
+          continue;
+        const auto &Prohibited = Returning ? NoPublication : NoRetention;
+        auto RestrictedPublication = [&](llvm::Value *V) {
+          return Prohibited.contains(V);
+        };
         auto *Stored = Store->getValueOperand();
         unsigned Trace = 256;
-        if (!originatesFrom(Stored, Trace, HasLifetimeObligation, Activation))
+        if (!originatesFrom(
+                Stored, Trace,
+                [&](llvm::Value *V) {
+                  return AutomaticHere(V) || RestrictedPublication(V);
+                },
+                Activation))
           continue;
         Trace = 256;
         if (!publishedAtReturn(*Store, Dest, Trace, Activation))
@@ -429,7 +471,7 @@ class EscapeCheck {
           Outermost = Outermost->Caller;
         auto Site = callSite(Outermost->Call, At);
         Trace = 256;
-        if (originatesFrom(Stored, Trace, Restricted, Activation))
+        if (originatesFrom(Stored, Trace, RestrictedPublication, Activation))
           fail(Site,
                "escaping borrow violates the declared parameter contract");
         fail(Site, "borrow of automatic storage escapes through a call");
@@ -445,13 +487,15 @@ class EscapeCheck {
 public:
   EscapeCheck(Context &U, Function &D, llvm::Function &F,
               const std::map<llvm::Value *, llvm::Type *> &Globals,
+              const UnionPayloads &Payloads,
               const llvm::SmallPtrSetImpl<llvm::Function *> &Definitions,
               const llvm::SmallPtrSetImpl<llvm::Function *> &TrivialDrops,
               bool StableRegistrations)
       : DL(U.M.getDataLayout()), Root(F),
         Input(D.Definition.Configuration.Input), Result(nullptr),
-        ResultType(nullptr), Globals(Globals), Definitions(Definitions),
-        TrivialDrops(TrivialDrops), StableRegistrations(StableRegistrations) {
+        ResultType(nullptr), Globals(Globals), Payloads(Payloads),
+        Definitions(Definitions), TrivialDrops(TrivialDrops),
+        StableRegistrations(StableRegistrations) {
     unsigned I = 0;
     if (U.aggregate(D.Result)) {
       Result = F.getArg(I++);
@@ -567,6 +611,12 @@ void Context::checkBorrowEscapes() {
   for (const auto &[Name, V] : Globals)
     if (auto *G = llvm::dyn_cast_or_null<llvm::GlobalVariable>(V.Address))
       StaticObjects[G] = G->getValueType();
+  UnionPayloads Payloads;
+  for (const auto &[Name, Alternatives] : Variants) {
+    auto &Types = Payloads[Records.at(Name).IR];
+    for (const auto &Case : Alternatives)
+      Types.push_back(Cases.at(Case).Payload);
+  }
   llvm::SmallPtrSet<llvm::Function *, 32> Definitions;
   for (auto &D : Functions)
     for (auto *F : {D.IR, D.BaseIR})
@@ -575,23 +625,37 @@ void Context::checkBorrowEscapes() {
   for (const auto &[Name, R] : Records)
     if (R.ClosureEntry && !R.ClosureEntry->empty())
       Definitions.insert(R.ClosureEntry);
-  // When no extent can be replaced, an implicit closure drop with scalar
-  // captures only updates the compiler's lifetime sidecars.
+  // When no extent can be replaced, implicit cleanup of scalar captures or
+  // scalar union payloads only updates the compiler's lifetime sidecars.
   llvm::SmallPtrSet<llvm::Function *, 8> TrivialDrops;
   auto *ExtentCheck = M.getFunction("cpn.extent.valid");
   bool StableRegistrations = !ExtentCheck || ExtentCheck->use_empty();
-  if (StableRegistrations)
-    for (const auto &[Type, Drop] : CleanupEntries)
-      if (auto R = Records.find(Type);
-          R != Records.end() && R->second.Decl.K == Node::Lambda &&
+  if (StableRegistrations) {
+    auto ScalarOnly = [&](const std::vector<std::string> &Types) {
+      return llvm::none_of(Types, [&](const auto &T) { return aggregate(T); });
+    };
+    for (const auto &[Type, Drop] : CleanupEntries) {
+      auto R = Records.find(Type);
+      if (R == Records.end())
+        continue;
+      if (R->second.Decl.K == Node::Lambda &&
           llvm::none_of(R->second.Fields,
                         [&](const Field &F) { return aggregate(F.Type); }))
         TrivialDrops.insert(Drop);
+      auto Alternatives = Variants.find(Type);
+      if (Alternatives != Variants.end() &&
+          !Overloads.count(Type + "::$drop") &&
+          llvm::all_of(Alternatives->second, [&](const auto &Alternative) {
+            return ScalarOnly(Cases.at(Alternative).Types);
+          }))
+        TrivialDrops.insert(Drop);
+    }
+  }
   for (auto &D : Functions)
     for (auto *F : {D.IR, D.BaseIR})
       if (Definitions.contains(F))
-        EscapeCheck(*this, D, *F, StaticObjects, Definitions, TrivialDrops,
-                    StableRegistrations)
+        EscapeCheck(*this, D, *F, StaticObjects, Payloads, Definitions,
+                    TrivialDrops, StableRegistrations)
             .verify(D.Decl.At);
   for (auto &F : M)
     for (auto &I : llvm::instructions(F))

@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/FloatingPointMode.h"
 #include "llvm/ADT/StringSwitch.h"
 
 using namespace cpn;
@@ -20,7 +21,7 @@ enum class Operation {
   Magnitude,
   Cast
 };
-enum class Projection { Checked, Wrapping, Saturating, Ordinary };
+using Projection = NumericProjection;
 enum class BitOperation { Reinterpret, Extract, Insert };
 enum class Extension { Source, Zero, Sign };
 struct BitInterface {
@@ -109,7 +110,7 @@ std::optional<NumericOperation> lookupOperation(StringRef Name) {
     Policy = Projection::Saturating;
   else if (Name == "exact_cast" || Name == "truncating_cast")
     return NumericOperation{Operation::Cast,
-                            Name == "exact_cast" ? Projection::Checked
+                            Name == "exact_cast" ? Projection::Exact
                                                  : Projection::Wrapping,
                             Result};
   else {
@@ -329,7 +330,8 @@ Value numericTarget(Frame &F, const Node &Arg) {
 Value deliverInteger(Frame &F, const Token &At, Value Number,
                      const Value &Target, llvm::Value *Failed,
                      llvm::Value *Code, llvm::Value *Changed,
-                     llvm::Value *Clamped, llvm::Value *Wrapped) {
+                     llvm::Value *Clamped, llvm::Value *Wrapped,
+                     llvm::Value *FPFlags = nullptr) {
   bool Assign = !Target.Type.empty();
   auto Commit = [&] {
     if (F.IR)
@@ -342,7 +344,8 @@ Value deliverInteger(Frame &F, const Token &At, Value Number,
                          Assign ? nullptr : Number.IR, Failed, Code, Changed,
                          Clamped, Wrapped,
                          Assign ? llvm::function_ref<void()>(Commit)
-                                : llvm::function_ref<void()>());
+                                : llvm::function_ref<void()>(),
+                         FPFlags);
   if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Failed);
       Known && !Known->isZero()) {
     if (!F.IR)
@@ -354,6 +357,71 @@ Value deliverInteger(Frame &F, const Token &At, Value Number,
   if (Assign)
     Commit();
   return Assign ? Value{"void"} : Number;
+}
+
+std::optional<llvm::RoundingMode> roundingCase(StringRef Name) {
+  using R = llvm::RoundingMode;
+  return llvm::StringSwitch<std::optional<R>>(Name)
+      .Case("NearestTiesEven", R::NearestTiesToEven)
+      .Case("NearestTiesAway", R::NearestTiesToAway)
+      .Case("TowardZero", R::TowardZero)
+      .Case("TowardPositiveInfinity", R::TowardPositive)
+      .Case("TowardNegativeInfinity", R::TowardNegative)
+      .Default(std::nullopt);
+}
+
+Value namedCast(Frame &F, const Node &Call, const NumericOperation &Spec,
+                const std::vector<Node> &Args) {
+  if (Call.TemplateArgs.size() != 1 || Args.empty() || Args.size() > 2 ||
+      (Args.size() == 2 && Spec.Policy != Projection::Checked &&
+       Spec.Policy != Projection::Saturating))
+    fail(Call.At, "invalid named numeric cast arguments");
+  auto T = F.resolve(Call.TemplateArgs.front().Type, Call.At);
+  const bool IntegerDestination = integer(T) && T != "integer";
+  if (!IntegerDestination && !floating(T))
+    fail(Call.At, "named numeric cast requires an enabled scalar destination");
+  if (!IntegerDestination && Spec.Policy != Projection::Checked &&
+      Spec.Policy != Projection::Exact)
+    fail(Call.At, "numeric cast has no such mapping to a floating destination");
+  auto Source = F.load(F.eval(Args.front()));
+  if (Source.Type == "never")
+    return Source;
+  const bool IntegerSource = integer(Source.Type);
+  if (!IntegerSource && !floating(Source.Type) && Source.Type != "real")
+    fail(Call.At, "named numeric cast requires an integer or real source");
+
+  llvm::Value *Mode = nullptr;
+  if (Args.size() == 2) {
+    const auto &Arg = Args.back();
+    if (IntegerSource && IntegerDestination)
+      fail(Arg.At, "integer-to-integer conversion has no rounding stage");
+    Value Policy;
+    try {
+      Policy = F.load(F.eval(Arg));
+    } catch (const Diagnostic &D) {
+      auto Case = Arg.K == Node::Name ? roundingCase(Arg.Text) : std::nullopt;
+      if (!Case || D.Message != "unknown name '" + Arg.Text + "'")
+        throw;
+      Policy = {"std::numeric::RoundingMode", F.B.getInt8(unsigned(*Case))};
+    }
+    if (Policy.Type == "never")
+      return Policy;
+    if (Policy.Type != "std::numeric::RoundingMode")
+      fail(Arg.At, "numeric cast rounding argument requires RoundingMode");
+    Mode = Policy.IR;
+  }
+  const auto P = F.projectScalarCast(Source, T, Spec.Policy, Mode, Call.At);
+  auto &B = F.B;
+  auto *NotExact = Spec.Policy == Projection::Exact ? P.Inexact : B.getFalse();
+  auto *Failed = B.CreateOr(B.CreateOr(P.NonFinite, P.Outside), NotExact);
+  llvm::Value *Code = nullptr;
+  if (Spec.Result) {
+    Code = B.CreateSelect(P.Outside, numericError(F.U, "OutOfRange"),
+                          numericError(F.U, "NotExactlyRepresentable"));
+    Code = B.CreateSelect(P.NonFinite, numericError(F.U, "NonFinite"), Code);
+  }
+  return deliverInteger(F, Call.At, {T, P.Number}, {}, Failed, Code, P.Inexact,
+                        P.Clamped, P.Wrapped, P.FPFlags);
 }
 
 Value representationSource(Frame &F, Value Input, const Token &At) {
@@ -519,10 +587,22 @@ bool cpn::bitExtensionArgument(const Node &Call) {
          extensionArgument(A.back()).has_value();
 }
 
+bool cpn::castRoundingArgument(const Node &Call) {
+  const auto &A = Call.Children;
+  if (Call.K != Node::Call || A.size() != 3 || A.front().K != Node::Name ||
+      A.back().K != Node::Name || !roundingCase(A.back().Text))
+    return false;
+  const auto Op = lookupOperation(A.front().Text);
+  return Op && Op->Op == Operation::Cast &&
+         (Op->Policy == Projection::Checked ||
+          Op->Policy == Projection::Saturating);
+}
+
 bool cpn::usesNumericLibrary(const Node &D) {
   if (StringRef(D.Type).contains("std::numeric::") ||
       StringRef(D.Text).contains("std::numeric::") ||
-      (D.K == Node::Name && integerLibraryName(D.Text)))
+      (D.K == Node::Name &&
+       (integerLibraryName(D.Text) || floatingSpecialName(D.Text))))
     return true;
   for (const auto *Nodes : {&D.Children, &D.Params, &D.Generics,
                             &D.TemplateArgs, &D.Pattern, &D.Contracts})
@@ -551,6 +631,10 @@ void Context::bindNumericLibrary() {
         enum FPFlag : u8 {
           case Invalid(0), case DivideByZero(1), case Overflow(2),
           case Underflow(3), case Inexact(4)
+        };
+        enum RoundingMode : u8 {
+          case NearestTiesEven(1), case NearestTiesAway(4), case TowardZero(0),
+          case TowardPositiveInfinity(2), case TowardNegativeInfinity(3)
         };
         class FPFlagSet {
           u8 bits;
@@ -650,10 +734,11 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
   auto Spec = lookupOperation(Name);
   if (!Spec)
     return std::nullopt;
+  if (Spec->Op == Operation::Cast)
+    return namedCast(*this, Call, *Spec, Args);
   const auto &[Op, Policy, Fallible, Assign, Report] = *Spec;
   if (Args.size() != (Spec->unary() ? 1u : 2u) ||
-      Call.TemplateArgs.size() > (Spec->destination() ? 1u : 0u) ||
-      (Op == Operation::Cast && Call.TemplateArgs.empty()))
+      Call.TemplateArgs.size() > (Spec->destination() ? 1u : 0u))
     fail(Call.At, "invalid named numeric operation arguments");
   Value Target;
   Value Left;
@@ -813,4 +898,11 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
   return deliverInteger(*this, Call.At, {T, Number}, Target, Failed, Code,
                         Changed, Saturating ? Changed : B.getFalse(),
                         Saturating ? B.getFalse() : Changed);
+}
+
+Value Frame::numericRepresentationResult(const Token &At, const Value &Number,
+                                         llvm::Value *Invalid) {
+  return numericResult(*this, At, Number.Type, Number.IR, Invalid,
+                       numericError(U, "OutOfRange"), B.getFalse(),
+                       B.getFalse(), B.getFalse(), {});
 }

@@ -23,6 +23,35 @@ static std::string read(StringRef Path) {
     fail({}, B.getError().message());
   return (*B)->getBuffer().str();
 }
+static std::string logicalSourcePath(const Options &O) {
+  SmallString<256> Source(O.LogicalSource.empty() ? O.Input : O.LogicalSource);
+  if (!O.LogicalSource.empty()) {
+    sys::path::remove_dots(Source, true);
+    StringRef Path(Source);
+    if (Path.empty() || Path == "." || Path == ".." ||
+        Path.starts_with("../") || sys::path::is_absolute(Path))
+      fail({}, "logical source path must identify a file within the root");
+    return Path.str();
+  }
+
+  SmallString<256> Base;
+  if (O.Config.empty()) {
+    if (auto Error = sys::fs::current_path(Base))
+      fail({}, Error.message());
+  } else {
+    Base = O.Config;
+    if (auto Error = sys::fs::make_absolute(Base))
+      fail({}, Error.message());
+    sys::path::remove_filename(Base);
+  }
+  if (auto Error = sys::fs::make_absolute(Source))
+    fail({}, Error.message());
+  sys::path::remove_dots(Source, true);
+  sys::path::remove_dots(Base, true);
+  if (sys::path::replace_path_prefix(Source, Base, ""))
+    return StringRef(Source).ltrim('/').str();
+  return sys::path::filename(Source).str();
+}
 int main(int argc, char **argv) {
   InitLLVM Init(argc, argv);
   Options O;
@@ -40,7 +69,7 @@ int main(int argc, char **argv) {
       };
       if (A == "--help" || A == "-h") {
         outs() << "Usage: cpnc --std=CPN26 [--check|-S|-c] [-o output] "
-                  "source.cpn\n";
+                  "[--root-id ID] [--logical-source PATH] source.cpn\n";
         return 0;
       }
       if (A == "--std" || A.starts_with("--std=")) {
@@ -49,9 +78,16 @@ int main(int argc, char **argv) {
         Edition = true;
       } else if (A == "-o")
         O.Output = arg("-o");
-      else if (A == "--root-id" || A.starts_with("--root-id="))
+      else if (A == "--root-id" || A.starts_with("--root-id=")) {
         O.RootID = arg("--root-id");
-      else if (A == "--config" || A.starts_with("--config="))
+        if (O.RootID.empty())
+          fail({}, "root identity must not be empty");
+      } else if (A == "--logical-source" ||
+                 A.starts_with("--logical-source=")) {
+        O.LogicalSource = arg("--logical-source");
+        if (O.LogicalSource.empty())
+          fail({}, "logical source path must not be empty");
+      } else if (A == "--config" || A.starts_with("--config="))
         O.Config = arg("--config");
       else if (A == "--identifiers" || A.starts_with("--identifiers=")) {
         Node N;
@@ -93,6 +129,11 @@ int main(int argc, char **argv) {
       }
     }
     Path = O.Input;
+    O.LogicalSource = logicalSourcePath(O);
+    if (O.RootID.empty())
+      O.RootID = O.LogicalSource;
+    if (O.StaticIdentityNamespace.empty())
+      O.StaticIdentityNamespace = O.RootID;
     auto Source = read(Path);
     auto AST = parse(Source, O);
     LLVMInitializeX86TargetInfo();
@@ -108,7 +149,8 @@ int main(int argc, char **argv) {
     std::unique_ptr<TargetMachine> TM(
         Target->createTargetMachine(TT, "generic", "", TO, Reloc::PIC_));
     LLVMContext C;
-    Module M(O.RootID.empty() ? Path : O.RootID, C);
+    Module M(O.RootID, C);
+    M.setSourceFileName(O.LogicalSource);
     M.setTargetTriple(TT);
     M.setDataLayout(TM->createDataLayout());
     compile(M, AST, O);

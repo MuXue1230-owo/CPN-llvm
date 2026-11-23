@@ -31,7 +31,7 @@ struct ConstantStorageSlot {
 };
 struct ConstantStorage : ConstantStorageSlot {
   std::vector<llvm::GlobalVariable *> Designations;
-  std::map<std::vector<unsigned>, ConstantStorageSlot> ArrayElements;
+  std::map<std::vector<unsigned>, ConstantStorageSlot> Subobjects;
   std::shared_ptr<ConstantPlace> OriginalExtent;
 };
 // Each evaluation-local object has its own lifetime. Copying its value creates
@@ -55,6 +55,7 @@ struct Value {
   std::string Storage, RealText;
   llvm::Value *Generation = nullptr, *Slot = nullptr;
   std::string ExtentType;
+  std::optional<std::pair<llvm::Value *, unsigned>> ConstructionBase;
   // Bounds of a pointer value and of a designated array element are distinct
   // for arrays of pointers. BoundsCell follows reassignment of a local pointer.
   llvm::Value *Lower = nullptr, *Upper = nullptr, *BoundsCell = nullptr;
@@ -78,6 +79,7 @@ struct Value {
     Slot = V.Slot;
     Storage = V.Storage;
     ExtentType = V.ExtentType;
+    ConstructionBase = V.ConstructionBase;
     Subobject = V.Subobject;
     BaseView = V.BaseView;
     Lower = V.Lower;
@@ -223,7 +225,9 @@ struct ConstantPlace {
   std::optional<std::weak_ptr<ConstantStorage>> Lifetime;
   void trackLifetime();
   std::vector<unsigned> indices() const;
+  const ConstantStorageSlot *registeredExtent() const;
   ConstantStorageSlot &registerExtent() const;
+  bool hasLiveExtent() const;
   void checkLifetime(const Token &, bool ExtentOnly = false) const;
   Value read(Frame &, const Token &) const;
   void write(Frame &, Value, const Token &) const;
@@ -237,6 +241,7 @@ struct Family {
   std::string Owner{};
   std::optional<Node> Body{};
   std::optional<DefinitionSite> BodySite{};
+  Substitution BodyBindings{};
 };
 struct Context {
   llvm::Module &M;
@@ -318,7 +323,12 @@ struct Context {
   void defineQualified(const Node &, const std::string &,
                        const Substitution * = nullptr);
   struct MemberBody {
-    std::vector<SourcePosition> GenericOwners;
+    struct OwnerBinding {
+      SourcePosition Position;
+      std::vector<Node> Parameters;
+    };
+    std::vector<OwnerBinding> GenericOwners;
+    SourcePosition Member;
     Node Definition;
     DefinitionSite Site;
   };
@@ -359,6 +369,7 @@ struct Context {
   void genericFunction(const Node &, const std::string &, const std::string &,
                        const std::string &Owner = "");
   void attachGenericBody(Function &, const Family &);
+  void setGenericBody(Family &, Node, DefinitionSite, Substitution = {});
   void enumeration(Frame &, const Node &, const std::string &);
   bool nestedType(const Node &, const std::string &, Frame &);
   void tagged(const Node &, const std::string &, const std::string &,
@@ -378,7 +389,8 @@ struct Context {
   void emitForeignContractAdapters();
   JumpCleanups validate(const Node &, const std::string &,
                         const std::string &Owner = "",
-                        const Node *FamilyOwner = nullptr);
+                        const Node *FamilyOwner = nullptr,
+                        const Substitution *Captured = nullptr);
 };
 struct EnterDefinition {
   llvm::SaveAndRestore<Options> OptionsScope;
@@ -401,8 +413,10 @@ std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
 bool sameGenericValueContracts(const Node &, const Node &);
-bool sameGenericArgument(const Node &, const Node &, const Node &SourceBinders,
-                         const Node &TargetBinders);
+std::optional<std::vector<size_t>>
+matchOwnerBinders(llvm::ArrayRef<Node> Pattern, llvm::ArrayRef<Node> Arguments,
+                  llvm::ArrayRef<Node> Formals, llvm::ArrayRef<Node> Binders,
+                  llvm::ArrayRef<size_t> Enclosing);
 EffectBound genericEffectBound(const Node &, bool HasReceiver);
 std::set<llvm::StringRef> callableFlags(llvm::StringRef);
 EffectBound callableEffects(llvm::StringRef);
@@ -430,6 +444,11 @@ bool integer(const std::string &T);
 bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);
 unsigned width(const std::string &T);
+enum class NumericProjection { Checked, Exact, Wrapping, Saturating, Ordinary };
+struct ScalarCastProjection {
+  llvm::Value *Number, *Outside, *NonFinite, *Inexact;
+  llvm::Value *Clamped, *Wrapped, *FPFlags = nullptr;
+};
 struct Local {
   std::map<std::string, Node::Kind> Nominals;
   std::map<std::string, std::string> Aliases;
@@ -499,10 +518,16 @@ public:
   llvm::BasicBlock *InlineReturn = nullptr;
   bool HasDelegated = false;
   std::map<std::string, llvm::Value *> FieldFlags;
+  std::set<std::string> ManualDropSlots;
+  bool InDestructorCleanup = false;
   void retirement();
   void checkAbandon(const std::string &, const Token &);
   void endField(const std::string &, const Token &, bool RunDestructor,
                 bool Explicit);
+  llvm::Value *destructionMemberRegistration(unsigned Index);
+  llvm::Value *destructionSlotAlive(unsigned Index);
+  void checkCleanupFrontier(const std::string &, const Token &);
+  void checkCleanupStorageRequest(Value, bool Destroy);
   std::string directField(const Node &) const;
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
@@ -568,10 +593,15 @@ public:
   Value floatingBinary(const Node &, Value, Value,
                        const std::string &Expected = "",
                        llvm::Value **LocalFlags = nullptr);
+  ScalarCastProjection projectScalarCast(Value, const std::string &,
+                                         NumericProjection, llvm::Value *,
+                                         const Token &);
+  Value numericRepresentationResult(const Token &, const Value &,
+                                    llvm::Value *Invalid);
   Value place(const Node &, bool NeedLive = true);
   Value pointedObject(Value, const Token &);
   Value subscript(const Node &);
-  Value lookup(const Token &);
+  Value lookup(const Token &, bool NeedLive = true);
   std::string resolve(std::string, const Token &);
   std::string materializationType(const std::string &, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
@@ -583,6 +613,8 @@ public:
                                   Value Receiver);
   std::optional<Value> namedInteger(const Node &, llvm::StringRef,
                                     const std::vector<Node> &);
+  std::optional<Value> floatingSpecial(const Node &, llvm::StringRef,
+                                       const std::vector<Node> &);
   CallArguments evaluateArguments(const std::vector<Node> &,
                                   Function *Context = nullptr,
                                   Value SingleDestination = {});
@@ -635,7 +667,7 @@ public:
   void exitInvariantConstructionLifetimes(
       size_t Depth = 0, const std::set<SourcePosition> *Exited = nullptr);
   Function *checkSelected(Function *, const Token &);
-  Value member(Value, const Token &);
+  Value member(Value, const Token &, bool NeedLive = true);
   void stmt(const Node &, llvm::StringRef EntryLabel = {});
   void constantSequence(llvm::ArrayRef<Node>, llvm::StringRef EntryLabel);
   void rewindConstantScope(const ConstantTransfer &, const Token &Destination);
@@ -737,10 +769,11 @@ public:
   void retireConstantCell(Value &, const Token &, bool Explicit = false,
                           bool Destroy = true);
   void retireConstantExtent(ConstantPlace, const Token &, bool Explicit,
-                            bool Destroy);
+                            bool Destroy, bool AsBase = false);
   Value constantStorageCall(const Node &, const std::vector<Node> &);
   Value storageViewObserver(Value, llvm::StringRef, const Token &);
-  void endConstantField(const std::string &, bool, const Token &);
+  void endConstantField(const std::string &, bool, const Token &,
+                        bool Explicit = false);
   void constructorBody(const Node &);
   void bindInlineParams(const std::vector<Value> &,
                         const Function *DefaultDeclaration = nullptr,
@@ -786,6 +819,7 @@ public:
   void restore(const Positions &);
   void restoreFlow(const Node &, bool Exit = false);
   void checkAccess(Frame &, const Token &) const;
+  void checkBaseAccess(Frame &, const Value &, const Token &) const;
   std::optional<Value> firstWrite(Frame &, const Node &);
   bool needsDelegate(const Frame &) const;
 };

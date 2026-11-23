@@ -112,6 +112,37 @@ class Parser {
   std::vector<Token> Tokens;
   size_t Pos = 0;
   std::set<std::string> Types, HiddenTypes, TypeParameters;
+  std::map<std::string, std::string> AliasSchemas;
+  std::map<std::pair<unsigned, unsigned>, std::string> AliasDeclarations;
+  void publishAlias(const Node &Alias, const std::string &Name) {
+    auto I = AliasDeclarations.find({Alias.At.Line, Alias.At.Column});
+    if (I == AliasDeclarations.end())
+      return;
+    StringRef Target(I->second);
+    auto Canonical = Target.str();
+    if (Target.consume_front("::")) {
+      Canonical = Target.str();
+    } else if (!Target.empty()) {
+      StringRef Scope(Name);
+      while (Scope.contains("::")) {
+        Scope = Scope.rsplit("::").first;
+        auto Qualified = (Scope + "::" + Target).str();
+        if (Types.count(Qualified)) {
+          Canonical = std::move(Qualified);
+          break;
+        }
+      }
+    }
+    AliasSchemas[Name] = Canonical;
+    AliasSchemas["::" + Name] = std::move(Canonical);
+  }
+  void publishRootAliases(const Node &Decl) {
+    if (Decl.K == Node::Alias)
+      publishAlias(Decl, Decl.Text);
+    else if (Decl.K == Node::Linkage)
+      for (const auto &Child : Decl.Children)
+        publishRootAliases(Child);
+  }
   void publishMemberNames(const Node &Owner, const std::string &Prefix) {
     for (const auto &C : Owner.Children) {
       auto Key = Prefix + C.Text;
@@ -120,6 +151,8 @@ class Parser {
         Types.insert(Key);
       if (!C.Generics.empty() || C.K == Node::Constraint)
         Families[Key] = C.Generics;
+      if (C.K == Node::Alias)
+        publishAlias(C, Key);
       if (C.K == Node::Record || C.K == Node::Union || C.K == Node::Namespace)
         publishMemberNames(C, Key + "::");
     }
@@ -212,7 +245,8 @@ class Parser {
       Name = peek(I).Text + "::" + Name;
     }
     return known(Name) || Families.count(Name) ||
-           integerLibraryName(Name, true) || builtinPredicate(Name);
+           integerLibraryName(Name, true) || floatingSpecialName(Name) ||
+           builtinPredicate(Name);
   }
   std::optional<unsigned> bitExtractionArity() const {
     // The standard has a single type argument on the dynamic form and two
@@ -245,11 +279,21 @@ class Parser {
     }
     return std::nullopt;
   }
-  Token qualified(bool AllowBuiltin = false, Node *Application = nullptr) {
+  Token qualified(bool AllowBuiltin = false, Node *Application = nullptr,
+                  std::string *NominalSchema = nullptr) {
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
              : AllowBuiltin && builtin(peek().Text) ? take()
                                                     : name();
+    auto AliasSchema = [&](const std::string &S) {
+      auto Head = StringRef(S).split("::").first.str();
+      if (!Root && (HiddenTypes.count(Head) || TypeParameters.count(Head)))
+        return S;
+      if (auto I = AliasSchemas.find(Root ? "::" + S : S);
+          I != AliasSchemas.end() && !I->second.empty())
+        return StringRef(I->second).ltrim(':').str();
+      return S;
+    };
     std::string Schema = T.Text;
     while (true) {
       std::optional<bool> BitArgumentsAreTypes;
@@ -259,7 +303,8 @@ class Parser {
           BitArgumentsAreTypes = *Arity == 1;
       const bool NumericApplication =
           BitArgumentsAreTypes.has_value() ||
-          (Application && is("<") && integerLibraryName(T.Text, true) &&
+          (Application && is("<") &&
+           (integerLibraryName(T.Text, true) || floatingSpecialName(T.Text)) &&
            !bitExtractionName(T.Text) &&
            (StringRef(T.Text).contains("::") ||
             ((Root || !HiddenTypes.count(T.Text)) &&
@@ -289,12 +334,15 @@ class Parser {
       }
       if (!eat("::"))
         break;
+      Schema = AliasSchema(Schema);
       auto Next = Application && is("operator")      ? operatorName()
                   : is("forward") && T.Text == "std" ? take()
                                                      : name();
       T.Text += "::" + Next.Text;
       Schema += "::" + Next.Text;
     }
+    if (NominalSchema)
+      *NominalSchema = (Root ? "::" : "") + AliasSchema(Schema);
     if (Root)
       T.Text = "::" + T.Text;
     return T;
@@ -343,6 +391,7 @@ class Parser {
                    ? It->second[std::min(I, It->second.size() - 1)].K ==
                          Node::TypeParam
                    : ArgumentIsType.value_or(integerLibraryName(Name, true) ||
+                                             floatingSpecialName(Name) ||
                                              known(peek().Text));
       if (T) {
         Node A(Node::TypeArg, peek());
@@ -373,12 +422,12 @@ class Parser {
       *Canonical += ">";
     return Out;
   }
-  std::string type() {
+  std::string type(std::string *NominalSchema = nullptr) {
     Nest Guard(Depth, peek());
     auto T = peek();
     std::string S;
     if (eat("(")) {
-      S = type();
+      S = type(NominalSchema);
       expect(")");
     } else if (eat("decltype")) {
       expect("(");
@@ -455,19 +504,23 @@ class Parser {
     } else {
       if (!is("::") && !identifier(peek().Text))
         fail(T, "unsupported or unknown type '" + T.Text + "'");
-      S = qualified(true).Text;
+      S = qualified(true, nullptr, NominalSchema).Text;
       if (!known(S) && !(StringRef(S).contains("::") &&
                          known(StringRef(S).split("::").first)))
         fail(T, "unsupported or unknown type '" + S + "'");
     }
     for (;;) {
-      if (is("*") || is("&") || is("&&"))
+      if (is("*") || is("&") || is("&&")) {
         S += take().Text;
-      else if (eat("[")) {
+        if (NominalSchema)
+          NominalSchema->clear();
+      } else if (eat("[")) {
         size_t Begin = Pos;
         expr();
         S += "[" + spelling(Begin) + "]";
         expect("]");
+        if (NominalSchema)
+          NominalSchema->clear();
       } else
         break;
     }
@@ -678,6 +731,7 @@ class Parser {
     Nest Guard(Depth, peek());
     auto OuterTypes = Types;
     auto OuterHidden = HiddenTypes;
+    llvm::SaveAndRestore LocalSchemas(AliasSchemas);
     Node B(Node::Block, expect("{"));
     while (!eat("}")) {
       if (Construction && eat("init")) {
@@ -1001,6 +1055,7 @@ class Parser {
   }
   std::vector<Node> generic() {
     std::vector<Node> G;
+    std::set<std::string> Names;
     expect("<");
     do {
       auto T = peek();
@@ -1013,6 +1068,8 @@ class Parser {
       P.Pack = eat("...");
       P.At = name();
       P.Text = P.At.Text;
+      if (!Names.insert(P.Text).second)
+        fail(P.At, "duplicate generic parameter");
       if (P.K == Node::TypeParam) {
         Types.insert(P.Text);
         TypeParameters.insert(P.Text);
@@ -1315,8 +1372,13 @@ class Parser {
       else
         expect("\"C\"");
       if (eat("{")) {
-        while (!eat("}"))
-          N.Children.push_back(declaration(Foreign || !NS));
+        if (NS) {
+          llvm::SaveAndRestore NamespaceAliases(AliasSchemas);
+          while (!eat("}"))
+            N.Children.push_back(declaration(Foreign));
+        } else
+          while (!eat("}"))
+            N.Children.push_back(declaration(true));
       } else if (!NS)
         N.Children.push_back(declaration(true));
       else
@@ -1376,10 +1438,13 @@ class Parser {
     if (eat("alias")) {
       Node N(Node::Alias, name());
       expect("=");
-      N.Type = type();
+      std::string Schema;
+      N.Type = type(&Schema);
       expect(";");
       Types.insert(N.Text);
       HiddenTypes.erase(N.Text);
+      AliasSchemas[N.Text] = Schema;
+      AliasDeclarations[{N.At.Line, N.At.Column}] = std::move(Schema);
       return N;
     }
     auto Saved = Types;
@@ -1405,6 +1470,7 @@ class Parser {
       D.Prototype = true;
       expect(";");
       Types.insert(D.Text);
+      AliasSchemas.erase(D.Text);
       return D;
     }
     bool Specialize = eat("specialize");
@@ -1425,6 +1491,8 @@ class Parser {
         R.Settings["specialize"] = "1";
       }
       Types.insert(R.Text);
+      AliasSchemas.erase(R.Text);
+      auto OuterAliases = AliasSchemas;
       if (!Specialize && !G.empty())
         Families[R.Text] = G;
       if (Requires.K != Node::Empty)
@@ -1545,6 +1613,7 @@ class Parser {
       expect(";");
       Types = std::move(Saved);
       Types.insert(R.Text);
+      AliasSchemas = std::move(OuterAliases);
       publishMemberNames(R, R.Text + "::");
       return R;
     }
@@ -1553,6 +1622,7 @@ class Parser {
       expect(":");
       E.Type = type();
       Types.insert(E.Text);
+      AliasSchemas.erase(E.Text);
       expect("{");
       if (is("}"))
         fail(peek(), "enum requires a case");
@@ -1673,12 +1743,14 @@ class Parser {
 
 public:
   explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {
-    Types.insert({"std::ScalarError", "std::Result"});
+    Types.insert(
+        {"std::AccessError", "std::Ref", "std::ScalarError", "std::Result"});
     Types.insert({"std::mem::StorageView", "std::mem::StorageIdentity"});
     Types.insert({"std::numeric::NumericResult", "std::numeric::NumericStatus",
                   "std::numeric::NumericErrorCode", "std::numeric::FPFlag",
-                  "std::numeric::FPFlagSet"});
+                  "std::numeric::FPFlagSet", "std::numeric::RoundingMode"});
     Node TypeParam(Node::TypeParam, {});
+    Families["std::Ref"] = {TypeParam};
     Families["std::Result"] = {TypeParam, TypeParam};
     Families["std::numeric::NumericResult"] = {TypeParam};
     Families["std::from_underlying"] = {TypeParam};
@@ -1686,8 +1758,11 @@ public:
   }
   std::vector<Node> unit() {
     std::vector<Node> V;
-    while (!is(""))
-      V.push_back(declaration());
+    while (!is("")) {
+      auto D = declaration();
+      publishRootAliases(D);
+      V.push_back(std::move(D));
+    }
     for (auto &[Key, Query] : TypeQueries)
       V.push_back(std::move(Query));
     return V;
@@ -1753,16 +1828,38 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (K == "preset")
       continue;
     O.ExplicitConfiguration.insert(K);
-    if (K == "compilation.modules" || K == "compilation.separate" ||
-        K == "tooling.contract_export") {
+    auto StringValue = [&] {
+      if (!StringRef(V).starts_with('"'))
+        fail(N.At, "CFG001: " + K + " requires a string");
+      return unquote({V, N.At.Line, N.At.Column});
+    };
+    static const std::map<StringRef, ConfigScope> UnavailableCapabilities{
+        {"compilation.modules", ConfigScope::Project},
+        {"compilation.separate", ConfigScope::Project},
+        {"tooling.contract_export", ConfigScope::Project},
+        {"exceptions.language", ConfigScope::Project},
+        {"exceptions.secondary.dynamic_storage", ConfigScope::Project},
+        {"generic.higher_kinds", ConfigScope::Declaration},
+        {"generic.associated_entities", ConfigScope::Declaration},
+        {"meta.reflection", ConfigScope::Declaration},
+        {"meta.generate", ConfigScope::Declaration},
+        {"meta.generate_layout", ConfigScope::Declaration},
+        {"numeric.software_fallback", ConfigScope::Declaration},
+        {"atomic.software_fallback", ConfigScope::Declaration},
+    };
+    if (auto It = UnavailableCapabilities.find(K);
+        It != UnavailableCapabilities.end()) {
       if (V == "true")
         fail(N.At, "CFG002: " + K + " is unavailable");
       if (V != "false")
         fail(N.At, "CFG001: expected Boolean value for " + K);
+      if (Scope > It->second)
+        fail(N.At, "CFG001: " + K + " is outside its configuration scope");
+      continue;
     }
     if ((K == "target" || K == "source.identifiers" ||
-         K == "source.unicode_version" || K == "compilation.modules" ||
-         K == "compilation.separate" || K == "tooling.contract_export") &&
+         K == "source.unicode_version" || K == "static.schedule" ||
+         K == "static.workers" || K == "static.identity_namespace") &&
         Scope != ConfigScope::Project)
       fail(N.At, "CFG001: " + K +
                      " must be bound before source tokenization or binding");
@@ -1770,9 +1867,24 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
         Scope > ConfigScope::Declaration)
       fail(N.At,
            "CFG001: " + K + " cannot be overridden below declaration scope");
-    if (K == "compilation.modules" || K == "compilation.separate" ||
-        K == "tooling.contract_export")
+    if (K == "static.schedule") {
+      if (V == "custom_parallel")
+        fail(N.At, "CFG002: parallel static initialization is unavailable");
+      if (V != "serial")
+        fail(N.At, "CFG001: invalid static scheduling policy");
       continue;
+    }
+    if (K == "static.workers") {
+      if (V != "1")
+        fail(N.At, "CFG001: serial static initialization requires one worker");
+      continue;
+    }
+    if (K == "static.identity_namespace") {
+      O.StaticIdentityNamespace = StringValue();
+      if (O.StaticIdentityNamespace.empty())
+        fail(N.At, "CFG001: static identity namespace must not be empty");
+      continue;
+    }
     if (K == "memory.raw_validation") {
       if (V != "available" && V != "contract")
         fail(N.At, "CFG001: invalid raw memory validation policy");
@@ -1823,7 +1935,7 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       continue;
     }
     if (K == "source.unicode_version") {
-      if (V != "\"17.0.0\"")
+      if (StringValue() != "17.0.0")
         fail(N.At, "CFG002: unavailable Unicode data version");
       continue;
     }
@@ -1947,8 +2059,8 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
         fail(N.At, "CFG001: invalid default integer");
       O.DefaultInt = V;
     } else if (K == "target") {
-      if (V != "\"x86_64-linux-gnu\"")
-        fail(N.At, "unsupported target");
+      if (StringValue() != "x86_64-linux-gnu")
+        fail(N.At, "CFG002: unsupported target");
     } else if (K == "numeric.integer.widths") {
       StringRef List(V);
       if (!List.consume_front("[") || !List.consume_back("]"))

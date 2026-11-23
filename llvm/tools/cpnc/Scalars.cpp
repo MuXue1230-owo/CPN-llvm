@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 
 using namespace cpn;
 using llvm::StringRef;
@@ -8,6 +9,32 @@ void Context::bindScalarLibrary() {
   // layout as ordinary unions, including in required constant evaluation.
   auto Library = parse(R"cpn(
     namespace std {
+      union AccessError {
+        case MissingValue;
+        case WrongCase;
+        AccessError(const<AccessError>& other)=default;
+        AccessError(AccessError&& other)=default;
+      };
+      generic<type T> class Ref {
+        T* referent;
+      public:
+        Ref(T& object) noexcept [[effects(write(this))]] { init referent(&object); }
+        Ref(const<Ref>& other)=default;
+        Ref(Ref&& other)=default;
+        constexpr T& get() const noexcept { return *referent; }
+      };
+      generic<type T> specialize class Ref<const<T>> {
+        const<T>* referent;
+        constexpr static const<T>* address(const<T>& object) noexcept
+            [[returns_borrowed_from(object)]] { return &object; }
+      public:
+        Ref(const<T>& object) noexcept [[effects(write(this))]]
+            { init referent(&object); }
+        Ref(const<Ref<T>>& other) noexcept { init referent(address(other.get())); }
+        Ref(const<Ref>& other)=default;
+        Ref(Ref&& other)=default;
+        constexpr const<T>& get() const noexcept { return *referent; }
+      };
       union ScalarError {
         case InvalidBoolean;
         case InvalidScalar;
@@ -28,6 +55,14 @@ void Context::bindScalarLibrary() {
         declare const<E>& error() const noexcept
             [[effects(read(this), trap(contract))]];
         declare E&& error() && noexcept [[effects(read(this), trap(contract))]];
+        declare Result<Ref<T>,AccessError> try_value() noexcept
+            [[effects(read(this))]];
+        declare Result<Ref<const<T>>,AccessError> try_value() const noexcept
+            [[effects(read(this))]];
+        declare Result<Ref<E>,AccessError> try_error() noexcept
+            [[effects(read(this))]];
+        declare Result<Ref<const<E>>,AccessError> try_error() const noexcept
+            [[effects(read(this))]];
         Result(const<Result>& other)=default;
         Result(Result&& other)=default;
       };
@@ -41,6 +76,12 @@ void Context::bindScalarLibrary() {
         declare const<E>& error() const noexcept
             [[effects(read(this), trap(contract))]];
         declare E&& error() && noexcept [[effects(read(this), trap(contract))]];
+        declare Result<void,AccessError> try_value() const noexcept
+            [[effects(read(this))]];
+        declare Result<Ref<E>,AccessError> try_error() noexcept
+            [[effects(read(this))]];
+        declare Result<Ref<const<E>>,AccessError> try_error() const noexcept
+            [[effects(read(this))]];
         Result(const<Result>& other)=default;
         Result(Result&& other)=default;
       };
@@ -51,9 +92,87 @@ void Context::bindScalarLibrary() {
   for (auto [Index, Decl] : llvm::enumerate(Library.front().Children)) {
     Decl.At.Line = 0;
     Decl.At.Column = Index + 1;
+    if (Decl.Text == "Result")
+      for (auto &Member : Decl.Children)
+        if (Member.Text == "try_value" || Member.Text == "try_error")
+          Member.Settings["$cpn.result.accessor"] = "";
   }
   unit(Library);
 }
+
+namespace {
+Value resultPayload(Frame &F, const Case &Selected, const Value &Receiver,
+                    const Token &At) {
+  const auto &T = Selected.Types.front();
+  const bool Readonly = Receiver.Readonly || Selected.Decl.Params.front().Const;
+  Value Payload{T, nullptr, nullptr, Readonly};
+  if (F.IR) {
+    Payload.Address = F.payloadAddress(Selected, Receiver.Address, 0);
+    Payload = F.subobject(Receiver, Payload);
+    F.ensureLive(Payload, At);
+  } else {
+    auto *Image = llvm::cast<llvm::Constant>(Receiver.IR);
+    Payload.IR = F.unpackVariant(Selected, Image, At)->getAggregateElement(0u);
+    if (Receiver.Location) {
+      auto Place = *Receiver.Location;
+      Place.Type = T;
+      Place.Readonly = Readonly;
+      Place.Steps.push_back({0, &Selected});
+      Payload.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    } else if (Receiver.Address)
+      Payload.Address = F.payloadAddress(Selected, Receiver.Address, 0);
+  }
+  return Payload;
+}
+
+Value tryResultPayload(Frame &F, const Node &Call, const Node &Method,
+                       const Case &Selected, const Value &Receiver,
+                       llvm::Value *Active) {
+  const auto &Record = F.U.Records.at(Receiver.Type);
+  // Resolve the declaration here. Every Result specialization carries these
+  // signatures, but resolving all their return types up front would recurse.
+  Frame Signature(F.U, nullptr, nullptr, "std::");
+  Signature.Env = Record.Env;
+  const auto Type = Signature.resolve(Method.Type, Call.At);
+  const auto &Ok = F.U.Cases.at(Type + "::Ok");
+  const auto &Err = F.U.Cases.at(Type + "::Err");
+  auto Build = [&](bool Success, llvm::Value *Dest) {
+    if (Success && Selected.Types.empty())
+      return F.variant(Ok, {}, Call.At, Dest);
+
+    Node Expression(Node::Call, Call.At);
+    auto &Callee = Expression.Children.emplace_back(Node::Name, Call.At);
+    Callee.At.Text = Callee.Text =
+        Success ? "::" + Ok.Types.front() : "::std::AccessError::WrongCase";
+    if (!Success)
+      return F.variant(Err, {Expression}, Call.At, Dest);
+
+    auto &Argument = Expression.Children.emplace_back(Node::Name, Call.At);
+    Argument.At.Text = Argument.Text = "$result.payload";
+    F.Scopes.emplace_back();
+    llvm::scope_exit RestoreScope([&] { F.Scopes.pop_back(); });
+    F.Scopes.back().Names.emplace(
+        Argument.Text, resultPayload(F, Selected, Receiver, Call.At));
+    return F.variant(Ok, {Expression}, Call.At, Dest);
+  };
+  if (!F.IR)
+    return Build(llvm::cast<llvm::ConstantInt>(Active)->isOne(), nullptr);
+
+  auto *Storage = F.resultAddress(Type, Call.At);
+  auto *Success = F.block("result.active"),
+       *Failure = F.block("result.inactive"),
+       *Done = F.block("result.accessed");
+  F.B.CreateCondBr(Active, Success, Failure);
+  F.B.SetInsertPoint(Success);
+  Build(true, Storage);
+  F.branch(Done);
+  F.B.SetInsertPoint(Failure);
+  Build(false, Storage);
+  F.branch(Done);
+  F.B.SetInsertPoint(Done);
+  return F.callResult(Type, nullptr, Call.At, Storage);
+}
+} // namespace
 
 std::optional<Value> Frame::resultObserver(const Node &Call,
                                            const std::vector<Node> &Args,
@@ -63,9 +182,21 @@ std::optional<Value> Frame::resultObserver(const Node &Call,
       !U.Variants.count(Receiver.Type))
     return {};
   const bool Test = Call.Text == "has_value" || Call.Text == "has_error";
-  const bool Error = Call.Text == "error" || Call.Text == "has_error";
-  if (!Test && Call.Text != "value" && Call.Text != "error")
+  const bool Try = Call.Text == "try_value" || Call.Text == "try_error";
+  const bool Error = Call.Text == "error" || Call.Text == "has_error" ||
+                     Call.Text == "try_error";
+  if (!Test && !Try && Call.Text != "value" && Call.Text != "error")
     return {};
+  const Node *Method = nullptr;
+  if (Try) {
+    for (const auto &Member : U.Records.at(Receiver.Type).Decl.Children)
+      if (Member.Text == Call.Text &&
+          Member.Settings.count("$cpn.result.accessor") &&
+          (Member.Const || !Receiver.Readonly) && (!Method || !Member.Const))
+        Method = &Member;
+    if (!Method)
+      return {};
+  }
   if (!Args.empty() || !Call.TemplateArgs.empty())
     fail(Call.At, "Result observers take no arguments");
   Receiver = load(Receiver);
@@ -74,6 +205,8 @@ std::optional<Value> Frame::resultObserver(const Node &Call,
   auto *Active = B.CreateICmpEQ(Tag, B.getInt32(Selected.Tag));
   if (Test)
     return Value{"bool", Active};
+  if (Try)
+    return tryResultPayload(*this, Call, *Method, Selected, Receiver, Active);
 
   if (!IR && !llvm::cast<llvm::ConstantInt>(Active)->isOne())
     fail(Call.At, "Result access selects ContractTrap on inactive case in "
@@ -82,26 +215,7 @@ std::optional<Value> Frame::resultObserver(const Node &Call,
   if (Selected.Types.empty())
     return Value{"void"};
 
-  const auto &T = Selected.Types.front();
-  const bool Readonly = Receiver.Readonly || Selected.Decl.Params.front().Const;
-  Value Payload{T, nullptr, nullptr, Readonly};
-  if (IR) {
-    Payload.Address = payloadAddress(Selected, Receiver.Address, 0);
-    Payload = subobject(Receiver, Payload);
-    ensureLive(Payload, Call.At);
-  } else {
-    auto *Image = llvm::cast<llvm::Constant>(Receiver.IR);
-    Payload.IR =
-        unpackVariant(Selected, Image, Call.At)->getAggregateElement(0u);
-    if (Receiver.Location) {
-      auto Place = *Receiver.Location;
-      Place.Type = T;
-      Place.Readonly = Readonly;
-      Place.Steps.push_back({0, &Selected});
-      Payload.Location = std::make_shared<ConstantPlace>(std::move(Place));
-    } else if (Receiver.Address)
-      Payload.Address = payloadAddress(Selected, Receiver.Address, 0);
-  }
+  auto Payload = resultPayload(*this, Selected, Receiver, Call.At);
   Payload.Expiring = Receiver.Expiring && !Receiver.Readonly;
   return load(Payload);
 }

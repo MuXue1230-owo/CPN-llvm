@@ -1,3 +1,4 @@
+#include "NumericLiteral.h"
 #include "Sema.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/IR/IntrinsicsX86.h"
@@ -14,6 +15,24 @@ llvm::RoundingMode rounding(const std::string &Name) {
     return llvm::RoundingMode::NearestTiesToAway;
   return llvm::RoundingMode::NearestTiesToEven;
 }
+
+llvm::AllocaInst *mxcsrSlot(Frame &F) {
+  llvm::IRBuilder<> Entry(F.IR->getEntryBlock().begin());
+  return Entry.CreateAlloca(F.B.getInt32Ty(), nullptr, "fp.control");
+}
+llvm::Value *readMXCSR(Frame &F, llvm::Value *Cell) {
+  F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                     &F.U.M, llvm::Intrinsic::x86_sse_stmxcsr),
+                 {Cell});
+  return F.B.CreateLoad(F.B.getInt32Ty(), Cell);
+}
+void writeMXCSR(Frame &F, llvm::Value *Cell, llvm::Value *V) {
+  F.B.CreateStore(V, Cell);
+  F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
+                     &F.U.M, llvm::Intrinsic::x86_sse_ldmxcsr),
+                 {Cell});
+}
+
 // MXCSR contains the active rounding and subnormal controls, exception masks,
 // and sticky history. An observed operation must classify its own events even
 // when an identical event was already sticky on entry.
@@ -24,18 +43,6 @@ class FloatingOperation {
   static constexpr unsigned Rounding = 3u << 13;
   static constexpr unsigned Subnormal = (1u << 15) | (1u << 6);
   static constexpr unsigned Flags = 0x3f, Masks = Flags << 7, Events = 0x3d;
-  llvm::Value *read() {
-    F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
-                       &F.U.M, llvm::Intrinsic::x86_sse_stmxcsr),
-                   {Cell});
-    return F.B.CreateLoad(F.B.getInt32Ty(), Cell);
-  }
-  void write(llvm::Value *V) {
-    F.B.CreateStore(V, Cell);
-    F.B.CreateCall(llvm::Intrinsic::getOrInsertDeclaration(
-                       &F.U.M, llvm::Intrinsic::x86_sse_ldmxcsr),
-                   {Cell});
-  }
 
 public:
   llvm::RoundingMode Mode;
@@ -61,9 +68,8 @@ public:
     if (!Observed && !Strict && !F.Opt.FPTrapMask && Name == "current" &&
         !Preserve)
       return;
-    llvm::IRBuilder<> Entry(F.IR->getEntryBlock().begin());
-    Cell = Entry.CreateAlloca(F.B.getInt32Ty(), nullptr, "fp.control");
-    Saved = read();
+    Cell = mxcsrSlot(F);
+    Saved = readMXCSR(F, Cell);
     auto *Controls = Saved;
     if (Observed || Strict || F.Opt.FPTrapMask) {
       if (!Observed) {
@@ -85,13 +91,13 @@ public:
     }
     if (Preserve)
       Controls = F.B.CreateAnd(Controls, ~Subnormal);
-    write(Controls);
+    writeMXCSR(F, Cell, Controls);
   }
   llvm::Value *finish() {
     if (!Saved)
       return F.B.getInt32(0);
-    auto *Local = F.B.CreateAnd(read(), Flags);
-    write(F.B.CreateOr(Saved, Local));
+    auto *Local = F.B.CreateAnd(readMXCSR(F, Cell), Flags);
+    writeMXCSR(F, Cell, F.B.CreateOr(Saved, Local));
     Saved = nullptr;
     if (Traps)
       F.guard(F.B.CreateIsNotNull(F.B.CreateAnd(Local, Traps)), "numeric");
@@ -190,7 +196,385 @@ llvm::Value *nonraisingCompare(llvm::IRBuilder<> &B, llvm::CmpInst::Predicate P,
     llvm_unreachable("invalid predicate comparison");
   }
 }
+
+struct BinaryFormat {
+  unsigned Width, Fraction;
+  int Bias;
+  uint64_t ExponentMask;
+};
+
+BinaryFormat binaryFormat(llvm::StringRef Type) {
+  return Type == "f32" ? BinaryFormat{32, 23, 127, 0xff}
+                       : BinaryFormat{64, 52, 1023, 0x7ff};
+}
+
+// A finite source is (-1)^Negative * Magnitude * 2^Scale. Nonfinite
+// encodings keep legal shift operands on paths discarded by classification.
+struct BinaryCastSource {
+  llvm::Value *Magnitude, *Scale, *Negative, *NonFinite, *NaN;
+};
+
+BinaryCastSource binaryCastSource(Frame &F, const Value &Source) {
+  auto &B = F.B;
+  if (integer(Source.Type)) {
+    auto *Negative =
+        signedType(Source.Type) ? B.CreateIsNeg(Source.IR) : B.getFalse();
+    auto *Magnitude =
+        B.CreateSelect(Negative, B.CreateNeg(Source.IR), Source.IR);
+    if (Magnitude->getType()->getIntegerBitWidth() < 64)
+      Magnitude = B.CreateZExt(Magnitude, B.getInt64Ty());
+    return {Magnitude, B.getInt32(0), Negative, B.getFalse(), B.getFalse()};
+  }
+  const auto Format = binaryFormat(Source.Type);
+  auto *Bits = B.CreateBitCast(Source.IR, B.getIntNTy(Format.Width));
+  auto *Negative = B.CreateIsNeg(Bits);
+  Bits = B.CreateZExtOrTrunc(Bits, B.getInt64Ty());
+  const uint64_t Hidden = uint64_t(1) << Format.Fraction;
+  auto *Exponent = B.CreateTrunc(
+      B.CreateAnd(B.CreateLShr(Bits, Format.Fraction), Format.ExponentMask),
+      B.getInt32Ty());
+  auto *Fraction = B.CreateAnd(Bits, Hidden - 1);
+  auto *Subnormal = B.CreateIsNull(Exponent);
+  auto *Magnitude =
+      B.CreateSelect(Subnormal, Fraction, B.CreateOr(Fraction, Hidden));
+  auto *Scale = B.CreateSub(B.CreateSelect(Subnormal, B.getInt32(1), Exponent),
+                            B.getInt32(Format.Bias + Format.Fraction));
+  auto *NonFinite = B.CreateICmpEQ(Exponent, B.getInt32(Format.ExponentMask));
+  return {Magnitude, Scale, Negative, NonFinite,
+          B.CreateAnd(NonFinite, B.CreateIsNotNull(Fraction))};
+}
+
+struct ShiftCount {
+  llvm::Value *InRange, *Count;
+};
+
+ShiftCount shiftCount(llvm::IRBuilder<> &B, llvm::Value *Distance,
+                      llvm::IntegerType *Word) {
+  auto *InRange = B.CreateICmpULT(Distance, B.getInt32(Word->getBitWidth()));
+  return {InRange,
+          B.CreateIntCast(B.CreateSelect(InRange, Distance, B.getInt32(0)),
+                          Word, false)};
+}
+
+struct MagnitudeProjection {
+  llvm::Value *Whole, *Increase, *Inexact, *LostHighBits;
+};
+
+MagnitudeProjection roundMagnitude(llvm::IRBuilder<> &B, llvm::Value *Mag,
+                                   llvm::Value *Delta, llvm::Value *Negative,
+                                   llvm::Value *Mode) {
+  if (auto *D = llvm::dyn_cast<llvm::ConstantInt>(Delta); D && D->isZero())
+    return {Mag, B.getFalse(), B.getFalse(), B.getFalse()};
+
+  auto *Word = llvm::cast<llvm::IntegerType>(Mag->getType());
+  auto *Zero = llvm::ConstantInt::get(Word, 0);
+  auto *ShiftRight = B.CreateICmpSGT(Delta, B.getInt32(0));
+  auto Right = shiftCount(B, Delta, Word);
+  auto Left = shiftCount(B, B.CreateNeg(Delta), Word);
+  auto *High = B.CreateSelect(Left.InRange, B.CreateShl(Mag, Left.Count), Zero);
+  auto *Lost = B.CreateAnd(B.CreateNot(ShiftRight),
+                           B.CreateICmpNE(B.CreateLShr(High, Left.Count), Mag));
+  auto *Whole =
+      B.CreateSelect(Right.InRange, B.CreateLShr(Mag, Right.Count), Zero);
+  auto *Rest = B.CreateSub(Mag, B.CreateShl(Whole, Right.Count));
+  auto HalfShift = shiftCount(B, B.CreateSub(Delta, B.getInt32(1)), Word);
+  auto *Half = B.CreateShl(llvm::ConstantInt::get(Word, 1), HalfShift.Count);
+  auto *Tie = B.CreateAnd(HalfShift.InRange, B.CreateICmpEQ(Rest, Half));
+  auto *Above = B.CreateAnd(HalfShift.InRange, B.CreateICmpUGT(Rest, Half));
+  auto *Odd = B.CreateTrunc(Whole, B.getInt1Ty());
+  auto *Inexact = B.CreateAnd(ShiftRight, B.CreateIsNotNull(Rest));
+  auto Is = [&](llvm::RoundingMode R) {
+    return B.CreateICmpEQ(Mode, B.getInt8(unsigned(R)));
+  };
+  auto *NearestEven = B.CreateOr(Above, B.CreateAnd(Tie, Odd));
+  auto *NearestAway = B.CreateOr(Above, Tie);
+  auto *Increase = B.CreateSelect(Is(llvm::RoundingMode::NearestTiesToEven),
+                                  NearestEven, B.getFalse());
+  Increase = B.CreateSelect(Is(llvm::RoundingMode::NearestTiesToAway),
+                            NearestAway, Increase);
+  Increase = B.CreateSelect(Is(llvm::RoundingMode::TowardPositive),
+                            B.CreateNot(Negative), Increase);
+  Increase = B.CreateSelect(Is(llvm::RoundingMode::TowardNegative), Negative,
+                            Increase);
+  return {B.CreateSelect(ShiftRight, Whole, High),
+          B.CreateAnd(Inexact, Increase), Inexact, Lost};
+}
+
+ScalarCastProjection integerCast(Frame &F, const BinaryCastSource &Source,
+                                 unsigned Width, bool Signed,
+                                 NumericProjection Policy, llvm::Value *Mode) {
+  auto &B = F.B;
+  const auto P = roundMagnitude(B, Source.Magnitude, B.CreateNeg(Source.Scale),
+                                Source.Negative, Mode);
+  auto *Word = llvm::cast<llvm::IntegerType>(P.Whole->getType());
+  auto *Magnitude = B.CreateAdd(P.Whole, B.CreateZExt(P.Increase, Word));
+  auto PositiveMax = Signed ? llvm::APInt::getSignedMaxValue(Width)
+                            : llvm::APInt::getMaxValue(Width);
+  auto NegativeMax =
+      Signed ? llvm::APInt::getSignMask(Width) : llvm::APInt::getZero(Width);
+  const unsigned WordWidth = Word->getBitWidth();
+  auto *Maximum =
+      B.CreateSelect(Source.Negative,
+                     llvm::ConstantInt::get(Word, NegativeMax.zext(WordWidth)),
+                     llvm::ConstantInt::get(Word, PositiveMax.zext(WordWidth)));
+  auto *Outside =
+      B.CreateOr(P.LostHighBits, B.CreateICmpUGT(Magnitude, Maximum));
+  auto *Finite = B.CreateNot(Source.NonFinite);
+  auto *Inexact = B.CreateAnd(Finite, P.Inexact);
+  if (Policy == NumericProjection::Exact)
+    Outside = B.CreateOr(
+        Outside, B.CreateAnd(Inexact, B.CreateICmpEQ(P.Whole, Maximum)));
+  Outside = B.CreateAnd(Finite, Outside);
+
+  auto *Ty = B.getIntNTy(Width);
+  auto *Bits = B.CreateZExtOrTrunc(Magnitude, Ty);
+  auto *Number = B.CreateSelect(Source.Negative, B.CreateNeg(Bits), Bits);
+  if (Policy == NumericProjection::Wrapping)
+    return {Number,           B.getFalse(),
+            Source.NonFinite, B.CreateOr(Inexact, Outside),
+            B.getFalse(),     Outside};
+  if (Policy == NumericProjection::Saturating) {
+    auto *Clamp = B.CreateOr(
+        Outside, B.CreateAnd(Source.NonFinite, B.CreateNot(Source.NaN)));
+    auto *Bound =
+        B.CreateSelect(Source.Negative, llvm::ConstantInt::get(Ty, NegativeMax),
+                       llvm::ConstantInt::get(Ty, PositiveMax));
+    return {B.CreateSelect(Clamp, Bound, Number), B.getFalse(), Source.NaN,
+            B.CreateOr(Inexact, Outside),         Clamp,        B.getFalse()};
+  }
+  return {Number,  Outside,      Source.NonFinite,
+          Inexact, B.getFalse(), B.getFalse()};
+}
+
+llvm::Value *bitLength(Frame &F, llvm::Value *V) {
+  auto *Ty = V->getType();
+  unsigned Width = Ty->getIntegerBitWidth();
+  if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(V))
+    return F.B.getInt32(C->getValue().getActiveBits());
+  auto *Leading =
+      F.B.CreateIntrinsic(llvm::Intrinsic::ctlz, {Ty}, {V, F.B.getFalse()});
+  return F.B.CreateSub(F.B.getInt32(Width),
+                       F.B.CreateIntCast(Leading, F.B.getInt32Ty(), false));
+}
+
+llvm::Value *roundedSignificand(llvm::IRBuilder<> &B,
+                                const MagnitudeProjection &P) {
+  return B.CreateAdd(B.CreateZExtOrTrunc(P.Whole, B.getInt64Ty()),
+                     B.CreateZExt(P.Increase, B.getInt64Ty()));
+}
+
+llvm::Value *projectionEvents(llvm::IRBuilder<> &B, llvm::Value *Inexact,
+                              llvm::Value *Overflow, llvm::Value *Underflow) {
+  return B.CreateOr(
+      B.CreateSelect(Inexact, B.getInt8(16), B.getInt8(0)),
+      B.CreateOr(B.CreateSelect(Overflow, B.getInt8(4), B.getInt8(0)),
+                 B.CreateSelect(Underflow, B.getInt8(8), B.getInt8(0))));
+}
+
+ScalarCastProjection floatingCast(Frame &F, const BinaryCastSource &Source,
+                                  const std::string &Type,
+                                  NumericProjection Policy, llvm::Value *Mode) {
+  const auto Format = binaryFormat(Type);
+  auto &B = F.B;
+  auto *Length = bitLength(F, Source.Magnitude);
+  auto *Zero = B.CreateIsNull(Length);
+  auto *Exponent =
+      B.CreateAdd(B.CreateSub(Length, B.getInt32(1)), Source.Scale);
+  auto *PrecisionDelta = B.CreateSub(Length, B.getInt32(Format.Fraction + 1));
+
+  // Chapter 04 checks range and tininess on the unbounded-exponent rounding.
+  // The delivered representation rounds the original value at its final
+  // binary quantum, including gradual subnormals.
+  const auto Unbounded = roundMagnitude(B, Source.Magnitude, PrecisionDelta,
+                                        Source.Negative, Mode);
+  const uint64_t Leading = uint64_t(1) << Format.Fraction;
+  auto *Rounded = roundedSignificand(B, Unbounded);
+  auto *Carry = B.CreateICmpEQ(Rounded, B.getInt64(2 * Leading));
+  auto *RoundedExponent =
+      B.CreateAdd(Exponent, B.CreateZExt(Carry, B.getInt32Ty()));
+  auto *Ordinary =
+      B.CreateAnd(B.CreateNot(Zero), B.CreateNot(Source.NonFinite));
+  auto *Outside = B.CreateICmpSGT(RoundedExponent, B.getInt32(Format.Bias));
+  const bool Exact = Policy == NumericProjection::Exact;
+  if (Exact) {
+    auto *AboveMaximum =
+        B.CreateAnd(Unbounded.Inexact,
+                    B.CreateICmpEQ(Rounded, B.getInt64(2 * Leading - 1)));
+    Outside = B.CreateOr(
+        Outside, B.CreateAnd(B.CreateICmpEQ(Exponent, B.getInt32(Format.Bias)),
+                             AboveMaximum));
+  }
+  Outside = B.CreateAnd(Ordinary, Outside);
+
+  const int MinNormal = 1 - Format.Bias;
+  auto *Subnormal = B.CreateICmpSLT(Exponent, B.getInt32(MinNormal));
+  auto *SubnormalDelta =
+      B.CreateSub(B.getInt32(MinNormal - int(Format.Fraction)), Source.Scale);
+  const auto Delivered =
+      roundMagnitude(B, Source.Magnitude,
+                     B.CreateSelect(Subnormal, SubnormalDelta, PrecisionDelta),
+                     Source.Negative, Mode);
+  auto *Significand = roundedSignificand(B, Delivered);
+  auto *Base =
+      B.CreateSelect(Subnormal, B.getInt32(0),
+                     B.CreateAdd(Exponent, B.getInt32(Format.Bias - 1)));
+  auto *Bits = B.CreateAdd(
+      B.CreateShl(B.CreateZExt(Base, B.getInt64Ty()), Format.Fraction),
+      Significand);
+  Bits = B.CreateSelect(Zero, B.getInt64(0), Bits);
+  auto *Sign = B.CreateSelect(Source.Negative,
+                              B.getInt64(uint64_t(1) << (Format.Width - 1)),
+                              B.getInt64(0));
+  auto *Ty = F.U.ir(Type);
+  auto *Number = B.CreateBitCast(
+      B.CreateZExtOrTrunc(B.CreateOr(Sign, Bits), B.getIntNTy(Format.Width)),
+      Ty);
+  auto *Inexact = B.CreateAnd(Ordinary, Delivered.Inexact);
+  if (Exact)
+    return {Number,  Outside,      Source.NonFinite,
+            Inexact, B.getFalse(), B.getFalse()};
+  Inexact = B.CreateOr(Inexact, Outside);
+  auto *Underflow = B.CreateAnd(
+      Inexact, B.CreateICmpSLT(RoundedExponent, B.getInt32(MinNormal)));
+  return {Number,
+          Outside,
+          Source.NonFinite,
+          Inexact,
+          B.getFalse(),
+          B.getFalse(),
+          projectionEvents(B, Inexact, Outside, Underflow)};
+}
+
+ScalarCastProjection realLiteralCast(Frame &F, const Value &Source,
+                                     const std::string &Type,
+                                     NumericProjection Policy,
+                                     llvm::Value *Mode, const Token &At) {
+  auto &B = F.B;
+  const bool IsFloat = floating(Type);
+  const bool Exact = Policy == NumericProjection::Exact;
+  const bool Signed = signedType(Type);
+  const unsigned Width = width(Type);
+  auto Project = [&](llvm::RoundingMode R) -> ScalarCastProjection {
+    const auto P = projectRealLiteral(Source.RealText, Width, Signed, IsFloat,
+                                      Exact, R, At);
+    auto *Ty = B.getIntNTy(Width);
+    llvm::Value *Number = llvm::ConstantInt::get(Ty, P.Bits);
+    if (IsFloat)
+      Number = B.CreateBitCast(Number, F.U.ir(Type));
+    auto *FPFlags =
+        IsFloat && !Exact
+            ? projectionEvents(B, B.getInt1(P.Inexact), B.getInt1(P.FPOverflow),
+                               B.getInt1(P.FPUnderflow))
+            : B.getInt8(0);
+    bool Outside = P.OutOfRange, Clamped = false, Wrapped = false;
+    if (Policy == NumericProjection::Saturating && Outside) {
+      const bool Negative = llvm::StringRef(Source.RealText).starts_with("-");
+      llvm::APInt Bound = Negative
+                              ? (Signed ? llvm::APInt::getSignedMinValue(Width)
+                                        : llvm::APInt::getZero(Width))
+                              : (Signed ? llvm::APInt::getSignedMaxValue(Width)
+                                        : llvm::APInt::getMaxValue(Width));
+      Number = llvm::ConstantInt::get(Ty, Bound);
+      Clamped = true;
+      Outside = false;
+    } else if (Policy == NumericProjection::Wrapping && Outside) {
+      Wrapped = true;
+      Outside = false;
+    }
+    return {Number,
+            B.getInt1(Outside),
+            B.getFalse(),
+            B.getInt1(P.Inexact || Wrapped || Clamped),
+            B.getInt1(Clamped),
+            B.getInt1(Wrapped),
+            FPFlags};
+  };
+  if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Mode))
+    return Project(llvm::RoundingMode(Known->getZExtValue()));
+
+  // Preserve the token as an exact value even when a call computes its
+  // rounding policy at runtime. Each arm is a compile-time projection.
+  auto P = Project(llvm::RoundingMode::TowardZero);
+  for (auto R : {llvm::RoundingMode::NearestTiesToEven,
+                 llvm::RoundingMode::NearestTiesToAway,
+                 llvm::RoundingMode::TowardPositive,
+                 llvm::RoundingMode::TowardNegative}) {
+    const auto Candidate = Project(R);
+    auto *Selected = B.CreateICmpEQ(Mode, B.getInt8(unsigned(R)));
+    P.Number = B.CreateSelect(Selected, Candidate.Number, P.Number);
+    P.Outside = B.CreateSelect(Selected, Candidate.Outside, P.Outside);
+    P.Inexact = B.CreateSelect(Selected, Candidate.Inexact, P.Inexact);
+    P.Clamped = B.CreateSelect(Selected, Candidate.Clamped, P.Clamped);
+    P.Wrapped = B.CreateSelect(Selected, Candidate.Wrapped, P.Wrapped);
+    P.FPFlags = B.CreateSelect(Selected, Candidate.FPFlags, P.FPFlags);
+  }
+  return P;
+}
+
+llvm::Value *castRounding(Frame &F, bool Integer, bool Exact,
+                          llvm::Value *Mode) {
+  if (Mode)
+    return Mode;
+  auto &B = F.B;
+  if (Integer || Exact)
+    return B.getInt8(unsigned(llvm::RoundingMode::TowardZero));
+  auto Name = F.Opt.FPRounding;
+  if (Name.empty())
+    Name = F.Opt.FPProfile == "strict" ? "current" : "nearest_ties_even";
+  if (Name == "current" && !F.Opt.InitialRounding.empty())
+    Name = F.Opt.InitialRounding;
+  if (Name != "current" || !F.IR)
+    return B.getInt8(unsigned(rounding(Name)));
+  auto *Current = readMXCSR(F, mxcsrSlot(F));
+  auto *RC = B.CreateTrunc(B.CreateLShr(Current, 13), B.getIntNTy(2));
+  // MXCSR rounds to nearest, negative, positive, zero in this order.
+  auto *Modes = B.getInt32(1 | (3 << 8) | (2 << 16));
+  return B.CreateTrunc(
+      B.CreateLShr(Modes, B.CreateShl(B.CreateZExt(RC, B.getInt32Ty()), 3)),
+      B.getInt8Ty());
+}
+
+void mergeCastEvents(Frame &F, llvm::Value *Flags) {
+  if (!F.IR || !Flags)
+    return;
+  if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Flags);
+      Known && Known->isZero())
+    return;
+  auto *Cell = mxcsrSlot(F);
+  auto *Current = readMXCSR(F, Cell);
+  // Named floating destination casts raise only Overflow, Underflow and
+  // Inexact. Set their sticky bits without activating any trap outlet.
+  auto *Events = F.B.CreateShl(F.B.CreateZExt(Flags, F.B.getInt32Ty()), 1);
+  writeMXCSR(F, Cell, F.B.CreateOr(Current, Events));
+}
 } // namespace
+
+ScalarCastProjection Frame::projectScalarCast(Value Source,
+                                              const std::string &Type,
+                                              NumericProjection Policy,
+                                              llvm::Value *Mode,
+                                              const Token &At) {
+  const bool IsFloat = floating(Type);
+  const bool Exact = Policy == NumericProjection::Exact;
+  if (IsFloat && !Opt.FloatFormats.count(Type))
+    fail(At, "floating format is disabled");
+  if (IsFloat && !Exact && InPredicate)
+    fail(At, "contract predicate cannot update floating status");
+  if (Policy == NumericProjection::Wrapping)
+    Mode = nullptr;
+  Mode = castRounding(*this, !IsFloat, Exact, Mode);
+  auto Projection =
+      Source.Type == "real"
+          ? realLiteralCast(*this, Source, Type, Policy, Mode, At)
+      : IsFloat ? floatingCast(*this, binaryCastSource(*this, Source), Type,
+                               Policy, Mode)
+                : integerCast(*this, binaryCastSource(*this, Source),
+                              width(Type), signedType(Type), Policy, Mode);
+  if (IsFloat && !Exact)
+    mergeCastEvents(*this, Projection.FPFlags);
+  return Projection;
+}
+
 Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
                              bool Explicit) {
   if (!Opt.FloatFormats.count(T))
@@ -199,27 +583,21 @@ Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
     return V;
   auto &Sem =
       T == "f32" ? llvm::APFloat::IEEEsingle() : llvm::APFloat::IEEEdouble();
-  if (V.Type == "real" || V.Type == "integer") {
-    llvm::APFloat Number(Sem);
-    llvm::APFloat::opStatus Status;
-    if (V.Type == "integer")
-      Status = Number.convertFromAPInt(
-          llvm::cast<llvm::ConstantInt>(V.IR)->getValue(), true,
-          rounding(Opt.LiteralRounding));
-    else {
-      auto Outcome =
-          Number.convertFromString(V.RealText, rounding(Opt.LiteralRounding));
-      if (!Outcome) {
-        std::string Detail;
-        llvm::raw_string_ostream Message(Detail);
-        llvm::logAllUnhandledErrors(Outcome.takeError(), Message);
-        fail(At, "malformed real literal: " + Detail);
-      }
-      Status = *Outcome;
-    }
-    if (Status & llvm::APFloat::opOverflow)
+  if (V.Type == "real") {
+    auto Projection =
+        projectRealLiteral(V.RealText, width(T), false, true, false,
+                           rounding(Opt.LiteralRounding), At);
+    if (Projection.FPOverflow)
       fail(At, "floating literal overflows " + T);
-    return {T, llvm::ConstantFP::get(U.C, Number)};
+    return {T, llvm::ConstantFP::get(U.C, llvm::APFloat(Sem, Projection.Bits))};
+  }
+  if (V.Type == "integer") {
+    auto Projection = floatingCast(
+        *this, binaryCastSource(*this, V), T, NumericProjection::Checked,
+        B.getInt8(unsigned(rounding(Opt.LiteralRounding))));
+    if (!llvm::cast<llvm::ConstantInt>(Projection.Outside)->isZero())
+      fail(At, "floating literal overflows " + T);
+    return {T, Projection.Number};
   }
   if (InPredicate)
     fail(At, "contract predicate requires a nonraising floating conversion");

@@ -43,15 +43,11 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
       scopeKey(Prefix, Base, [&](const auto &S) { return Families.count(S); });
   if (Key.empty())
     fail(D.At, "qualified member definition requires a declared owner family");
-  Node Formals;
-  std::vector<SourcePosition> GenericOwners;
+  Node Formals, BoundOwners;
+  std::vector<size_t> Renaming;
+  std::vector<Node> OwnerConditions;
+  std::vector<MemberBody::OwnerBinding> GenericOwners;
   auto matches = [&](const Node &Decl, const std::vector<Node> &Args) {
-    size_t Begin = Formals.Generics.size(), Count = Decl.Generics.size();
-    if (Begin + Count > D.Generics.size())
-      return false;
-    Node Binders;
-    Binders.Generics.assign(D.Generics.begin() + Begin,
-                            D.Generics.begin() + Begin + Count);
     std::vector<Node> Pattern;
     if (Decl.Settings.count("specialize")) {
       Pattern = Decl.Pattern;
@@ -64,26 +60,38 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
         Pattern.push_back(std::move(A));
       }
     }
-    return Pattern.size() == Args.size() &&
-           std::equal(Pattern.begin(), Pattern.end(), Args.begin(),
-                      [&](const Node &L, const Node &R) {
-                        return sameGenericArgument(L, R, Decl, Binders);
-                      });
+    auto All = Formals.Generics;
+    All.insert(All.end(), Decl.Generics.begin(), Decl.Generics.end());
+    return matchOwnerBinders(Pattern, Args, All, D.Generics, Renaming);
   };
-  auto addOwner = [&](const Node &Owner) {
-    GenericOwners.push_back(position(Owner));
+  auto addOwner = [&](const Node &Owner, std::vector<size_t> Parameters) {
+    MemberBody::OwnerBinding Binding{position(Owner), {}};
+    for (size_t I = Renaming.size(); I < Parameters.size(); ++I)
+      Binding.Parameters.push_back(D.Generics[Parameters[I]]);
+    Renaming = std::move(Parameters);
     Formals.Generics.insert(Formals.Generics.end(), Owner.Generics.begin(),
                             Owner.Generics.end());
+    BoundOwners.Generics.insert(BoundOwners.Generics.end(),
+                                Binding.Parameters.begin(),
+                                Binding.Parameters.end());
     Formals.Params.insert(Formals.Params.end(), Owner.Params.begin(),
                           Owner.Params.end());
+    for (auto Requirement : Owner.Params) {
+      rebindCondition(Requirement, Formals, BoundOwners);
+      OwnerConditions.push_back(std::move(Requirement));
+    }
+    GenericOwners.push_back(std::move(Binding));
   };
   const Node *Class = nullptr;
+  std::vector<size_t> RootParameters;
   auto matchRoot = [&](const Node &Decl) {
-    if (!matches(Decl, Applied->TemplateArgs))
+    auto Parameters = matches(Decl, Applied->TemplateArgs);
+    if (!Parameters)
       return;
     if (Class)
       fail(D.At, "ambiguous qualified owner pattern");
     Class = &Decl;
+    RootParameters = std::move(*Parameters);
   };
   matchRoot(Families.at(Key).Decl);
   if (auto It = Specializations.find(Key); It != Specializations.end())
@@ -92,7 +100,7 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
   if (!Class)
     fail(D.At,
          "owner application must identify a declared family or specialization");
-  addOwner(*Class);
+  addOwner(*Class, std::move(RootParameters));
   for (++Applied; Applied != D.Pattern.end(); ++Applied) {
     auto Inner = llvm::find_if(Class->Children, [&](const Node &N) {
       return (N.K == Node::Record || N.K == Node::Union) &&
@@ -102,34 +110,47 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
       fail(D.At, "unknown nested owning declaration");
     Class = &*Inner;
     if (Applied->ExplicitApplication) {
-      if (Class->Generics.empty() || !matches(*Class, Applied->TemplateArgs))
+      auto Parameters = matches(*Class, Applied->TemplateArgs);
+      if (Class->Generics.empty() || !Parameters)
         fail(D.At, "invalid nested owner application");
-      addOwner(*Class);
+      addOwner(*Class, std::move(*Parameters));
     } else if (!Class->Generics.empty())
       fail(D.At, "nested owner family requires an application");
   }
   if (Class->K != Node::Record && Class->K != Node::Union)
     fail(D.At, "qualified definition requires a record or union owner");
-  if (Formals.Generics.size() != D.Generics.size())
-    fail(D.At,
-         "owner application must match its declaration's generic parameters");
   for (const auto &G : D.Generics)
     if (!G.Children.empty())
       fail(G.At, "a definition cannot redeclare a generic default");
+  auto Body = D;
+  Body.Generics.clear();
+  for (size_t I = 0; I < D.Generics.size(); ++I)
+    if (!llvm::is_contained(Renaming, I))
+      Body.Generics.push_back(D.Generics[I]);
+  auto Signature = D;
+  Signature.Generics = BoundOwners.Generics;
+  Signature.Generics.insert(Signature.Generics.end(), Body.Generics.begin(),
+                            Body.Generics.end());
   const auto &Owner = *Class;
   const Node *Selected = nullptr;
+  Node Public;
   for (const auto &Member : Owner.Children) {
-    if (Member.K != D.K || Member.Text != D.Text || !Member.Generics.empty())
+    if (Member.K != D.K || Member.Text != D.Text)
       continue;
-    Node Public = Member;
-    Public.Generics = Formals.Generics;
-    // Omitting the owner's already established constraint retains that bound.
-    if (!D.TemplateArgs.empty())
-      Public.TemplateArgs = Formals.Params;
-    if (!sameGenericSignature(Public, D))
-      continue;
-    if (!sameGenericResult(Public, D) || D.Noexcept != Member.Noexcept ||
-        D.Required != Member.Required ||
+    Node Candidate = Member;
+    Candidate.Generics.insert(Candidate.Generics.begin(),
+                              Formals.Generics.begin(), Formals.Generics.end());
+    if (D.TemplateArgs.empty())
+      Candidate.TemplateArgs.clear();
+    if (!sameGenericSignature(Candidate, Signature)) {
+      Candidate.TemplateArgs.insert(Candidate.TemplateArgs.begin(),
+                                    Formals.Params.begin(),
+                                    Formals.Params.end());
+      if (!sameGenericSignature(Candidate, Signature))
+        continue;
+    }
+    if (!sameGenericResult(Candidate, Signature) ||
+        D.Noexcept != Member.Noexcept || D.Required != Member.Required ||
         D.Settings.count("mode") != Member.Settings.count("mode") ||
         D.Settings.count("lifecycle_effect") !=
             Member.Settings.count("lifecycle_effect"))
@@ -138,14 +159,23 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
     if (auto Bound = genericEffectBound(D, HasReceiver);
         Bound && Bound != genericEffectBound(Member, HasReceiver))
       fail(D.At, "incompatible qualified member effect contract");
-    if (!D.Contracts.empty() && !sameGenericValueContracts(Public, D))
+    if (!D.Contracts.empty() &&
+        !sameGenericValueContracts(Candidate, Signature))
       fail(D.At, "incompatible qualified member value contract");
     for (StringRef Effect : {"consumes", "noescape", "returns_borrowed_from"})
-      if (effectPositions(Member, Effect) != effectPositions(D, Effect))
+      if ((Member.Generics.empty() || D.Settings.count(Effect.str())) &&
+          effectPositions(Member, Effect) != effectPositions(D, Effect))
         fail(D.At, "incompatible qualified member effect contract");
+    for (auto Effect : {"requires_initialized", "initializes"})
+      if (auto Contract = D.Settings.find(Effect);
+          Contract != D.Settings.end() &&
+          (Member.Settings.count(Effect) == 0 ||
+           Member.Settings.at(Effect) != Contract->second))
+        fail(D.At, "incompatible qualified member construction contract");
     if (Selected || !Member.Prototype || D.Prototype)
       fail(D.At, "member is ambiguous or already defined");
     Selected = &Member;
+    Public = std::move(Candidate);
   }
   if (!Selected)
     fail(D.At,
@@ -157,20 +187,30 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
   Node Domain = Owner;
   Domain.K = Node::Record;
   Domain.Generics = D.Generics;
-  Domain.Params = Formals.Params;
-  for (auto &Q : Domain.Params)
-    rebindCondition(Q, Formals, D);
+  Domain.Params = std::move(OwnerConditions);
+  for (auto Requirement : Selected->TemplateArgs) {
+    rebindCondition(Requirement, Public, Signature);
+    Domain.Params.push_back(std::move(Requirement));
+  }
   Domain.Children.clear();
   for (auto Field : Owner.Children)
     if (Field.K == Node::Field) {
-      Field.Type = rebindTypeNames(Field.Type, Formals, D);
+      Field.Type = rebindTypeNames(Field.Type, Formals, BoundOwners);
       Domain.Children.push_back(std::move(Field));
     }
   Domain.Children.push_back(D);
+  if (Selected->Settings.count("static"))
+    Domain.Children.back().Settings["static"] = "1";
   checkDomain(Domain, Families.at(Key).Prefix, &Owner);
+  Body.Pattern.clear();
+  Body.TemplateArgs.clear();
+  // The selected declaration owns the public value predicates.
+  Body.Contracts.clear();
   auto &Definitions = OwnerBodies[position(Owner)];
   auto [Bound, New] = Definitions.emplace(position(*Selected),
-                                          MemberBody{GenericOwners, D, site()});
+                                          MemberBody{std::move(GenericOwners),
+                                                     position(*Selected),
+                                                     std::move(Body), site()});
   if (!New)
     fail(D.At, "family member is already defined");
   std::vector<std::string> Existing;
@@ -185,11 +225,10 @@ void Context::bindFamilyMember(const std::string &Name,
                                const MemberBody &Saved) {
   const auto &Owner = Records.at(Name);
   Node D = Saved.Definition;
-  auto Env = Owner.Env;
   std::vector<const Record *> Instances;
   const Record *Current = &Owner;
-  for (auto Site : llvm::reverse(Saved.GenericOwners)) {
-    while (Current && position(Current->Decl) != Site) {
+  for (const auto &Binding : llvm::reverse(Saved.GenericOwners)) {
+    while (Current && position(Current->Decl) != Binding.Position) {
       auto P = Records.find(Current->EnclosingScope);
       Current = P == Records.end() ? nullptr : &P->second;
     }
@@ -197,31 +236,54 @@ void Context::bindFamilyMember(const std::string &Name,
       fail(D.At, "missing enclosing owner instance");
     Instances.push_back(Current);
   }
-  size_t Count = 0;
-  for (auto *R : Instances)
-    Count += R->Decl.Generics.size();
-  if (!D.Generics.empty() && D.Generics.back().Pack) {
-    Family Source{D, "", Saved.Site, Env};
-    auto Expanded = expand(Source, Count - (D.Generics.size() - 1), D.At);
-    D = std::move(Expanded.Decl);
-    Env.PackLengths = std::move(Expanded.Enclosing.PackLengths);
-  }
-  if (D.Generics.size() != Count)
-    fail(D.At, "owner binder arity mismatch");
-  size_t I = 0;
-  for (auto *R : llvm::reverse(Instances))
-    for (const auto &Old : R->Decl.Generics) {
-      const auto &New = D.Generics[I++].Text;
+  Substitution Bindings;
+  for (auto [R, Binding] :
+       llvm::zip_equal(llvm::reverse(Instances), Saved.GenericOwners)) {
+    const bool Packed =
+        !Binding.Parameters.empty() && Binding.Parameters.back().Pack;
+    const size_t Fixed = Binding.Parameters.size() - Packed;
+    if (R->Decl.Generics.size() < Fixed ||
+        (!Packed && R->Decl.Generics.size() != Fixed))
+      fail(D.At, "owner binder arity mismatch");
+    for (auto [I, Old] : llvm::enumerate(R->Decl.Generics)) {
+      const auto New = I < Fixed ? Binding.Parameters[I].Text
+                                 : Binding.Parameters.back().Text + "$" +
+                                       std::to_string(I - Fixed);
       if (Old.K == Node::TypeParam)
-        Env.Types[New] = R->Env.Types.at(Old.Text);
+        Bindings.Types[New] = R->Env.Types.at(Old.Text);
       else
-        Env.Values[New] = R->Env.Values.at(Old.Text);
+        Bindings.Values[New] = R->Env.Values.at(Old.Text);
     }
-  D.Generics.clear();
-  D.TemplateArgs.clear();
-  // The selected member declaration owns its value predicates. Any repeated
-  // clauses have already been compared in the correct binder environments.
-  D.Contracts.clear();
+    if (Packed) {
+      // The sole source pack belongs to this owner. Expand its occurrences
+      // now that the owner is concrete, then retain the member's own binders.
+      auto MemberArity = D.Generics.size();
+      D.Generics.push_back(Binding.Parameters.back());
+      Family Source{std::move(D), "", Saved.Site, std::move(Bindings)};
+      auto Expanded =
+          expand(Source, R->Decl.Generics.size() - Fixed, Saved.Definition.At);
+      D = std::move(Expanded.Decl);
+      D.Generics.resize(MemberArity);
+      Bindings = std::move(Expanded.Enclosing);
+    }
+  }
+  if (!D.Generics.empty()) {
+    auto &Group = FunctionFamilies.at(Name + "::" + D.Text);
+    auto Selected = llvm::find_if(Group, [&](const Family &F) {
+      return position(F.Decl) == Saved.Member;
+    });
+    if (Selected == Group.end() || Selected->Body)
+      fail(D.At, "member is ambiguous or already defined");
+    setGenericBody(*Selected, std::move(D), Saved.Site, std::move(Bindings));
+    return;
+  }
+  auto Env = Owner.Env;
+  for (const auto &[Parameter, T] : Bindings.Types)
+    Env.Types[Parameter] = T;
+  for (const auto &[Parameter, V] : Bindings.Values)
+    Env.Values[Parameter] = V;
+  for (const auto &[Parameter, Count] : Bindings.PackLengths)
+    Env.PackLengths[Parameter] = Count;
   D.Settings["qualifier"] = "::" + Name + "::";
   EnterDefinition Site(*this, Saved.Site);
   defineQualified(D, "", &Env);

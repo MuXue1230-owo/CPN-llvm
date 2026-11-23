@@ -54,8 +54,8 @@ struct Check {
                                                      "true",
                                                      "false"};
     if (Names.count(S) || Intrinsics.count(S) || integerLibraryName(S) ||
-        builtin(S) || builtinPredicate(S) || U.Aliases.count(S) ||
-        U.Cases.count(S))
+        floatingSpecialName(S) || builtin(S) || builtinPredicate(S) ||
+        U.Aliases.count(S) || U.Cases.count(S))
       return true;
     if (auto Enclosing =
             U.Records.find(llvm::StringRef(Prefix).rtrim(':').str());
@@ -308,15 +308,23 @@ struct Check {
     for (const auto &C : N.TemplateArgs)
       visit(C, Bind);
     for (auto [I, C] : llvm::enumerate(A))
-      if (I != 2 || !bitExtensionArgument(N))
+      if ((I != 2 || (!bitExtensionArgument(N) && !castRoundingArgument(N))) &&
+          !floatingSpecialSignArgument(N, I))
         visit(C, Bind);
   }
 };
 } // namespace
 JumpCleanups Context::validate(const Node &N, const std::string &P,
                                const std::string &Owner,
-                               const Node *FamilyOwner) {
+                               const Node *FamilyOwner,
+                               const Substitution *Captured) {
   Check Ch{*this, P, Owner, {}, FamilyOwner};
+  if (Captured) {
+    for (const auto &[Name, Type] : Captured->Types)
+      Ch.Names[Name] = {Binding::Alias, Ch.nominalType(Type)};
+    for (const auto &[Name, Value] : Captured->Values)
+      Ch.Names[Name] = {Binding::ValueParameter, Ch.nominalType(Value.Type)};
+  }
   Ch.Names[N.Text] =
       nominalRecord(N) ? Binding{Binding::Nominal, {&N}} : Binding{};
   if (!N.Generics.empty() && N.Generics.back().Pack) {

@@ -32,6 +32,7 @@ struct Options {
   uint64_t MaxNormalNodes = 100000, MaxSolverSteps = 1000000,
            MaxInstantiations = 1000000;
   std::string Input, Output, Config, RootID;
+  std::string LogicalSource, StaticIdentityNamespace;
   std::string FPProfile = "strict", FPRounding, DefaultReal = "f64",
               LiteralRounding = "nearest_ties_even";
   std::string InitialRounding, FPSubnormal, InitialSubnormal;
@@ -67,6 +68,7 @@ inline bool operatorSpelling(llvm::StringRef Name) {
 bool builtin(llvm::StringRef);
 bool builtinPredicate(llvm::StringRef);
 bool integerLibraryName(llvm::StringRef, bool ExplicitDestination = false);
+bool floatingSpecialName(llvm::StringRef);
 bool bitExtractionName(llvm::StringRef);
 bool realToken(llvm::StringRef);
 bool floating(llvm::StringRef);
@@ -141,6 +143,8 @@ struct Node {
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
 bool bitExtensionArgument(const Node &);
+bool floatingSpecialSignArgument(const Node &, unsigned Child);
+bool castRoundingArgument(const Node &);
 bool usesNumericLibrary(const Node &);
 using EffectSet = std::set<std::string>;
 using EffectBound = std::optional<EffectSet>;

@@ -610,21 +610,24 @@ std::string substituteBinders(llvm::StringRef Text, const Node &Decl,
                               const Node *New) {
   std::string Key;
   while (!Text.empty()) {
-    auto Word = Text.take_while([](char C) {
-      return llvm::isAlnum(C) || C == '_' || C == '$' ||
-             static_cast<unsigned char>(C) >= 128;
-    });
+    if (Text.front() == '\'' || Text.front() == '"') {
+      auto Literal = quotedSpelling(Text);
+      Key += Literal;
+      Text = Text.drop_front(Literal.size());
+      continue;
+    }
+    auto Word = Text.take_while(identifierByte);
     if (Word.empty()) {
       Key += Text.front();
       Text = Text.drop_front();
       continue;
     }
-    auto I =
-        llvm::find_if(Decl.Generics, [&](auto &G) { return G.Text == Word; });
-    if (I == Decl.Generics.end())
+    auto I = std::find_if(Decl.Generics.rbegin(), Decl.Generics.rend(),
+                          [&](const Node &G) { return G.Text == Word; });
+    if (I == Decl.Generics.rend())
       Key += Word.str();
     else {
-      size_t Pos = I - Decl.Generics.begin();
+      size_t Pos = std::prev(I.base()) - Decl.Generics.begin();
       Key += New ? New->Generics[Pos].Text : "$" + std::to_string(Pos);
     }
     Text = Text.drop_front(Word.size());
@@ -878,29 +881,80 @@ bool cpn::sameGenericValueContracts(const Node &A, const Node &B) {
                        normalizedValueContracts(B));
 }
 
-bool cpn::sameGenericArgument(const Node &A, const Node &B, const Node &From,
-                              const Node &To) {
-  if (A.K != B.K || A.Pack != B.Pack || A.Definition != B.Definition ||
-      A.ExplicitApplication != B.ExplicitApplication ||
-      A.Settings != B.Settings || A.Children.size() != B.Children.size() ||
-      A.TemplateArgs.size() != B.TemplateArgs.size() ||
-      normalized(A.Type, From) != normalized(B.Type, To))
-    return false;
-  if (A.K == Node::Number) {
-    auto X = integerLiteral(A.At), Y = integerLiteral(B.At);
-    unsigned W = std::max(X.getBitWidth(), Y.getBitWidth());
-    if (X.zextOrTrunc(W) != Y.zextOrTrunc(W))
-      return false;
-  } else if (A.K != Node::TypeArg && A.K != Node::Call &&
-             normalized(A.Text, From) != normalized(B.Text, To))
-    return false;
-  auto Match = [&](const Node &L, const Node &R) {
-    return sameGenericArgument(L, R, From, To);
+// Match the owner head under an injective renaming of its binders. The source
+// prefix can put a final pack after member binders even when the pack belongs
+// to the owning type. Owner arguments identify which binders belong to it.
+std::optional<std::vector<size_t>> cpn::matchOwnerBinders(
+    llvm::ArrayRef<Node> Pattern, llvm::ArrayRef<Node> Arguments,
+    llvm::ArrayRef<Node> Formals, llvm::ArrayRef<Node> Binders,
+    llvm::ArrayRef<size_t> Enclosing) {
+  if (Pattern.size() != Arguments.size() || Formals.size() > Binders.size())
+    return {};
+  constexpr size_t Unbound = std::numeric_limits<size_t>::max();
+  std::vector<size_t> Renaming(Enclosing.begin(), Enclosing.end());
+  Renaming.resize(Formals.size(), Unbound);
+  auto TokenPart = [](StringRef S) {
+    if (S.front() == '\'' || S.front() == '"')
+      return quotedSpelling(S);
+    if (identifierByte(S.front()))
+      return S.take_while(identifierByte);
+    return S.take_front();
   };
-  return std::equal(A.Children.begin(), A.Children.end(), B.Children.begin(),
-                    Match) &&
-         std::equal(A.TemplateArgs.begin(), A.TemplateArgs.end(),
-                    B.TemplateArgs.begin(), Match);
+  auto MatchSpelling = [&](StringRef L, StringRef R) {
+    while (!L.empty() && !R.empty()) {
+      auto From = TokenPart(L), To = TokenPart(R);
+      L = L.drop_front(From.size());
+      R = R.drop_front(To.size());
+      auto Formal = std::find_if(Formals.rbegin(), Formals.rend(),
+                                 [&](const Node &P) { return P.Text == From; });
+      if (Formal == Formals.rend()) {
+        if (From != To)
+          return false;
+        continue;
+      }
+      auto Binder =
+          llvm::find_if(Binders, [&](const Node &P) { return P.Text == To; });
+      if (Binder == Binders.end() || Binder->K != Formal->K ||
+          Binder->Pack != Formal->Pack)
+        return false;
+      auto Pos = std::prev(Formal.base()) - Formals.begin();
+      size_t Target = Binder - Binders.begin();
+      if (Renaming[Pos] == Target)
+        continue;
+      if (Renaming[Pos] != Unbound || llvm::is_contained(Renaming, Target))
+        return false;
+      Renaming[Pos] = Target;
+    }
+    return L.empty() && R.empty();
+  };
+  std::function<bool(const Node &, const Node &)> Match;
+  Match = [&](const Node &A, const Node &B) {
+    if (A.K != B.K || A.Pack != B.Pack || A.Definition != B.Definition ||
+        A.ExplicitApplication != B.ExplicitApplication ||
+        A.Settings != B.Settings || A.Children.size() != B.Children.size() ||
+        A.TemplateArgs.size() != B.TemplateArgs.size() ||
+        !MatchSpelling(A.Type, B.Type))
+      return false;
+    if (A.K == Node::Number) {
+      auto X = integerLiteral(A.At), Y = integerLiteral(B.At);
+      unsigned W = std::max(X.getBitWidth(), Y.getBitWidth());
+      if (X.zextOrTrunc(W) != Y.zextOrTrunc(W))
+        return false;
+    } else if (A.K != Node::TypeArg && A.K != Node::Call &&
+               !MatchSpelling(A.Text, B.Text))
+      return false;
+    return std::equal(A.Children.begin(), A.Children.end(), B.Children.begin(),
+                      Match) &&
+           std::equal(A.TemplateArgs.begin(), A.TemplateArgs.end(),
+                      B.TemplateArgs.begin(), Match);
+  };
+  if (!std::equal(Pattern.begin(), Pattern.end(), Arguments.begin(), Match) ||
+      llvm::is_contained(Renaming, Unbound))
+    return {};
+  for (size_t I = Enclosing.size(); I < Formals.size(); ++I)
+    if (!MatchSpelling(Formals[I].Type, Binders[Renaming[I]].Type))
+      return {};
+  return Renaming;
 }
 
 EffectBound cpn::genericEffectBound(const Node &D, bool HasReceiver) {

@@ -58,27 +58,45 @@ rounding and sticky-state behavior in native execution and produce matching
 result classifications during required constant evaluation. The `report_*`
 forms expose the IEEE default value and local status in a `NumericReport<T>`
 record with `value` and `status` fields.
+`infinity<T>`, `quiet_nan<T>` and `signaling_nan<T>` construct binary32 and
+binary64 encodings directly. The fallible NaN forms return `OutOfRange` with
+empty IEEE status for an inadmissible payload.
+Checked and Exact casts support f32, f64, fixed-width integers and platform
+integers. Integer-destination truncation and saturation classify the exact
+source value without generating IEEE events. Named casts accept the applicable
+rounding modes and evaluate untyped real literals at their exact token value.
 
 The minimal `std::Result` binding supports case queries, receiver-qualified
 `value()` and `error()` access, and checked payloadless success for `Result<void,E>`.
-Wrong-case access selects ContractTrap. The fallible accessors and mapping
+Wrong-case checked access selects ContractTrap. `try_value()` and `try_error()`
+return `WrongCase` on an inactive case and preserve payload references through
+the corresponding const-qualified or mutable `std::Ref` on success. Mapping
 adapters remain incomplete.
 
 ### Outstanding Core coverage
 
-* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Independent inner packs bind in their own scopes. Computed specialization ordering uses structural and constant-expression evidence. More complete computed comparisons and mixed owner/member binders in out-of-line definitions remain partial.
+* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Out-of-line generic member definitions bind both the owner and member parameters, including packed and nested owners. Qualified static generic calls can use chained type aliases. More complete computed comparisons and receiver-dependent template argument parsing remain partial.
 * Contract proof is conservative. Override checking proves supported predicate implications against each inherited declaration and its receiver view. Indirect callable types retain selected predicate-check effects and published borrow origins. Stronger proof rules and opaque foreign lifetime contracts remain partial.
-* Record lifetime support still needs complete access checking, construction-state contracts across aliased receivers and inherited layers, construction rollback on continuing failures and complete lifecycle checking during construction and Cleanup.
+* Construction checks recognize immutable receiver aliases and diagnose proved early inherited access. Cleanup checks the reverse frontier and retains reconstructed slots' cleanup rank. Construction contracts through less direct aliases, rollback on continuing failures, and other access and lifecycle checks remain partial.
 * Complete objects and individually selected member and array-element extents support replacement, including by another fitting type. Pointer provenance after untracked foreign writes or raw storage reinterpretation, whole-program escape checking, storage transfer, and allocator ownership remain incomplete.
-* Constant evaluation supports generation-checked replacement of complete automatic objects and elements of automatic arrays. Replacement of a tagged union by an explicit case is supported. StorageView exposes capacity, alignment and identity in native and constant execution. Constant record-member replacement, stronger shared-base and closure lifetime checks, and authored union replacement contracts remain partial.
-* Floating-point arithmetic covers f32 and f64. Cross-family casts, FP context APIs and provider controls need additional implementation.
+* Constant evaluation supports generation-checked replacement of complete automatic objects, ordinary record members and array elements. Replacement of a tagged union by an explicit case is supported. StorageView exposes capacity, alignment and identity in native and constant execution. Direct tagged-payload transitions and stronger shared-base and closure lifetime checks remain partial.
+* Floating-point arithmetic covers f32 and f64. Additional FP context APIs and provider controls remain unavailable.
 * The supported ABI is x86-64 System V for the tested scalar boundary. C++ ABI features, separate compilation, module imports, reflection, exceptions and concurrent execution are unimplemented capabilities.
 
 ### Target and invocation
 
 The driver defaults to the Unicode identifier profile and the Debug integer policy. Use `--preset Release` for Native arithmetic, `--identifiers ascii` for the ASCII profile, or `--config path/to/cpn.config` to supply project configuration. A supplied project file must contain configuration declarations. The project and source use the same CPN26 configuration syntax. Custom uses the target's Checked integer and Strict floating defaults for unspecified operation policies. An untyped literal that needs its disabled default instead fails when materialized.
 
-The LLVM module identifier defaults to the input path. Use `--root-id ID` to assign it an explicit root identity. CPN-internal symbols have module-local linkage. File-scope startup and shutdown use the ELF constructors and destructors emitted by LLVM.
+The default logical source path is relative to the project configuration's
+directory, or to the working directory for a standalone build. An input
+outside that directory defaults to its basename. `--logical-source PATH`
+supplies a project-relative path explicitly. The root identity defaults to the
+logical source path, with `--root-id ID` available for independently owned
+roots with the same logical path. CPN-internal symbols have module-local
+linkage. File-scope startup and shutdown use ELF constructors and destructors.
+A project can explicitly select `static.schedule = serial`, `static.workers = 1`,
+and a nonempty `static.identity_namespace`. The namespace defaults to the root
+identity.
 
 The target has eight-bit bytes and 64-bit platform integers. Native addition, subtraction, multiplication and negation use modulo arithmetic. Exceptional Native division or remainder and invalid variable shift counts terminate through a target trap. Known invalid ordinary division or shift domains produce a source diagnostic. Direct object creation writes an ELF object suitable for the ordinary system linker.
 

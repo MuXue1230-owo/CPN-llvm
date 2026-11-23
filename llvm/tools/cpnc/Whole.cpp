@@ -249,6 +249,9 @@ Value Frame::transferOwner(const Node &C, const Node &Operand) {
   }
   if (!IR || !Target.Address || !U.Records.count(Target.Type))
     fail(C.At, "destruction transfer requires a class layer");
+  if (F && F->Decl.K == Node::Destructor && Target.Address == Self.Address &&
+      Target.Type == Self.Type)
+    fail(C.At, "LIFE005: destruction ownership is frozen during destruction");
   const auto &Layer = U.Records.at(Target.Type);
   auto Virtuals = llvm::ArrayRef(Layer.Bases).take_front(Layer.VirtualCount);
   auto T = resolve(C.TemplateArgs.front().Type, C.At);
@@ -287,6 +290,15 @@ Value Frame::baseRequest(const Node &C, const Node &Operand) {
     fail(C.At, "base request requires an object or pointer to a class layer");
   const auto &R = U.Records.at(Object.Type);
   auto Path = selectBase(R, {}, C.TemplateArgs.front());
+  auto Own = Object.Address == Self.Address && Object.Type == Self.Type;
+  if (F && F->Decl.K == Node::Constructor && Own)
+    fail(C.At, "LIFE005: an early base request requires an Alive object");
+  if (InDestructorCleanup) {
+    if (C.Text == "abandon_base")
+      fail(C.At, "LIFE005: base Abandon is forbidden in Cleanup");
+    if (Own && Path.size() == 1)
+      checkCleanupFrontier(R.Fields.at(Path.front()).Decl.Text, C.At);
+  }
   auto Target = baseView(Object, Path);
   if (C.Text == "abandon_base")
     checkAbandon(Target.Type, C.At);

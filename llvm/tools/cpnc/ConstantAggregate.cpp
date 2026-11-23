@@ -121,15 +121,21 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
                           Value *BaseDestination) {
   ConstantActivation Activation(U, At);
   const auto Type = unconst(Source.Type);
-  if (Source.Location && StringRef(Type).ends_with("]")) {
+  if (Source.Location) {
     const auto &Place = *Source.Location;
     Place.checkLifetime(At);
     const auto &Storage = Place.Root->ConstantIdentity.Storage;
-    if (Storage && !Storage->ArrayElements.empty()) {
+    if (Storage && !Storage->Subobjects.empty() &&
+        StringRef(Type).ends_with("]")) {
       const auto Position = Place.indices();
-      if (llvm::any_of(Storage->ArrayElements, [&](const auto &Entry) {
+      size_t LastElement = Position.size();
+      for (auto Array = Type; StringRef(Array).ends_with("]");
+           Array = unconst(element(Array)))
+        ++LastElement;
+      if (llvm::any_of(Storage->Subobjects, [&](const auto &Entry) {
             const auto &[Path, Element] = Entry;
             return Element.Ended && Path.size() > Position.size() &&
+                   Path.size() <= LastElement &&
                    llvm::ArrayRef(Path).take_front(Position.size()) ==
                        llvm::ArrayRef(Position);
           }))
@@ -658,7 +664,24 @@ ConstantStorageSlot &ConstantPlace::registerExtent() const {
   auto &Storage = *Root->ConstantIdentity.Storage;
   if (Steps.empty())
     return Storage;
-  return Storage.ArrayElements[indices()];
+  return Storage.Subobjects[indices()];
+}
+
+const ConstantStorageSlot *ConstantPlace::registeredExtent() const {
+  const auto &Storage = Root->ConstantIdentity.Storage;
+  if (!Storage)
+    return nullptr;
+  if (Steps.empty())
+    return Storage.get();
+  auto I = Storage->Subobjects.find(indices());
+  return I == Storage->Subobjects.end() ? nullptr : &I->second;
+}
+
+bool ConstantPlace::hasLiveExtent() const {
+  auto *Extent = registeredExtent();
+  return !Extent || !Extent->Ended ||
+         (Extent->Replacement &&
+          !Extent->Replacement->ConstantIdentity.Storage->Ended);
 }
 
 void ConstantPlace::checkLifetime(const Token &At, bool ExtentOnly) const {
@@ -669,21 +692,17 @@ void ConstantPlace::checkLifetime(const Token &At, bool ExtentOnly) const {
     return;
   if (Identity->Ended && (!ExtentOnly || !Steps.empty()))
     fail(At, "ended object generation");
-  if (Identity->Retiring && Steps.empty() && !ExtentOnly)
-    fail(At, "object destruction is already in progress");
-  if (Identity->ArrayElements.empty())
+  if (Identity->Subobjects.empty())
     return;
   std::vector<unsigned> Path;
   for (const auto &Step : Steps) {
     Path.push_back(Step.Index);
-    auto I = Identity->ArrayElements.find(Path);
-    if (I == Identity->ArrayElements.end())
+    auto I = Identity->Subobjects.find(Path);
+    if (I == Identity->Subobjects.end())
       continue;
     bool Exact = Path.size() == Steps.size();
     if (I->second.Ended && (!ExtentOnly || !Exact))
       fail(At, "ended object generation");
-    if (I->second.Retiring && Exact && !ExtentOnly)
-      fail(At, "object destruction is already in progress");
   }
 }
 

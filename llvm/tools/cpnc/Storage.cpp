@@ -50,6 +50,10 @@ llvm::Constant *Context::typeID(const std::string &T) {
   return ID;
 }
 bool Frame::usesStorage(const Node &N) {
+  if (llvm::StringRef(N.Type).contains("Ref<") ||
+      (N.K == Node::Name && llvm::StringRef(N.Text).contains("Ref<")) ||
+      (N.K == Node::Member && (N.Text == "try_value" || N.Text == "try_error")))
+    return true;
   if (N.K == Node::Lambda &&
       llvm::any_of(N.TemplateArgs, [](const Node &Capture) {
         return Capture.Type == "borrow" || Capture.Type == "this";
@@ -313,14 +317,11 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
   Place.checkLifetime(C.At, View);
   if (Place.Root->Address)
     fail(C.At, "constant storage operation requires an automatic object");
-  auto Type = Place.Root->Type;
-  for (const auto &Step : Place.Steps) {
-    if (!llvm::StringRef(Type).ends_with("]") || Step.Alternative ||
-        !Step.BaseOwner.empty())
-      fail(C.At, "constant storage operation requires an automatic object "
-                 "or array element");
-    Type = element(Type);
-  }
+  if ((!Place.Steps.empty() && !Place.Steps.back().BaseOwner.empty()) ||
+      llvm::any_of(Place.Steps,
+                   [](const auto &Step) { return Step.Alternative; }))
+    fail(C.At, "constant storage operation requires an automatic object, "
+               "record member or array element");
   if (View) {
     auto Storage = Place.Root->ConstantIdentity.Storage;
     if (Storage->OriginalExtent && Place.Steps.empty())
@@ -328,6 +329,25 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
     auto Address = constantAddress(Place, C.At, /*ExtentOnly=*/true);
     Address.Type = StorageViewType;
     return Address;
+  }
+  if (InDestructorCleanup && ConstantReceiver) {
+    const auto &Owner = U.Records.at(ConstantReceiver->Type);
+    const auto &Storage = Place.Root->ConstantIdentity.Storage;
+    const auto &Requested = Storage->OriginalExtent && Place.Steps.empty()
+                                ? *Storage->OriginalExtent
+                                : Place;
+    for (unsigned I = Owner.Bases.size(); I < Owner.Fields.size(); ++I) {
+      auto Member = constantFieldPlace(*ConstantReceiver, I);
+      if (Requested.Root == Member.Root &&
+          Requested.Steps.size() >= Member.Steps.size() &&
+          llvm::ArrayRef(Requested.Steps).take_front(Member.Steps.size()) ==
+              llvm::ArrayRef(Member.Steps)) {
+        if (C.Text == "abandon")
+          fail(C.At, "LIFE005: abandon is unavailable in Cleanup");
+        checkCleanupFrontier(Owner.Fields[I].Decl.Text, C.At);
+        break;
+      }
+    }
   }
   if (Place.Steps.empty() && ConstantReceiver == Place.Root && F &&
       F->Decl.K == Node::Destructor)
@@ -441,6 +461,11 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
       (!U.Records.count(V.Type) || !U.Records.at(V.Type).VirtualDestructor))
     fail(C.At,
          "complete destruction through a base requires virtual destruction");
+  if (F && V.Address == Self.Address && V.Type == Self.Type &&
+      (F->Decl.K == Node::Constructor || F->Decl.K == Node::Destructor))
+    fail(C.At, "LIFE005: retirement requires an Alive complete object");
+  if (InDestructorCleanup)
+    checkCleanupStorageRequest(V, C.Text == "destroy");
   if (C.Text == "abandon")
     checkAbandon(V.Type, C.At);
   retireStorage(V, C.Text == "destroy", true);

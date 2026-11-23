@@ -15,12 +15,15 @@ Flow merge(Flow A, Flow B) {
 unsigned observe(unsigned State, History H) {
   return (State & ~Unseen) | ((State & Unseen) ? unsigned(H) : 0);
 }
-bool field(const Node &N, const std::string &Slot, const Names &Locals) {
+bool receiverName(const Node &N, const Names &Aliases) {
+  return N.K == Node::Name && (N.Text == "this" || Aliases.count(N.Text));
+}
+bool field(const Node &N, const std::string &Slot, const Names &Locals,
+           const Names &Aliases) {
   if (N.K == Node::Name)
     return N.Text == Slot && !Locals.count(Slot);
-  return N.K == Node::Member && N.Text == Slot && N.Definition &&
-         N.Children.front().K == Node::Name &&
-         N.Children.front().Text == "this";
+  return N.K == Node::Member && N.Text == Slot &&
+         receiverName(N.Children.front(), Aliases);
 }
 struct SourceAnalysis {
   Frame &Em;
@@ -31,6 +34,7 @@ struct SourceAnalysis {
   std::map<std::string, unsigned> Labels, Breaks, Continues;
   Function *Owner = nullptr;
   std::vector<const Node *> Declarations;
+  Names ReceiverAliases;
   SourceAnalysis(Frame &Em, const std::string &Slot,
                  const std::vector<std::pair<Function *, const Node *>> &Chain,
                  std::map<const Node *, Function *> &Selected)
@@ -38,9 +42,8 @@ struct SourceAnalysis {
   Function *method(const Node &Call, const Names &Locals) {
     const auto &Callee = Call.Children.front();
     bool Self = Callee.K == Node::Name && !Locals.count(Callee.Text);
-    Self |= Callee.K == Node::Member && Callee.Definition &&
-            Callee.Children[0].K == Node::Name &&
-            Callee.Children[0].Text == "this";
+    Self |= Callee.K == Node::Member &&
+            receiverName(Callee.Children.front(), ReceiverAliases);
     if (!Self)
       return nullptr;
     auto Key = Owner->Owner + "::" + Callee.Text;
@@ -107,15 +110,16 @@ struct SourceAnalysis {
       }
       return S;
     }
-    if (field(N, Slot, Locals) || (N.K == Node::Name && N.Text == "this"))
+    if (field(N, Slot, Locals, ReceiverAliases) ||
+        receiverName(N, ReceiverAliases))
       return observe(S, Read);
     if (N.K == Node::Binary && N.Text == "=" &&
-        field(N.Children[0], Slot, Locals))
+        field(N.Children[0], Slot, Locals, ReceiverAliases))
       return observe(expression(N.Children[1], S, Locals), Written);
     // A qualified access to a different immediate member does not read this
     // slot. Passing this to an opaque call, however, exposes the whole layer.
-    if (N.K == Node::Member && N.Definition &&
-        N.Children.front().K == Node::Name && N.Children.front().Text == "this")
+    if (N.K == Node::Member &&
+        receiverName(N.Children.front(), ReceiverAliases))
       return S;
     if (N.K == Node::Conditional) {
       S = expression(N.Children[0], S, Locals);
@@ -149,6 +153,7 @@ struct SourceAnalysis {
     auto *D = Chain[Depth].first;
     llvm::SaveAndRestore Current(Owner, D);
     llvm::SaveAndRestore Environment(Declarations);
+    llvm::SaveAndRestore Aliases(ReceiverAliases, Names{});
     Declarations.clear();
     // Gotos form ordinary CFG edges, including back edges and jumps into
     // another lexical block admitted by the binding pass. Each destination
@@ -187,6 +192,7 @@ struct SourceAnalysis {
     switch (N.K) {
     case Node::Block: {
       llvm::SaveAndRestore Environment(Declarations);
+      llvm::SaveAndRestore Aliases(ReceiverAliases);
       Names Scope = Locals;
       Flow Out{S};
       for (auto &C : A) {
@@ -200,17 +206,35 @@ struct SourceAnalysis {
     case Node::Enumeration:
     case Node::Union:
       Locals.insert(N.Text);
+      ReceiverAliases.erase(N.Text);
       return {S};
     case Node::Init:
       return {S};
     case Node::Alias:
       Declarations.push_back(&N);
       Locals.insert(N.Text);
+      ReceiverAliases.erase(N.Text);
       return {S};
-    case Node::Object:
+    case Node::Object: {
       Declarations.push_back(&N);
       Locals.insert(N.Text);
+      ReceiverAliases.erase(N.Text);
+      if (Em.IR && N.Children.size() == 1 && !N.Settings.count("storage")) {
+        const auto &Init = N.Children.front();
+        bool Pointer = (N.Const && N.Type == Owner->Owner + "*") ||
+                       N.Type == "const<" + Owner->Owner + "*>";
+        bool Reference = N.Type == Owner->Owner + "&";
+        if ((Pointer && receiverName(Init, ReceiverAliases)) ||
+            (Reference &&
+             (receiverName(Init, ReceiverAliases) ||
+              (Init.K == Node::Unary && Init.Text == "*" &&
+               receiverName(Init.Children.front(), ReceiverAliases))))) {
+          ReceiverAliases.insert(N.Text);
+          return {S};
+        }
+      }
       return {expression(N, S, Locals)};
+    }
     case Node::Delegate:
       for (auto &C : A)
         S = expression(C, S, Locals);
@@ -243,6 +267,7 @@ struct SourceAnalysis {
     case Node::While:
     case Node::Do: {
       llvm::SaveAndRestore Environment(Declarations);
+      llvm::SaveAndRestore Aliases(ReceiverAliases);
       bool For = N.K == Node::For, Do = N.K == Node::Do;
       Names Scope = Locals;
       if (For)
@@ -289,6 +314,7 @@ struct SourceAnalysis {
       for (const auto &Arm : llvm::ArrayRef(A).drop_front()) {
         Names Scope = Locals;
         llvm::SaveAndRestore Bindings(Declarations);
+        llvm::SaveAndRestore Aliases(ReceiverAliases);
         std::vector<Node> Payload;
         if (!Switch && !Arm.Params.empty()) {
           const Case *Variant = Em.findCase(Arm.Text, Arm.At);
@@ -304,6 +330,7 @@ struct SourceAnalysis {
             V.Type = Variant->Types[J];
             V.Const = P.Type == "ref" && Variant->Decl.Params[J].Const;
             Scope.insert(P.Text);
+            ReceiverAliases.erase(P.Text);
             Declarations.push_back(&V);
           }
         }
@@ -380,9 +407,19 @@ void Construction::checkAccess(Frame &Em, const Token &T) const {
   if (*States.begin() <= Slot) {
     Em.Opt.diagnose(T, Severity::Anomaly, "LIFE003",
                     "slot lifetime depends on the incoming path");
-    Em.guard(Em.B.CreateICmpULE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
-                                Em.B.getInt32(Slot)));
+    if (Em.Opt.RawValidation)
+      Em.guard(Em.B.CreateICmpULE(Em.B.CreateLoad(Em.B.getInt32Ty(), Cursor),
+                                  Em.B.getInt32(Slot)),
+               "lifecycle");
   }
+}
+void Construction::checkBaseAccess(Frame &Em, const Value &View,
+                                   const Token &At) const {
+  if (!View.ConstructionBase || View.ConstructionBase->first != Object.Address)
+    return;
+  auto Base = At;
+  Base.Text = Order[View.ConstructionBase->second];
+  checkAccess(Em, Base);
 }
 void Construction::atEachPosition(Frame &Em,
                                   const std::function<void()> &Action) {
@@ -414,12 +451,21 @@ std::optional<Value> Construction::firstWrite(Frame &Em, const Node &N) {
   if (OrdinaryAssignment == &N)
     return {};
   auto &L = N.Children[0];
-  Names Locals;
+  Names Locals, ReceiverAliases;
   for (auto &Scope : Em.Scopes)
-    for (auto &KV : Scope.Names)
-      Locals.insert(KV.first);
-  auto I = std::find_if(Reserved.begin(), Reserved.end(),
-                        [&](auto &Name) { return field(L, Name, Locals); });
+    for (const auto &[Name, V] : Scope.Names) {
+      Locals.insert(Name);
+      ReceiverAliases.erase(Name);
+      if (Em.IR && !V.Readonly && V.Type == Object.Type &&
+          V.Address == Object.Address)
+        ReceiverAliases.insert(Name);
+      if (Em.IR && V.Readonly && V.Type == Object.Type + "*" &&
+          V.IR == Object.Address)
+        ReceiverAliases.insert(Name);
+    }
+  auto I = std::find_if(Reserved.begin(), Reserved.end(), [&](auto &Name) {
+    return field(L, Name, Locals, ReceiverAliases);
+  });
   if (I == Reserved.end())
     return {};
   size_t Index = std::find(Order.begin(), Order.end(), *I) - Order.begin();

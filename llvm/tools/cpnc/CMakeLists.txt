@@ -28,6 +28,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Emit.cpp
     FamilyMembers.cpp
     Floating.cpp
+    FloatingSpecial.cpp
     ForeignContracts.cpp
     Generic.cpp
     Integer.cpp
@@ -36,6 +37,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Lexer.cpp
     Lifetime.cpp
     MemoryLibrary.cpp
+    NumericLiteral.cpp
     Whole.cpp
     Parser.cpp
     PointerCalls.cpp

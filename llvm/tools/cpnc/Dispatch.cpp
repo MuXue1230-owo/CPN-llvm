@@ -295,6 +295,9 @@ Value Frame::constantField(Value &Object, unsigned I, const Token &At) {
 }
 
 Value Frame::baseView(Value Obj, const BasePath &Path) {
+  if (IR && Transaction && !Path.empty() && Obj.Address == Self.Address &&
+      Obj.Type == Self.Type)
+    Obj.ConstructionBase = {Obj.Address, Path.front()};
   if (!IR && !Path.empty() && !Obj.Address) {
     auto Place = constantBasePlace(placeFor(Obj), Path);
     auto Result = Place.read(*this, {});

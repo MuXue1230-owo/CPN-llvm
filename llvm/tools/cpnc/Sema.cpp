@@ -1131,8 +1131,9 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   bindOwners(Name, P);
   std::vector<Function *> Members;
   for (auto &D : N.Children)
-    if (D.K == Node::Constructor || D.K == Node::Destructor ||
-        D.K == Node::Function) {
+    if ((D.K == Node::Constructor || D.K == Node::Destructor ||
+         D.K == Node::Function) &&
+        !D.Settings.count("$cpn.result.accessor")) {
       llvm::SaveAndRestore Policy(Opt);
       for (const auto &PrefixPolicy : D.Policies)
         configure(Opt, PrefixPolicy, ConfigScope::Declaration);
@@ -1276,22 +1277,31 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
     return;
   auto Body = *FamilyDecl.Body;
   const auto &Public = F.Decl;
+  auto Bindings = FamilyDecl.BodyBindings;
   if (Body.Generics.back().Pack) {
-    Family Source{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite, F.Env};
+    Family Source{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite, Bindings};
     auto Expanded = expand(
         Source, Public.Generics.size() - (Body.Generics.size() - 1), Body.At);
     Body = std::move(Expanded.Decl);
-    F.Env.PackLengths = std::move(Expanded.Enclosing.PackLengths);
+    Bindings.PackLengths = std::move(Expanded.Enclosing.PackLengths);
   }
-  auto Original = F.Env;
   for (size_t I = 0; I < Body.Generics.size(); ++I) {
     const auto &P = Public.Generics[I], &Q = Body.Generics[I];
     if (P.K == Node::TypeParam)
-      F.Env.Types[Q.Text] = Original.Types.at(P.Text);
+      Bindings.Types[Q.Text] = F.Env.Types.at(P.Text);
     else
-      F.Env.Values[Q.Text] = Original.Values.at(P.Text);
+      Bindings.Values[Q.Text] = F.Env.Values.at(P.Text);
   }
-  F.ExitedLifetimes = validate(Body, F.Prefix, F.Owner);
+  for (const auto &[Name, Type] : Bindings.Types)
+    F.Env.Types[Name] = Type;
+  for (const auto &[Name, Value] : Bindings.Values)
+    F.Env.Values[Name] = Value;
+  for (const auto &[Name, Count] : Bindings.PackLengths)
+    F.Env.PackLengths[Name] = Count;
+  {
+    EnterDefinition Site(*this, *FamilyDecl.BodySite);
+    F.ExitedLifetimes = validate(Body, F.Prefix, F.Owner, nullptr, &Bindings);
+  }
   for (size_t I = 0; I < Body.Params.size(); ++I) {
     Body.Params[I].Children = Public.Params[I].Children;
     Body.Params[I].Const |= Public.Params[I].Const;
@@ -1301,6 +1311,21 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
   Body.Contracts = Public.Contracts;
   F.Decl = std::move(Body);
   F.Definition = *FamilyDecl.BodySite;
+}
+
+void Context::setGenericBody(Family &F, Node Body, DefinitionSite Site,
+                             Substitution Bindings) {
+  F.Body = std::move(Body);
+  F.BodySite = std::move(Site);
+  F.BodyBindings = std::move(Bindings);
+  std::vector<Function *> Pending;
+  for (auto &Instance : Functions)
+    if (Instance.Origin == &F)
+      Pending.push_back(&Instance);
+  for (auto *Instance : Pending) {
+    attachGenericBody(*Instance, F);
+    emit(*Instance);
+  }
 }
 
 void Context::genericFunction(const Node &D, const std::string &Name,
@@ -1361,16 +1386,7 @@ void Context::genericFunction(const Node &D, const std::string &Name,
       fail(D.At, "incompatible generic definition contract");
   if (D.Prototype)
     return;
-  It->Body = D;
-  It->BodySite = site();
-  std::vector<Function *> Pending;
-  for (auto &F : Functions)
-    if (F.Origin == &*It)
-      Pending.push_back(&F);
-  for (auto *F : Pending) {
-    attachGenericBody(*F, *It);
-    emit(*F);
-  }
+  setGenericBody(*It, D, site());
 }
 
 void Context::unit(const std::vector<Node> &Decls, std::string P) {
@@ -1581,10 +1597,11 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     Ranks.emplace(Name, I);
     StorageRanks.emplace(Storage(Name), I);
   }
-  std::set<std::string> Ids;
+  std::set<std::pair<std::string, std::string>> Ids;
   for (const auto &[Name, Prefix, N] : U.Statics) {
     if (N.Settings.count("static_id") &&
-        !Ids.insert(N.Settings.at("static_id")).second)
+        !Ids.emplace(U.Opt.StaticIdentityNamespace, N.Settings.at("static_id"))
+             .second)
       fail(N.At, "STAT001: duplicate static identity");
     if (N.Settings.count("init_after")) {
       for (const auto &Spelling : splitArguments(N.Settings.at("init_after"))) {

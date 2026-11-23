@@ -21,33 +21,102 @@ void Frame::endField(const std::string &Slot, const Token &At,
   auto It = FieldFlags.find(Slot);
   if (It == FieldFlags.end())
     fail(At, "request must select a direct subobject");
-  auto *Alive = B.CreateLoad(B.getInt1Ty(), It->second);
+  const auto &R = U.Records.at(Self.Type);
+  auto FieldIndex = unsigned(
+      llvm::find_if(R.Fields,
+                    [&](const Field &F) { return F.Decl.Text == Slot; }) -
+      R.Fields.begin());
+  assert(FieldIndex < R.Fields.size());
+  if (Explicit && InDestructorCleanup) {
+    if (!RunDestructor)
+      fail(At, "LIFE005: member Abandon is forbidden in Cleanup");
+    checkCleanupFrontier(Slot, At);
+  }
+  auto *Alive = destructionSlotAlive(FieldIndex);
   if (Explicit)
-    guard(B.CreateNot(Alive));
+    guard(B.CreateNot(Alive), "lifecycle");
   auto *Do = block("retire.slot"), *Done = block("retire.next");
   B.CreateCondBr(Alive, Do, Done);
   B.SetInsertPoint(Do);
-  B.CreateStore(B.getFalse(), It->second);
   Token Name = At;
   Name.Text = Slot;
-  if (!RunDestructor && Explicit) {
-    auto Field = member(Self, Name);
-    checkAbandon(Field.Type, At);
+  auto Field = member(Self, Name, /*NeedLive=*/false);
+  if (Explicit) {
+    if (!RunDestructor)
+      checkAbandon(Field.Type, At);
     ensureLive(Field, At);
     markStorageWrite(Field.Address);
-    if (Field.Slot)
-      retireStorage(Field, false);
   }
-  if (RunDestructor) {
-    auto Field = member(Self, Name);
-    if (Explicit)
-      markStorageWrite(Field.Address);
-    dropChild(Self, Field,
-              llvm::StringRef(Slot).starts_with("$base:") ||
-                  llvm::StringRef(Slot).starts_with("$virtual:"));
-  }
+  B.CreateStore(B.getFalse(), It->second);
+  if (RunDestructor)
+    dropChild(Self, Field, FieldIndex < R.Bases.size());
+  else if (Field.Slot)
+    retireStorage(Field, false);
   branch(Done);
   B.SetInsertPoint(Done);
+}
+llvm::Value *Frame::destructionMemberRegistration(unsigned Index) {
+  const auto &Field = U.Records.at(Self.Type).Fields[Index];
+  return B.CreateCall(U.M.getFunction("cpn.slot.find"),
+                      {fieldAddress(Self, Index), U.typeID(Field.Type),
+                       slotFor(Self), B.getTrue()});
+}
+
+llvm::Value *Frame::destructionSlotAlive(unsigned Index) {
+  const auto &R = U.Records.at(Self.Type);
+  const auto &Field = R.Fields[Index];
+  auto *Flag = B.CreateLoad(B.getInt1Ty(), FieldFlags.at(Field.Decl.Text));
+  if (Index < R.Bases.size()) {
+    if (!U.Whole)
+      return Flag;
+    auto *Available = B.CreateCall(
+        U.M.getFunction("cpn.view.available"),
+        {fieldAddress(Self, Index), U.typeID(Field.Type), B.getFalse()});
+    return B.CreateAnd(Flag, Available);
+  }
+  if (!TracksStorage)
+    return Flag;
+  // Retirement through a borrowed view or an active replacement changes
+  // the registration without modifying this activation's flags.
+  auto *Registered = destructionMemberRegistration(Index);
+  auto *Stamp = B.CreateCall(U.M.getFunction("cpn.generation"),
+                             {Registered, B.getFalse()});
+  return B.CreateSelect(B.CreateIsNull(Registered), Flag,
+                        B.CreateTrunc(Stamp, B.getInt1Ty()));
+}
+
+void Frame::checkCleanupFrontier(const std::string &Slot, const Token &At) {
+  const auto &R = U.Records.at(IR ? Self.Type : ConstantReceiver->Type);
+  auto Selected = llvm::find_if(
+      R.Fields, [&](const Field &F) { return F.Decl.Text == Slot; });
+  assert(Selected != R.Fields.end());
+  if (!IR) {
+    for (auto I = Selected + 1; I != R.Fields.end(); ++I)
+      if (ConstantMembersAlive.at(I->Decl.Text) &&
+          constantFieldPlace(*ConstantReceiver, I - R.Fields.begin())
+              .hasLiveExtent())
+        fail(At, "LIFE005: Cleanup must destroy the reverse-frontier slot");
+    return;
+  }
+  llvm::Value *HasLater = B.getFalse();
+  for (auto I = Selected + 1; I != R.Fields.end(); ++I)
+    HasLater = B.CreateOr(HasLater, destructionSlotAlive(I - R.Fields.begin()));
+  guard(HasLater, "lifecycle");
+}
+
+void Frame::checkCleanupStorageRequest(Value Object, bool Destroy) {
+  const auto &R = U.Records.at(Self.Type);
+  llvm::Value *HasLater = B.getFalse(), *Invalid = B.getFalse();
+  // A replacement can be reached through a typed borrow of its new type.
+  // Its registration still identifies the original member's cleanup rank.
+  for (size_t I = R.Fields.size(); I > R.Bases.size(); --I) {
+    auto *Matches =
+        B.CreateICmpEQ(Object.Slot, destructionMemberRegistration(I - 1));
+    auto *Bad = Destroy ? B.CreateAnd(Matches, HasLater) : Matches;
+    Invalid = B.CreateOr(Invalid, Bad);
+    HasLater = B.CreateOr(HasLater, destructionSlotAlive(I - 1));
+  }
+  guard(Invalid, "lifecycle");
 }
 void Frame::checkAbandon(const std::string &Type, const Token &At) {
   auto Nontrivial = [&](auto &&Visit, const std::string &T) -> bool {
@@ -91,8 +160,9 @@ void Frame::retireConstantCell(Value &Cell, const Token &At, bool Explicit,
 }
 
 void Frame::retireConstantExtent(ConstantPlace Place, const Token &At,
-                                 bool Explicit, bool Destroy) {
+                                 bool Explicit, bool Destroy, bool AsBase) {
   Place.trackLifetime();
+  Place.checkLifetime(At, /*ExtentOnly=*/true);
   auto &Slot = Place.registerExtent();
   if (Slot.Retiring || Slot.Constructing)
     fail(At, "object lifetime transition is already in progress");
@@ -105,14 +175,16 @@ void Frame::retireConstantExtent(ConstantPlace Place, const Token &At,
   }
   auto Object = Place.read(*this, At);
   llvm::SaveAndRestore Retiring(Slot.Retiring, true);
+  auto End = llvm::scope_exit([&] { Slot.Ended = true; });
   const auto &Storage = *Place.Root->ConstantIdentity.Storage;
-  if (llvm::StringRef(Place.Type).ends_with("]") &&
-      !Storage.ArrayElements.empty()) {
+  if (llvm::StringRef(Place.Type).ends_with("]")) {
+    const auto Element = unconst(element(Place.Type));
+    if (!U.aggregate(Element) && Storage.Subobjects.empty())
+      return;
     auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Place.Type, At));
     auto Count = llvm::StringRef(Place.Type).ends_with("[0]")
                      ? 0
                      : Array->getNumElements();
-    const auto Element = unconst(element(Place.Type));
     for (uint64_t I = Count; I; --I) {
       U.chargeConstant(At);
       auto Child = Place;
@@ -120,32 +192,45 @@ void Frame::retireConstantExtent(ConstantPlace Place, const Token &At,
       Child.Steps.push_back({unsigned(I - 1)});
       retireConstantExtent(std::move(Child), At, false, Destroy);
     }
-    Slot.Ended = true;
     return;
   }
-  Slot.Ended = true;
-  if (Destroy)
-    constantDrop(Object, At);
-  else
-    checkAbandon(Object.Type, At);
+  if (Destroy) {
+    Object.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    constantDrop(Object, At, AsBase);
+    return;
+  }
+
+  checkAbandon(Object.Type, At);
+  // Each replacement has its own typed generation, even though its storage
+  // still belongs to the containing extent. Abandon also ends these
+  // generations.
+  const auto Position = Place.indices();
+  for (const auto &[Path, Child] : Storage.Subobjects)
+    if (Child.Replacement && Path.size() > Position.size() &&
+        llvm::ArrayRef(Path).take_front(Position.size()) ==
+            llvm::ArrayRef(Position)) {
+      U.chargeConstant(At);
+      retireConstantCell(*Child.Replacement, At, false, false);
+    }
 }
 
-void Frame::endConstantField(const std::string &Slot, bool Run,
-                             const Token &At) {
-  auto &Alive = ConstantMembersAlive.at(Slot);
-  if (!Alive)
+void Frame::endConstantField(const std::string &Slot, bool Run, const Token &At,
+                             bool Explicit) {
+  if (!ConstantMembersAlive.at(Slot))
     fail(At, "subobject destruction obligation already consumed");
   const auto &R = U.Records.at(ConstantReceiver->Type);
   unsigned Index =
       llvm::find_if(R.Fields,
                     [&](const cpn::Field &F) { return F.Decl.Text == Slot; }) -
       R.Fields.begin();
-  auto V = constantField(*ConstantReceiver, Index, At);
-  Alive = false;
-  if (Run)
-    constantDrop(V, At, Index < R.Bases.size());
-  else
-    checkAbandon(V.Type, At);
+  if (Explicit && InDestructorCleanup) {
+    if (!Run)
+      fail(At, "LIFE005: abandon is unavailable in Cleanup");
+    checkCleanupFrontier(Slot, At);
+  }
+  auto Place = constantFieldPlace(*ConstantReceiver, Index);
+  retireConstantExtent(std::move(Place), At, Explicit, Run,
+                       Index < R.Bases.size());
 }
 
 void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
@@ -157,7 +242,9 @@ void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
   ConstantActivation Activation(U, At);
   Object = load(Object);
   Object.Type = Type;
-  if (!AsBase)
+  const auto *Extent =
+      Object.Location ? Object.Location->registeredExtent() : nullptr;
+  if (!AsBase && (!Extent || !Extent->Retiring))
     Object.Location.reset();
   else if (Object.Location) {
     auto Place = *Object.Location;
@@ -217,9 +304,14 @@ void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
       constantDrop({Active.Types[I - 1], Payload->getAggregateElement(I - 1)},
                    At);
   }
+  auto HasObligation = [&](const cpn::Field &Field) {
+    return Body.ConstantMembersAlive.at(Field.Decl.Text) &&
+           Body.constantFieldPlace(Object, &Field - R.Fields.data())
+               .hasLiveExtent();
+  };
   for (auto &Field : llvm::reverse(R.Fields)) {
     const auto &Name = Field.Decl.Text;
-    if (!Body.ConstantMembersAlive.at(Name))
+    if (!HasObligation(Field))
       continue;
     if (llvm::StringRef(Name).starts_with("$virtual:"))
       break;
@@ -227,10 +319,12 @@ void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
       break;
     Body.endConstantField(Name, true, At);
   }
-  if (Destructor && Destructor->Decl.Children.size() > 1)
+  if (Destructor && Destructor->Decl.Children.size() > 1) {
+    llvm::SaveAndRestore Cleanup(Body.InDestructorCleanup, true);
     Body.constructorBody(Destructor->Decl.Children[1]);
+  }
   for (auto &Field : llvm::reverse(R.Fields))
-    if (Body.ConstantMembersAlive.at(Field.Decl.Text))
+    if (HasObligation(Field))
       Body.endConstantField(Field.Decl.Text, true, At);
   if (Destructor)
     Body.checkContracts(false);
@@ -240,7 +334,7 @@ void Frame::retirement() {
   auto *Previous =
       pushInvariantLifetime(Self, nullptr, /*IsConstruction=*/false);
   installTables(Self);
-  std::set<std::string> Manual;
+  auto &Manual = ManualDropSlots;
   for (unsigned I = 0; I < R.Fields.size(); ++I) {
     auto &Field = R.Fields[I];
     auto *Flag = allocate("bool", Field.Decl.At);
@@ -280,15 +374,7 @@ void Frame::retirement() {
       break;
     if (Manual.count(Slot)) {
       auto *Next = block("dtor.pass");
-      auto *Alive = B.CreateLoad(B.getInt1Ty(), FieldFlags.at(Slot));
-      llvm::Value *Barrier = Alive;
-      if (U.Whole && llvm::StringRef(Slot).starts_with("$base:")) {
-        auto *Addr =
-            fieldAddress(Self, std::distance(R.Fields.begin(), I.base()) - 1);
-        Barrier = B.CreateAnd(
-            Alive, B.CreateCall(U.M.getFunction("cpn.view.available"),
-                                {Addr, U.typeID(I->Type), B.getFalse()}));
-      }
+      auto *Barrier = destructionSlotAlive(I.base() - R.Fields.begin() - 1);
       B.CreateCondBr(Barrier, Cleanup, Next);
       B.SetInsertPoint(Next);
     } else
@@ -297,8 +383,10 @@ void Frame::retirement() {
   branch(Cleanup);
   B.SetInsertPoint(Cleanup);
   InlineReturn = block("dtor.remainder");
-  if (F->Decl.Children.size() > 1)
+  if (F->Decl.Children.size() > 1) {
+    llvm::SaveAndRestore Phase(InDestructorCleanup, true);
     stmt(F->Decl.Children[1]);
+  }
   branch(InlineReturn);
   B.SetInsertPoint(InlineReturn);
   InlineReturn = nullptr;

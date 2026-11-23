@@ -21,7 +21,7 @@ bool assignment(StringRef Op) {
          Op == ">>=";
 }
 } // namespace
-Value Frame::lookup(const Token &T) {
+Value Frame::lookup(const Token &T, bool NeedLive) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
     if (I->UnavailableNames.count(T.Text))
       fail(T, "unknown name '" + T.Text +
@@ -38,13 +38,13 @@ Value Frame::lookup(const Token &T) {
   if (Env.Values.count(T.Text))
     return Env.Values.at(T.Text);
   if (ConstantReceiver && U.lookupPath(ConstantReceiver->Type, T, false)) {
-    if (Transaction)
+    if (Transaction && NeedLive)
       Transaction->checkAccess(*this, T);
-    return member(load(*ConstantReceiver), T);
+    return member(load(*ConstantReceiver), T, NeedLive);
   }
   if (!Self.Type.empty()) {
     try {
-      return member(Self, T);
+      return member(Self, T, NeedLive);
     } catch (const Diagnostic &D) {
       if (!StringRef(D.Message).starts_with("unknown member"))
         throw;
@@ -103,7 +103,7 @@ Function *Frame::checkSelected(Function *D, const Token &At) {
     fail(At, "selected function is deleted");
   return D;
 }
-Value Frame::member(Value Obj, const Token &T) {
+Value Frame::member(Value Obj, const Token &T, bool NeedLive) {
   auto It = U.Records.find(Obj.Type);
   if (It == U.Records.end() || !It->second.Complete)
     fail(T, "member access requires a complete record");
@@ -119,14 +119,29 @@ Value Frame::member(Value Obj, const Token &T) {
     return openStaticReference(U.Globals.at(I->first));
   }
   Obj = baseView(Obj, *Path);
+  if (Transaction && IR && NeedLive)
+    Transaction->checkBaseAccess(*this, Obj, T);
   auto &R = U.Records.at(Obj.Type);
   for (size_t I = 0; I < R.Fields.size(); ++I)
     if (R.Fields[I].Decl.Text == T.Text) {
       auto &Field = R.Fields[I];
-      if (Obj.Address == PendingObject && PendingSlots.count(T.Text))
+      if (NeedLive && Obj.Address == PendingObject &&
+          PendingSlots.count(T.Text))
         fail(T, "use before initialization");
-      if (Transaction && IR && Obj.Address == Self.Address)
+      bool Own = Obj.Address == Self.Address && Obj.Type == Self.Type;
+      if (Transaction && IR && NeedLive && Own)
         Transaction->checkAccess(*this, T);
+      if (NeedLive && Own && InDestructorCleanup && I >= R.Bases.size()) {
+        const auto IsManual = [&](const cpn::Field &Slot) {
+          return ManualDropSlots.count(Slot.Decl.Text);
+        };
+        if (llvm::none_of(llvm::ArrayRef(R.Fields).drop_front(I), IsManual))
+          fail(T, "LIFE002: Cleanup observes a field ended by the automatic "
+                  "destruction prefix");
+        if (Opt.RawValidation)
+          guard(B.CreateNot(B.CreateLoad(B.getInt1Ty(), FieldFlags.at(T.Text))),
+                "lifecycle");
+      }
       checkAccess(Field.Decl, Obj.Type, T);
       if (Obj.Address) {
         Value V{Field.Type, nullptr, fieldAddress(Obj, I),
@@ -294,7 +309,7 @@ Value Frame::pointedObject(Value P, const Token &At) {
 Value Frame::place(const Node &N, bool NeedLive) {
   Value V;
   if (N.K == Node::Name)
-    V = lookup(N.At);
+    V = lookup(N.At, NeedLive);
   else if (N.K == Node::Unary && N.Text == "*")
     V = pointedObject(eval(N.Children[0]), N.At);
   else if (N.K == Node::Member) {
@@ -303,7 +318,7 @@ Value Frame::place(const Node &N, bool NeedLive) {
       Base = pointedObject(Base, N.At);
       ensureLive(Base, N.At);
     }
-    V = member(Base, N.At);
+    V = member(Base, N.At, NeedLive);
   } else if (N.K == Node::Index)
     V = subscript(N);
   else
@@ -883,6 +898,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         V.Storage = X.Storage;
       if (X.ExtentType == Y.ExtentType)
         V.ExtentType = X.ExtentType;
+      if (X.ConstructionBase == Y.ConstructionBase)
+        V.ConstructionBase = X.ConstructionBase;
       V.Subobject = X.Subobject || Y.Subobject;
       V.Origins = X.Origins;
       V.Origins.insert(Y.Origins.begin(), Y.Origins.end());
@@ -1406,7 +1423,10 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   Scopes = std::move(Original);
   Prefix = std::move(OldPrefix);
   if (!D.Owner.empty() && D.Decl.K == Node::Function && !D.isStatic()) {
-    if (Transaction && Receiver.Address == Self.Address) {
+    if (Transaction)
+      Transaction->checkBaseAccess(*this, Receiver, T);
+    if (Transaction && Receiver.Address == Self.Address &&
+        Receiver.Type == Self.Type) {
       if (auto *Hooks = Transaction->admitCall(*this, D, T))
         Values.push_back(Hooks);
     } else if (!D.Initializes.empty()) {
@@ -1652,7 +1672,7 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       if (IR)
         endField(Slot, C.At, Name == "destroy", true);
       else
-        endConstantField(Slot, Name == "destroy", C.At);
+        endConstantField(Slot, Name == "destroy", C.At, /*Explicit=*/true);
       return {"void"};
     }
   }
@@ -1692,9 +1712,13 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       Name = Owner + "::" + Name;
   auto Key = callKey(Name, Receiver.Type);
   auto Group = visibleOverloads(Key);
-  if (Receiver.Type.empty() && Group.empty() && !U.FunctionFamilies.count(Key))
+  if (Receiver.Type.empty() && Group.empty() &&
+      !U.FunctionFamilies.count(Key)) {
+    if (auto Special = floatingSpecial(C, Name, Args))
+      return *Special;
     if (auto Numeric = namedInteger(C, Name, Args))
       return *Numeric;
+  }
   auto *Hint = Group.size() == 1 && !U.FunctionFamilies.count(Key)
                    ? Group.front()
                    : nullptr;
@@ -2555,9 +2579,14 @@ void Frame::object(const Node &N, bool Global) {
   }
   if (N.Required && !llvm::isa_and_nonnull<llvm::Constant>(V.IR))
     fail(N.At, "constexpr initializer requires a constant");
-  Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, Readonly};
+  // An immutable construction view continues to designate its initializer.
+  // Retain that identity so the construction transaction can bind its calls.
+  bool KeepView = Transaction && Readonly && ends(Ty, "*");
+  Value Cell{Ty, N.Required || KeepView ? V.IR : nullptr, Ptr, Readonly};
   if (Ty == StorageViewType || ends(Ty, "*"))
     Cell.borrow(V);
+  if (!Readonly)
+    Cell.ConstructionBase.reset();
   if (carriesPointerBounds(Ty)) {
     Cell.BoundsCell = storedPointerCell(Ptr);
     saveBounds(Cell.BoundsCell, V);
