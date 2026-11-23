@@ -2,6 +2,7 @@
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/IntrinsicsX86.h"
@@ -31,13 +32,31 @@ constexpr StringRef CallEffects = "cpn.call.effects";
 constexpr StringRef OperationEffects = "cpn.effect";
 constexpr StringRef BoundaryEffects = "cpn.boundary.effects";
 constexpr StringRef BoundaryScope = "cpn.boundary";
+constexpr StringRef StorageRetire = "cpn.storage.retire";
+constexpr StringRef StorageReplace = "cpn.storage.replace";
+constexpr StringRef StorageWrite = "cpn.storage.write";
+constexpr StringRef StorageView = "cpn.storage.view";
+
+struct RegisteredReplacement {
+  unsigned Argument;
+  llvm::Value *Type;
+  llvm::Value *Cleanup;
+  auto key() const { return std::tie(Argument, Type, Cleanup); }
+  bool operator==(const RegisteredReplacement &Other) const {
+    return key() == Other.key();
+  }
+  bool operator<(const RegisteredReplacement &Other) const {
+    return key() < Other.key();
+  }
+};
 
 struct Summary {
   EffectSet Effects, Boundary;
+  std::set<RegisteredReplacement> Replacements;
   bool Open = false;
   bool operator==(const Summary &Other) const {
     return Effects == Other.Effects && Boundary == Other.Boundary &&
-           Open == Other.Open;
+           Replacements == Other.Replacements && Open == Other.Open;
   }
 };
 
@@ -63,6 +82,7 @@ class Inference {
   const Context &U;
   std::map<const llvm::Function *, const Function *> Declarations;
   llvm::SmallPtrSet<llvm::Value *, 16> SourceGlobals;
+  std::map<llvm::Value *, llvm::Value *> GlobalStorageAddresses;
   std::map<llvm::Function *, Summary> Summaries;
   const llvm::Argument *ProbedResult = nullptr;
 
@@ -102,14 +122,27 @@ class Inference {
   }
 
   struct Body {
+    struct Registration {
+      llvm::Value *Object = nullptr, *Type = nullptr;
+    };
+    struct Replacement {
+      llvm::CallBase *Site;
+      llvm::Value *Slot, *Cleanup;
+      Cell Location = {nullptr, 0};
+      llvm::Value *Type = nullptr;
+    };
     const Inference &Analysis;
+    llvm::Function &Function;
     llvm::SmallPtrSet<llvm::BasicBlock *, 32> Reachable;
     std::map<Cell, std::vector<llvm::Value *>> PointerValues;
     std::map<llvm::Value *, llvm::SmallVector<llvm::Instruction *>>
         UntrackedStores;
+    std::map<llvm::Value *, Registration> StorageAddresses;
+    std::vector<Replacement> Replacements;
+    mutable std::unique_ptr<llvm::DominatorTree> Dominance;
 
-    explicit Body(const Inference &Analysis, llvm::Function &F)
-        : Analysis(Analysis) {
+    Body(const Inference &Analysis, llvm::Function &F, bool Interprocedural)
+        : Analysis(Analysis), Function(F) {
       llvm::SmallVector<llvm::BasicBlock *> Pending{&F.getEntryBlock()};
       while (!Pending.empty()) {
         auto *Block = Pending.pop_back_val();
@@ -124,11 +157,13 @@ class Inference {
           }
         llvm::append_range(Pending, llvm::successors(Block));
       }
+      llvm::SmallVector<llvm::CallBase *> Calls;
+      llvm::SmallVector<llvm::CallBase *> Views;
       for (auto *Block : Reachable)
         for (auto &I : *Block) {
           if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
             auto Slot = cell(Store->getPointerOperand());
-            if (llvm::isa<llvm::AllocaInst>(Slot.first) &&
+            if (isPointerCell(Slot.first) &&
                 Store->getValueOperand()->getType()->isPointerTy())
               PointerValues[Slot].push_back(Store->getValueOperand());
           } else if (auto *Transfer = llvm::dyn_cast<llvm::MemIntrinsic>(&I)) {
@@ -136,6 +171,17 @@ class Inference {
                 .push_back(Transfer);
           } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
             auto *Callee = Analysis.callee(*Call);
+            if (auto Event = Call->getOperandBundle(StorageReplace))
+              Replacements.push_back(
+                  {Call, Event->Inputs[1].get(), Event->Inputs[2].get()});
+            if (Call->getOperandBundle(StorageView))
+              Views.push_back(Call);
+            if (Callee && Callee->getName() == "cpn.slot.begin")
+              StorageAddresses.emplace(
+                  Call->getArgOperand(0),
+                  Registration{Call->getArgOperand(1), Call->getArgOperand(2)});
+            if (Interprocedural && Callee && Analysis.Summaries.count(Callee))
+              Calls.push_back(Call);
             if (Callee && !Analysis.Declarations.count(Callee) &&
                 runtimeBookkeeping(Callee->getName()))
               continue;
@@ -144,6 +190,27 @@ class Inference {
                 UntrackedStores[llvm::getUnderlyingObject(Arg)].push_back(Call);
           }
         }
+      for (auto *View : Views) {
+        auto Origin = *View->getOperandBundle(StorageView);
+        StorageAddresses.try_emplace(
+            slotIdentity(View->getArgOperand(0)),
+            Registration{Origin.Inputs[0].get(), Origin.Inputs[1].get()});
+      }
+      for (auto &Event : Replacements) {
+        auto Extent = registration(Event.Slot);
+        if (Extent.Object) {
+          Event.Location = cell(Extent.Object);
+          Event.Type = Extent.Type;
+        }
+      }
+      for (auto *Call : Calls)
+        for (const auto &Event :
+             Analysis.Summaries.at(Analysis.callee(*Call)).Replacements) {
+          auto Location =
+              cell(slotIdentity(Call->getArgOperand(Event.Argument)));
+          Replacements.push_back(
+              {Call, nullptr, Event.Cleanup, Location, Event.Type});
+        }
     }
 
     Cell cell(llvm::Value *P) const {
@@ -151,6 +218,111 @@ class Inference {
       auto *Base = llvm::GetPointerBaseWithConstantOffset(
           P, Offset, Analysis.U.M.getDataLayout());
       return {Base, Offset};
+    }
+
+    bool isPointerCell(llvm::Value *Base) const {
+      if (llvm::isa<llvm::AllocaInst>(Base))
+        return true;
+      auto *Call = llvm::dyn_cast<llvm::CallBase>(Base);
+      auto *Callee = Call ? Analysis.callee(*Call) : nullptr;
+      return Callee && Callee->getName() == "cpn.pointer.field" &&
+             llvm::isa<llvm::AllocaInst>(
+                 llvm::getUnderlyingObject(Call->getArgOperand(0)));
+    }
+
+    llvm::Value *slotIdentity(llvm::Value *Slot) const {
+      // A copied storage view may reload its registration from a local cell.
+      for (unsigned Budget = 16; Budget; --Budget) {
+        auto *Load = llvm::dyn_cast<llvm::LoadInst>(Slot);
+        if (!Load)
+          break;
+        auto Location = cell(Load->getPointerOperand());
+        auto It = PointerValues.find(Location);
+        if (It == PointerValues.end() || It->second.size() != 1 ||
+            isUntracked(Location.first, *Load))
+          break;
+        Slot = It->second.front();
+      }
+      return Slot;
+    }
+
+    llvm::Value *storageAddress(Cell Address) const {
+      if (!Analysis.U.SlotType ||
+          Address.second != int64_t(Analysis.U.M.getDataLayout()
+                                        .getStructLayout(Analysis.U.SlotType)
+                                        ->getElementOffset(3)))
+        return nullptr;
+      auto *Slot = slotIdentity(Address.first);
+      auto Extent = registration(Slot);
+      if (Extent.Object)
+        return Extent.Object;
+      auto It = Analysis.GlobalStorageAddresses.find(Slot);
+      return It == Analysis.GlobalStorageAddresses.end() ? nullptr : It->second;
+    }
+
+    Registration registration(llvm::Value *Slot) const {
+      Slot = slotIdentity(Slot);
+      if (auto It = StorageAddresses.find(Slot); It != StorageAddresses.end())
+        return It->second;
+      if (auto *Call = llvm::dyn_cast<llvm::CallBase>(Slot)) {
+        auto *Callee = Analysis.callee(*Call);
+        if (Callee && Callee->getName() == "cpn.slot.find")
+          return {Call->getArgOperand(0), Call->getArgOperand(1)};
+        if (Callee && Callee->getName() == "cpn.slot.child")
+          return {Call->getArgOperand(1), Call->getArgOperand(2)};
+      }
+      return {};
+    }
+
+    bool sameRegistration(llvm::Value *A, llvm::Value *B) const {
+      A = slotIdentity(A);
+      B = slotIdentity(B);
+      if (A == B)
+        return true;
+      // A member sweep looks up its original registration.
+      auto *Lookup = llvm::dyn_cast<llvm::CallBase>(A);
+      auto *Child = llvm::dyn_cast<llvm::CallBase>(B);
+      if (!Lookup || !Child)
+        return false;
+      auto *Find = Analysis.callee(*Lookup);
+      auto *Register = Analysis.callee(*Child);
+      return Find && Find->getName() == "cpn.slot.find" && Register &&
+             Register->getName() == "cpn.slot.child" &&
+             llvm::isa<llvm::ConstantInt>(Lookup->getArgOperand(3)) &&
+             llvm::cast<llvm::ConstantInt>(Lookup->getArgOperand(3))->isOne() &&
+             Lookup->getArgOperand(2) == Child->getArgOperand(0) &&
+             Lookup->getArgOperand(1) == Child->getArgOperand(2) &&
+             cell(Lookup->getArgOperand(0)) == cell(Child->getArgOperand(1));
+    }
+
+    std::set<llvm::Function *> cleanupEntries(const llvm::CallBase &Retire,
+                                              llvm::Value *Fallback,
+                                              bool Reconstructed) const {
+      std::set<llvm::Function *> Entries;
+      bool Replaced = false;
+      if (Reconstructed) {
+        auto Extent = registration(Retire.getArgOperand(0));
+        auto Location = Extent.Object ? cell(Extent.Object) : Cell{nullptr, 0};
+        for (const auto &Event : Replacements) {
+          bool Matches =
+              Event.Slot ? sameRegistration(Retire.getArgOperand(0), Event.Slot)
+                         : Extent.Object && Extent.Type == Event.Type &&
+                               Location == Event.Location;
+          if (Matches && llvm::isPotentiallyReachable(Event.Site, &Retire)) {
+            if (Event.Slot) {
+              if (!Dominance)
+                Dominance = std::make_unique<llvm::DominatorTree>(Function);
+              Replaced |= Dominance->dominates(Event.Site, &Retire);
+            }
+            if (auto *Entry = llvm::dyn_cast<llvm::Function>(Event.Cleanup))
+              Entries.insert(Entry);
+          }
+        }
+      }
+      if (!Replaced)
+        if (auto *Entry = llvm::dyn_cast<llvm::Function>(Fallback))
+          Entries.insert(Entry);
+      return Entries;
     }
 
     bool isUntracked(llvm::Value *Base, const llvm::Instruction &Use) const {
@@ -211,7 +383,9 @@ class Inference {
           Out.insert("any");
       } else if (auto *L = llvm::dyn_cast<llvm::LoadInst>(Base)) {
         auto Address = cell(L->getPointerOperand());
-        if (!llvm::isa<llvm::AllocaInst>(Address.first)) {
+        if (auto *Object = storageAddress(Address)) {
+          regions(Object, Out, Visited, Budget);
+        } else if (!llvm::isa<llvm::AllocaInst>(Address.first)) {
           regions(L->getPointerOperand(), Out, Visited, Budget, true);
         } else if (auto It = PointerValues.find(Address);
                    It != PointerValues.end() &&
@@ -352,7 +526,8 @@ class Inference {
 
     void remap(EffectSet &Out, const EffectSet &Source,
                const llvm::CallBase &Call, unsigned Headers, bool Receiver,
-               llvm::ArrayRef<unsigned> ValueAggregates) const {
+               llvm::ArrayRef<unsigned> ValueAggregates,
+               llvm::Value *CleanupObject = nullptr) const {
       for (const auto &Item : Source) {
         const auto [Kind, Region] = StringRef(Item).split(':');
         unsigned Index = 0;
@@ -365,20 +540,21 @@ class Inference {
           Out.insert(Item);
           continue;
         }
-        if (Index >= Call.arg_size() ||
-            !Call.getArgOperand(Index)->getType()->isPointerTy())
+        auto *Actual = CleanupObject && Index == 0 ? CleanupObject
+                       : Index < Call.arg_size()   ? Call.getArgOperand(Index)
+                                                   : nullptr;
+        if (!Actual || !Actual->getType()->isPointerTy())
           Out.insert((Kind + ":any").str());
         else if (Kind == "read" || Kind == "write") {
           if (Region.starts_with("#") &&
               llvm::is_contained(ValueAggregates, Index - Headers - Receiver)) {
-            for (const auto &Root :
-                 aggregateRegions(Call.getArgOperand(Index), Call))
+            for (const auto &Root : aggregateRegions(Actual, Call))
               if (Root != "local")
                 Out.insert((Kind + ":" + Root).str());
           } else
-            memory(Out, Kind, Call.getArgOperand(Index));
+            memory(Out, Kind, Actual);
         } else
-          for (auto &Origin : regions(Call.getArgOperand(Index))) {
+          for (auto &Origin : regions(Actual)) {
             StringRef Domain(Origin);
             if (Domain == "local" || Domain == "this")
               Domain = "any";
@@ -390,6 +566,36 @@ class Inference {
 
   void callEffects(Body &Body, Summary &Out, EffectSet &Effects,
                    llvm::CallBase &Call, bool Interprocedural) const {
+    if (auto Write = Call.getOperandBundle(StorageWrite)) {
+      Body.memory(Effects, "write", Write->Inputs[0]);
+      return;
+    }
+    if (auto Replacement = Call.getOperandBundle(StorageReplace)) {
+      Body.memory(Effects, "write", Replacement->Inputs[0]);
+      return;
+    }
+    if (auto Retirement = Call.getOperandBundle(StorageRetire)) {
+      auto Enabled = [&](unsigned Index) {
+        return llvm::cast<llvm::ConstantInt>(Retirement->Inputs[Index].get())
+            ->isOne();
+      };
+      auto *Address = Retirement->Inputs[0].get();
+      if (Enabled(2))
+        Body.memory(Effects, "write", Address);
+      Out.Open |= Enabled(4);
+      for (auto *Entry :
+           Body.cleanupEntries(Call, Retirement->Inputs[1], Enabled(3))) {
+        auto It = Summaries.find(Entry);
+        if (It == Summaries.end()) {
+          Out.Open = true;
+          continue;
+        }
+        Body.remap(Effects, It->second.Effects, Call, 0, false, {}, Address);
+        Body.remap(Effects, It->second.Boundary, Call, 0, false, {}, Address);
+        Out.Open |= It->second.Open;
+      }
+      return;
+    }
     llvm::Function *F = callee(Call);
     EffectBound Bound;
     EffectSet Predicate;
@@ -474,10 +680,15 @@ class Inference {
   }
 
   Summary summarize(llvm::Function &F, const Function *D) const {
-    Body Plan(*this, F);
     Summary S;
     bool Interprocedural =
         !D || D->Definition.Configuration.InterproceduralEffects;
+    Body Plan(*this, F, Interprocedural);
+    for (const auto &Event : Plan.Replacements)
+      if (Event.Location.second == 0)
+        if (auto *A =
+                llvm::dyn_cast_or_null<llvm::Argument>(Event.Location.first))
+          S.Replacements.insert({A->getArgNo(), Event.Type, Event.Cleanup});
     for (auto *Block : Plan.Reachable)
       for (auto &I : *Block) {
         if (I.getMetadata("cpn.internal"))
@@ -520,6 +731,12 @@ public:
     for (const auto &[Name, Object] : U.ExternalObjects)
       if (Object.Address)
         SourceGlobals.insert(llvm::getUnderlyingObject(Object.Address));
+    if (auto *Begin = U.M.getFunction("cpn.slot.begin"))
+      for (auto *User : Begin->users())
+        if (auto *Start = llvm::dyn_cast<llvm::CallBase>(User))
+          if (llvm::isa<llvm::GlobalVariable>(Start->getArgOperand(0)))
+            GlobalStorageAddresses.emplace(Start->getArgOperand(0),
+                                           Start->getArgOperand(1));
     if (CollectBodies)
       for (auto &F : U.M)
         if (!F.isDeclaration() &&
@@ -694,6 +911,30 @@ void Context::checkEffects() {
       }))
     Inference(*this).verify();
   for (auto &F : M)
-    for (auto &I : llvm::instructions(F))
-      I.setMetadata(CallEffects, nullptr);
+    for (auto &Block : F)
+      for (auto &I : llvm::make_early_inc_range(Block)) {
+        I.setMetadata(CallEffects, nullptr);
+        auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+        if (!Call)
+          continue;
+        if (Call->getOperandBundle(StorageWrite)) {
+          I.eraseFromParent();
+          continue;
+        }
+        auto Descriptor = Call->getOperandBundle(StorageRetire);
+        if (!Descriptor)
+          Descriptor = Call->getOperandBundle(StorageReplace);
+        if (!Descriptor)
+          Descriptor = Call->getOperandBundle(StorageView);
+        if (Descriptor) {
+          auto *Native = llvm::CallBase::removeOperandBundle(
+              Call, Descriptor->getTagID(), Call->getIterator());
+          Native->takeName(Call);
+          Call->replaceAllUsesWith(Native);
+          Call->eraseFromParent();
+        }
+      }
+  if (auto *Marker = M.getFunction("llvm.donothing");
+      Marker && Marker->use_empty())
+    Marker->eraseFromParent();
 }

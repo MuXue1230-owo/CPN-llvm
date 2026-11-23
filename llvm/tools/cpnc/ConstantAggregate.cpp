@@ -1,17 +1,9 @@
 #include "Sema.h"
 #include "llvm/ADT/ScopeExit.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/ConstantFold.h"
 using namespace cpn;
 using llvm::StringRef;
-
-namespace {
-llvm::Constant *recordImage(llvm::StructType *Layout,
-                            std::vector<llvm::Constant *> Fields) {
-  for (auto *Field : llvm::drop_begin(Layout->elements(), Fields.size()))
-    Fields.push_back(llvm::Constant::getNullValue(Field));
-  return llvm::ConstantStruct::get(Layout, Fields);
-}
-} // namespace
 
 void Context::chargeConstant(const Token &At, uint64_t Steps) {
   constexpr unsigned Limit = 100000;
@@ -34,6 +26,7 @@ Value Frame::constantTemporary(Value V) {
   V.ConstantTemporary = std::make_shared<Value>(V);
   V.Location = std::make_shared<ConstantPlace>(
       ConstantPlace{V.ConstantTemporary.get(), {}, V.Type, V.Readonly});
+  V.Location->trackLifetime();
   Temps.push_back(V);
   return V;
 }
@@ -46,6 +39,7 @@ Value Frame::constantSelf(const Token &At) {
                                    ConstantReceiver->Type,
                                    ConstantReceiver->Readonly};
   Place.Readonly |= ConstantReceiver->Readonly;
+  Place.trackLifetime();
   auto V = Place.read(*this, At);
   V.Location = std::make_shared<ConstantPlace>(std::move(Place));
   return V;
@@ -89,17 +83,22 @@ bool Frame::containsDispatchState(const std::string &Type) const {
           }));
 }
 Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
-                                 const Token &At, const Node *Tail) {
+                                 const Token &At, const Node *Tail,
+                                 Value *BaseDestination) {
   requireObserver(D.Effects, At, &D);
   if (D.Decl.Prototype || D.Decl.Children.empty())
     fail(At, "constant construction requires a constructor definition");
   Frame Root(U, &D, nullptr);
+  Root.BaseLayer = BaseDestination != nullptr;
   for (size_t I = 0; I < Args.size(); ++I)
     if (!StringRef(D.Params[I]).ends_with("&") && Args[I].Prvalue)
       consume(Args[I]);
   Root.bindInlineParams(Args);
   Root.checkContracts(true);
-  Value Object{D.Owner, llvm::Constant::getNullValue(U.ir(D.Owner))};
+  Value Object =
+      BaseDestination
+          ? *BaseDestination
+          : Value{D.Owner, llvm::Constant::getNullValue(U.ir(D.Owner))};
   if (U.Variants.count(D.Owner)) {
     auto Default = U.DefaultCase.find(D.Owner);
     if (Default == U.DefaultCase.end())
@@ -115,10 +114,11 @@ Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
   }
   Construction Plan(Root, D, Object, Tail, this);
   Plan.run(Root);
-  return Plan.constantResult();
+  return load(Plan.constantResult());
 }
 
-Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
+Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
+                          Value *BaseDestination) {
   ConstantActivation Activation(U, At);
   const auto Type = unconst(Source.Type);
   if (Source.Expiring && Source.Readonly && U.Records.count(Type))
@@ -127,6 +127,37 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
                             : SpecialOperation::CopyConstruct;
   if (!constructible(Type, Op, At))
     fail(At, "no available constant copy or move construction");
+  if (auto R = U.Records.find(Type);
+      R != U.Records.end() && !U.Variants.count(Type)) {
+    auto &Record = R->second;
+    Value Dest = BaseDestination
+                     ? *BaseDestination
+                     : Value{Type, llvm::Constant::getNullValue(Record.IR)};
+    auto Special = Record.Special.find(Op);
+    if (Special != Record.Special.end() && Special->second.Body)
+      Dest = constantConstructor(*Special->second.Body, {Source}, At, nullptr,
+                                 BaseDestination);
+    else
+      for (unsigned I = BaseDestination ? Record.VirtualCount : 0;
+           I < Record.Fields.size(); ++I) {
+        auto Part = constantField(Source, I, At);
+        Part.Expiring = Source.Expiring;
+        if (I < Record.Bases.size()) {
+          auto Base = constantField(Dest, I, At);
+          constantCopy(Part, At, true, &Base);
+        } else {
+          auto Copy = constantCopy(Part, At);
+          constantFieldPlace(Dest, I).write(*this, Copy, At);
+        }
+      }
+    bindConstantVirtualLayout(Dest, At);
+    installConstantTables(Dest, At);
+    Dest = load(Dest);
+    Dest.Prvalue = Dest.Expiring = true;
+    if (CheckInvariant)
+      checkInvariants(Dest);
+    return Dest;
+  }
   auto *C = llvm::dyn_cast_or_null<llvm::Constant>(Source.IR);
   if (!C)
     fail(At, "constant source object required");
@@ -146,14 +177,8 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
     return llvm::cast<llvm::Constant>(constantCopy(V, At).IR);
   };
   if (auto R = U.Records.find(Type); R != U.Records.end()) {
-    if (R->second.VirtualCount)
-      fail(At, "constant evaluation of shared virtual bases is unavailable");
     auto S = R->second.Special.find(Op);
-    if (S != R->second.Special.end() && S->second.Body &&
-        !U.Variants.count(Type))
-      C = llvm::cast<llvm::Constant>(
-          constantConstructor(*S->second.Body, {Source}, At, nullptr).IR);
-    else if (U.Variants.count(Type)) {
+    {
       auto Tag = llvm::cast<llvm::ConstantInt>(C->getAggregateElement(0u))
                      ->getZExtValue();
       auto &Alternative = U.Cases.at(U.Variants.at(Type).at(Tag));
@@ -175,11 +200,6 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
         Body.constructorBody(S->second.Body->Decl.Children.front());
         C = llvm::cast<llvm::Constant>(Dest.IR);
       }
-    } else {
-      std::vector<llvm::Constant *> Fields;
-      for (unsigned I = 0; I < R->second.Fields.size(); ++I)
-        Fields.push_back(subobject(R->second.Fields[I].Type, I));
-      C = recordImage(R->second.IR, std::move(Fields));
     }
   } else if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType());
              Array && U.aggregate(unconst(element(Type))) &&
@@ -204,25 +224,31 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
 }
 Value Frame::constantAggregate(const std::string &T,
                                const std::vector<Node> &Args, const Token &At,
-                               const Node *Tail) {
+                               const Node *Tail, Value *BaseDestination) {
   ConstantActivation Activation(U, At);
   auto *Ty = U.ir(T, At);
   auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty);
 
   auto *Record = Array ? nullptr : &U.Records.at(T);
-  if (Record && Record->VirtualCount)
-    fail(At, "constant evaluation of shared virtual bases is unavailable");
   auto finishTail = [&](Value V) {
-    if (Record)
+    if (Record) {
+      bindConstantVirtualLayout(V, At);
       installConstantTables(V, At);
+    }
     if (Tail) {
       llvm::SaveAndRestore<Construction *> Outer(Transaction, nullptr);
       llvm::SaveAndRestore Receiver(ConstantReceiver, &V);
       U.ConstantInvariantLifetimes.push_back(&V);
       auto End =
           llvm::scope_exit([&] { U.ConstantInvariantLifetimes.pop_back(); });
-      stmt(*Tail);
+      try {
+        stmt(*Tail);
+      } catch (const ConstantTransfer &) {
+        constantDrop(V, Tail->At, V.BaseView, false);
+        throw;
+      }
     }
+    V = load(V);
     checkInvariants(V);
     V.Expiring = V.Prvalue = true;
     return V;
@@ -246,8 +272,8 @@ Value Frame::constantAggregate(const std::string &T,
   }
   if (Input.size() == 1 && Input.front().Type == T) {
     auto V = Input.front();
-    if (!V.Prvalue)
-      V = constantCopy(V, At, false);
+    if (!V.Prvalue || BaseDestination)
+      V = constantCopy(V, At, false, BaseDestination);
     else {
       consume(V);
       V.Location.reset();
@@ -268,7 +294,8 @@ Value Frame::constantAggregate(const std::string &T,
       if (Group.empty())
         fail(At, "union construction requires a selected case");
       auto *D = select("$ctor", Node(Node::Name, At), Input, {T});
-      return finishTail(constantConstructor(*D, Input, At, Tail));
+      return finishTail(
+          constantConstructor(*D, Input, At, Tail, BaseDestination));
     }
     if (!U.DefaultCase.count(T))
       fail(At, "union construction requires a selected case");
@@ -286,7 +313,8 @@ Value Frame::constantAggregate(const std::string &T,
     auto *D = select("$ctor", Node(Node::Name, At), Input, {T}, false,
                      Fits ? &Aggregate : nullptr);
     if (D != &Aggregate)
-      return finishTail(constantConstructor(*D, Input, At, Tail));
+      return finishTail(
+          constantConstructor(*D, Input, At, Tail, BaseDestination));
   }
   if (Args.size() > Count - Bases)
     fail(At, "too many aggregate initializers");
@@ -295,10 +323,10 @@ Value Frame::constantAggregate(const std::string &T,
     return integer(E) || floating(E) || E == "bool" || E == "char" ||
            E == "nullptr_t" || StringRef(E).ends_with("*");
   };
-  Value Result{T};
+  Value Result = BaseDestination ? *BaseDestination
+                                 : Value{T, llvm::Constant::getNullValue(Ty)};
   Result.Prvalue = Result.Expiring = true;
   if ((Array && Input.empty() && scalar(Elem)) || Count == 0) {
-    Result.IR = llvm::Constant::getNullValue(Ty);
     if (!Producers.empty())
       fail(At, "unknown initialization target");
     return finishTail(Result);
@@ -312,7 +340,7 @@ Value Frame::constantAggregate(const std::string &T,
   if (Record)
     for (const auto &Field : Record->Fields)
       Init.Scopes[0].Names[Field.Decl.Text] = {};
-  for (size_t I = 0; I < Count; ++I) {
+  for (size_t I = BaseDestination ? Record->VirtualCount : 0; I < Count; ++I) {
     auto Type = Array ? Elem : Record->Fields[I].Type;
     Value V;
     if (I >= Bases && I - Bases < Input.size()) {
@@ -326,7 +354,21 @@ Value Frame::constantAggregate(const std::string &T,
       llvm::SaveAndRestore Policy(Init.Opt);
       llvm::SaveAndRestore Limit(Init.LookupLimit);
       auto Producer = Producers.find(Field.Decl.Text);
-      if (Producer != Producers.end()) {
+      if (I < Bases) {
+        auto Base = constantField(Result, I, At);
+        if (Producer != Producers.end())
+          Scopes.push_back(Init.Scopes[0]);
+        auto &Source = Producer == Producers.end() ? Init : *this;
+        V = Source.constantAggregate(Type,
+                                     Producer == Producers.end()
+                                         ? Field.Decl.Children
+                                         : Producer->second->Children,
+                                     At, nullptr, &Base);
+        if (Producer != Producers.end()) {
+          Scopes.pop_back();
+          Producers.erase(Producer);
+        }
+      } else if (Producer != Producers.end()) {
         Scopes.push_back(Init.Scopes[0]);
         V = construct(Type, Producer->second->Children, Producer->second->At);
         Scopes.pop_back();
@@ -340,18 +382,138 @@ Value Frame::constantAggregate(const std::string &T,
       }
     }
     auto *C = llvm::dyn_cast_or_null<llvm::Constant>(V.IR);
-    if (!C || C->getType() != U.ir(Type, At))
+    if (!C || (I >= Bases && C->getType() != U.ir(Type, At)))
       fail(At, "constant aggregate element required");
-    Fields.push_back(C);
+    if (Array)
+      Fields.push_back(C);
+    else if (I >= Bases)
+      constantFieldPlace(Result, I).write(*this, V, At);
     Init.endExpression();
     if (Record)
       Init.Scopes[0].Names[Record->Fields[I].Decl.Text] = V;
   }
-  Result.IR = Array ? llvm::ConstantArray::get(Array, Fields)
-                    : recordImage(Record->IR, std::move(Fields));
+  if (Array)
+    Result.IR = llvm::ConstantArray::get(Array, Fields);
   if (!Producers.empty())
     fail(At, "unknown initialization target");
   return finishTail(Result);
+}
+
+Value Frame::constantAddress(const ConstantPlace &Place, const Token &At) {
+  if (Place.Lifetime && Place.Lifetime->expired())
+    fail(At, "constant reference designates an object whose lifetime ended");
+  auto PointerType =
+      (Place.Readonly ? qualifyConst(Place.Type) : Place.Type) + "*";
+  if (Place.Root->Address) {
+    auto Type = Place.Root->Type;
+    auto *Address = symbolicAddress(*Place.Root, At);
+    llvm::Value *Lower = Place.Root->ElementLower;
+    llvm::Value *Upper = Place.Root->ElementUpper;
+    for (auto Step : Place.Steps) {
+      Lower = Upper = nullptr;
+      if (Step.Alternative) {
+        Address = llvm::cast<llvm::Constant>(
+            payloadAddress(*Step.Alternative, Address, Step.Index));
+        Type = Step.Alternative->Types[Step.Index];
+      } else if (!Step.BaseOwner.empty()) {
+        const auto &Owner = U.Records.at(Step.BaseOwner);
+        Address = llvm::cast<llvm::Constant>(
+            B.CreateStructGEP(Owner.IR, Address, Step.Index));
+        unsigned I = Step.Index;
+        if (Owner.VirtualCount && I >= Owner.tailSlot(0))
+          I -= Owner.tailSlot(0);
+        Type = Owner.Bases[I];
+      } else if (auto *Array =
+                     llvm::dyn_cast<llvm::ArrayType>(U.ir(Type, At))) {
+        Lower = Address;
+        Upper =
+            B.CreateGEP(Array, Address,
+                        {B.getInt32(0), B.getInt64(Array->getNumElements())});
+        Address = llvm::cast<llvm::Constant>(B.CreateGEP(
+            Array, Address, {B.getInt32(0), B.getInt64(Step.Index)}));
+        Type = element(Type);
+      } else {
+        Address = llvm::cast<llvm::Constant>(
+            fieldAddress({Type, nullptr, Address}, Step.Index));
+        Type = U.Records.at(Type).Fields[Step.Index].Type;
+      }
+      Type = unconst(Type);
+    }
+    Value Pointer{PointerType, Address};
+    Pointer.Lower = Lower ? Lower : Address;
+    Pointer.Upper =
+        Upper ? Upper
+              : B.CreateGEP(U.ir(Place.Type, At), Address, B.getInt64(1));
+    return Pointer;
+  }
+  auto &Lifetime = Place.Root->ConstantIdentity.Storage;
+  if (!Lifetime)
+    Lifetime = std::make_shared<ConstantStorage>();
+  for (auto *Address : Lifetime->Designations)
+    if (U.LocalConstantAddresses.at(Address).Place.Steps == Place.Steps)
+      return {PointerType, Address};
+  U.chargeConstant(At);
+  auto *Ty = U.ir(Place.Type, At);
+  auto *Address = new llvm::GlobalVariable(
+      U.M, Ty, true, llvm::GlobalValue::PrivateLinkage,
+      llvm::PoisonValue::get(Ty), "cpn.constant.address");
+  auto Storage = Place;
+  Storage.Readonly = false;
+  U.LocalConstantAddresses.emplace(
+      Address, Context::LocalConstantAddress{Storage, Lifetime, At});
+  Lifetime->Designations.push_back(Address);
+  return {PointerType, Address};
+}
+
+ConstantPlace Frame::constantPointerPlace(const Value &Pointer,
+                                          const Token &At) {
+  if (!Pointer.IR || !StringRef(Pointer.Type).ends_with("*") ||
+      Pointer.Type == "void*")
+    fail(At, "typed object pointer required");
+  if (llvm::isa<llvm::ConstantPointerNull>(Pointer.IR))
+    fail(At, "null pointer access");
+  auto Qualified = element(Pointer.Type);
+  auto *Identity = llvm::dyn_cast<llvm::GlobalVariable>(
+      llvm::getUnderlyingObject(Pointer.IR));
+  auto It = U.LocalConstantAddresses.find(Identity);
+  if (It == U.LocalConstantAddresses.end()) {
+    if (Pointer.Upper) {
+      int64_t Position, End;
+      const auto &DL = U.M.getDataLayout();
+      if (llvm::GetPointerBaseWithConstantOffset(Pointer.IR, Position, DL) ==
+              llvm::GetPointerBaseWithConstantOffset(Pointer.Upper, End, DL) &&
+          Position == End)
+        fail(At, "cannot dereference a one-past pointer");
+    }
+    auto Storage =
+        std::make_shared<Value>(unconst(Qualified), nullptr, Pointer.IR,
+                                Qualified != unconst(Qualified));
+    Storage->borrow(Pointer);
+    Storage->ElementLower = Pointer.Lower;
+    Storage->ElementUpper = Pointer.Upper;
+    return ConstantPlace{Storage.get(),
+                         {},
+                         Storage->Type,
+                         Storage->Readonly,
+                         std::move(Storage)};
+  }
+  if (It->second.Lifetime.expired())
+    fail(At, "constant pointer designates an object whose lifetime ended");
+  if (Pointer.IR != Identity)
+    fail(At, "constant local pointer offset requires an exact designation");
+  auto Place = It->second.Place;
+  Place.Readonly = Qualified != unconst(Qualified) || Place.Root->Readonly;
+  return Place;
+}
+
+void Context::finishLocalConstantAddresses() {
+  for (const auto &[Address, Binding] : LocalConstantAddresses) {
+    Address->removeDeadConstantUsers();
+    if (!Address->use_empty())
+      fail(Binding.At, "constant result retains an evaluation-local address");
+    Address->eraseFromParent();
+  }
+  LocalConstantAddresses.clear();
 }
 
 // Resolve the destination and its subscripts once, before evaluating the right
@@ -360,21 +522,31 @@ Value Frame::constantAggregate(const std::string &T,
 std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
   const Node *Root = &N;
   std::vector<const Node *> Path;
+  std::optional<ConstantPlace> Designation;
+  const bool ImplicitThis =
+      ConstantReceiver && (!F || !F->Decl.Settings.count("closure"));
   while (Root->K == Node::Index || Root->K == Node::Member) {
-    if (Root->K == Node::Member && Root->Definition &&
-        !(ConstantReceiver && Root->Children.front().K == Node::Name &&
-          Root->Children.front().Text == "this"))
-      return {};
     Path.push_back(Root);
+    if (Root->K == Node::Member && Root->Definition &&
+        !(ImplicitThis && Root->Children.front().K == Node::Name &&
+          Root->Children.front().Text == "this")) {
+      Designation =
+          constantPointerPlace(eval(Root->Children.front()), Root->At);
+      break;
+    }
     Root = &Root->Children.front();
   }
-  if (Root->K != Node::Name)
+  if (!Designation && Root->K == Node::Unary && Root->Text == "*")
+    Designation = constantPointerPlace(eval(Root->Children.front()), Root->At);
+  if (!Designation && Root->K != Node::Name)
     return {};
   auto Scope = llvm::find_if(llvm::reverse(Scopes), [&](const Local &L) {
     return L.Names.count(Root->Text);
   });
   Value *Target = nullptr;
-  if (ConstantReceiver && Root->Text == "this" && !Path.empty())
+  if (Designation)
+    Target = Designation->Root;
+  else if (ImplicitThis && Root->Text == "this" && !Path.empty())
     Target = ConstantReceiver;
   else if (Scope != Scopes.rend())
     Target = &Scope->Names.at(Root->Text);
@@ -385,6 +557,10 @@ std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
   }
   if (!Target)
     return {};
+  if (Target->Address && !Path.empty())
+    if (auto R = U.Records.find(Target->Type);
+        R != U.Records.end() && R->second.VirtualCount)
+      return {};
   if (Target == ConstantReceiver && !Path.empty()) {
     if (auto It = ConstantMembersAlive.find(Path.back()->Text);
         It != ConstantMembersAlive.end() && !It->second)
@@ -392,7 +568,8 @@ std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
   }
   if (Transaction && Target == ConstantReceiver && !Path.empty())
     Transaction->checkAccess(*this, Path.back()->At);
-  auto Place = Target->Location
+  auto Place = Designation ? *Designation
+               : Target->Location
                    ? *Target->Location
                    : ConstantPlace{Target, {}, Target->Type, Target->Readonly};
   Place.Readonly |= Target->Readonly;
@@ -417,10 +594,7 @@ std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
       auto Bases = U.lookupPath(Type, Part->At, false);
       if (!Bases)
         fail(Part->At, "unknown constant field");
-      for (auto I : *Bases) {
-        Indices.push_back({I});
-        Type = U.Records.at(Type).Bases[I];
-      }
+      Place = constantBasePlace(std::move(Place), *Bases);
       auto &R = U.Records.at(Type);
       auto Field = llvm::find_if(
           R.Fields, [&](const auto &F) { return F.Decl.Text == Part->Text; });
@@ -436,10 +610,22 @@ std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
     Readonly |= Type != unconst(Type);
     Type = unconst(Type);
   }
+  Place.trackLifetime();
   return Place;
 }
 
+void ConstantPlace::trackLifetime() {
+  if (Lifetime || Root->Address)
+    return;
+  auto &Identity = Root->ConstantIdentity.Storage;
+  if (!Identity)
+    Identity = std::make_shared<ConstantStorage>();
+  Lifetime = Identity;
+}
+
 Value ConstantPlace::read(Frame &F, const Token &At) const {
+  if (Lifetime && Lifetime->expired())
+    fail(At, "constant reference designates an object whose lifetime ended");
   auto V = F.load(*Root);
   for (auto S : Steps) {
     auto *C = llvm::dyn_cast_or_null<llvm::Constant>(V.IR);
@@ -451,11 +637,15 @@ Value ConstantPlace::read(Frame &F, const Token &At) const {
   }
   V.Type = Type;
   V.Readonly = Readonly;
+  if (!Steps.empty())
+    V.BaseView = !Steps.back().BaseOwner.empty();
   V.Prvalue = V.Expiring = false;
   return V;
 }
 
 void ConstantPlace::write(Frame &F, Value V, const Token &At) const {
+  if (Lifetime && Lifetime->expired())
+    fail(At, "constant reference designates an object whose lifetime ended");
   if (Readonly || Root->Address)
     fail(At, "constant assignment requires writable local storage");
   if (Steps.empty()) {

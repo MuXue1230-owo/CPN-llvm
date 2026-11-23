@@ -144,17 +144,16 @@ void Frame::checkInvariants(Value Obj, bool IncludeBases, bool OwnBoundary) {
   auto I = U.Records.find(Obj.Type);
   if (I == U.Records.end() || TypeQuery)
     return;
-  if (IncludeBases)
+  if (IncludeBases) {
+    auto Receiver = Obj;
+    if (!IR && !Obj.Location && !Obj.Address)
+      Receiver.Location = std::make_shared<ConstantPlace>(
+          ConstantPlace{&Obj, {}, Obj.Type, Obj.Readonly});
     for (const auto &[Path, Base] : I->second.Views)
       if (!Path.empty() && checked(U.Records.at(Base))) {
-        auto BaseObject = Obj;
-        if (!IR && BaseObject.Location) {
-          BaseObject = load(BaseObject);
-          BaseObject.Location.reset();
-          BaseObject.Address = nullptr;
-        }
-        evaluateInvariants(baseView(BaseObject, Path), false, OwnBoundary);
+        evaluateInvariants(baseView(Receiver, Path), false, OwnBoundary);
       }
+  }
   evaluateInvariants(Obj, false, OwnBoundary);
 }
 
@@ -166,8 +165,12 @@ void Frame::checkMethodInvariant(bool Entry) {
       return;
     const auto &Place = ConstantReceiver->Location;
     if (llvm::any_of(U.ConstantInvariantLifetimes, [&](const Value *Active) {
-          return ConstantReceiver == Active ||
-                 (Place && Place->Root == Active && Place->Steps.empty());
+          if (ConstantReceiver == Active || !Place)
+            return ConstantReceiver == Active;
+          const auto &Other = Active->Location;
+          return Other ? Place->Root == Other->Root &&
+                             Place->Steps == Other->Steps
+                       : Place->Root == Active && Place->Steps.empty();
         }))
       return;
     checkInvariants(*ConstantReceiver, true, true);

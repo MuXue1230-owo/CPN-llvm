@@ -432,7 +432,7 @@ std::optional<Value> Construction::firstWrite(Frame &Em, const Node &N) {
   auto &Type = R.Fields[Index].Type;
   if (!Em.IR) {
     auto V = Em.construct(Type, {N.Children[1]}, N.At);
-    Object.IR = Em.B.CreateInsertValue(Object.IR, V.IR, Index);
+    Em.constantFieldPlace(Object, Index).write(Em, V, N.At);
     finishSlot(Em);
     return V;
   }

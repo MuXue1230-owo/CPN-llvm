@@ -4,7 +4,7 @@ using llvm::StringRef;
 
 bool cpn::carriesPointerBounds(const std::string &Type) {
   auto T = StringRef(Type).rtrim('&').str();
-  return StringRef(unconst(T)).ends_with("*") || T == "storage";
+  return StringRef(unconst(T)).ends_with("*") || unconst(T) == StorageViewType;
 }
 
 bool cpn::carriesBorrow(const std::string &Type) {
@@ -72,6 +72,10 @@ PointerCall Frame::openPointerCall(llvm::Value *Target,
   auto bind = [&](size_t Index, const std::string &Type, const Value &V) {
     if (!carriesBorrow(Type))
       return;
+    // Admission of a later argument can change the lifetime of an earlier
+    // argument's pointer cell. Validate that cell before entering the callee.
+    if (StringRef(Type).ends_with("&") && V.PointerCell)
+      ensureLive(V, {});
     llvm::Value *Cell = carriesPointerBounds(Type) ? V.BoundsCell : nullptr;
     if (!StringRef(Type).ends_with("&") || !Cell) {
       Cell = Allocate.CreateAlloca(pointerMetadataType());
@@ -139,6 +143,12 @@ Value Frame::pointerCallResult(Value V, const PointerCall &C,
     return load(V);
   }
   V.BoundsCell = Cell;
+  if (TracksStorage && StringRef(Type).ends_with("&") && V.Address) {
+    V.Slot = slotFor(V);
+    V.Generation =
+        B.CreateCall(U.M.getFunction("cpn.generation"), {V.Slot, B.getFalse()});
+    V.rememberPointerCell(V);
+  }
   V = load(V);
   if (!StringRef(Type).ends_with("&"))
     V.BoundsCell = nullptr;

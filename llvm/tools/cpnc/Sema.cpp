@@ -8,16 +8,28 @@ using namespace cpn;
 using llvm::StringRef;
 std::vector<std::string> cpn::splitArguments(StringRef S) {
   std::vector<std::string> Out;
-  unsigned Depth = 0;
+  unsigned Angles = 0, Groups = 0;
+  char Quote = 0;
   size_t Start = 0;
   for (size_t I = 0; I < S.size(); ++I) {
     char C = S[I];
-    if (C == '<' || C == '(' || C == '[')
-      ++Depth;
-    else if (C == '>' || C == ')' || C == ']') {
-      if (Depth)
-        --Depth;
-    } else if (C == ',' && !Depth) {
+    if (Quote) {
+      if (C == '\\' && I + 1 < S.size())
+        ++I;
+      else if (C == Quote)
+        Quote = 0;
+    } else if (C == '\'' || C == '"')
+      Quote = C;
+    else if (C == '(' || C == '[' || C == '{')
+      ++Groups;
+    else if (C == ')' || C == ']' || C == '}') {
+      if (Groups)
+        --Groups;
+    } else if (!Groups && C == '<')
+      ++Angles;
+    else if (!Groups && C == '>' && Angles)
+      --Angles;
+    else if (C == ',' && !Angles && !Groups) {
       Out.push_back(S.slice(Start, I).str());
       Start = I + 1;
     }
@@ -77,7 +89,7 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     return llvm::Type::getVoidTy(C);
   if (T == "nullptr_t")
     return llvm::Type::getInt8Ty(C);
-  if (T == "storage" || StringRef(T).ends_with("*") ||
+  if (T == StorageViewType || StringRef(T).ends_with("*") ||
       StringRef(T).ends_with("&"))
     return llvm::PointerType::getUnqual(C);
   if (integer(T) || T == "bool" || T == "char") {
@@ -141,7 +153,13 @@ cpn::Value Frame::load(cpn::Value V) {
     Current.ConstantTemporary = V.ConstantTemporary;
     V = std::move(Current);
   }
-  if (V.Type != "storage" && !StringRef(V.Type).ends_with("*"))
+  if (IR && V.Address && !V.IR && !V.BoundsCell && !V.PointerCell && V.Slot &&
+      StringRef(V.Type).ends_with("*")) {
+    V.rememberPointerCell(V);
+    V.Storage.clear();
+  }
+  if (V.Type != StorageViewType &&
+      (!StringRef(V.Type).ends_with("*") || V.PointerCell))
     ensureLive(V, {});
   if (V.Address && U.Ready.count(V.Address)) {
     if (!IR)
@@ -161,16 +179,42 @@ cpn::Value Frame::load(cpn::Value V) {
             llvm::getUnderlyingObject(Address));
         if (Object && U.ConstantObjects.count(Object)) {
           const auto &Layout = U.M.getDataLayout();
-          if (Object->isConstant())
+          auto Record = U.Records.find(V.Type);
+          const bool Layer =
+              Record != U.Records.end() && Record->second.VirtualCount;
+          if (Object->isConstant() && !Layer)
             V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
                                                       Layout);
           else {
             llvm::APInt Offset(
                 Layout.getIndexTypeSizeInBits(Address->getType()), 0);
             if (Address->stripAndAccumulateConstantOffsets(Layout, Offset,
-                                                           true) == Object)
-              V.IR = llvm::ConstantFoldLoadFromConst(
-                  Object->getInitializer(), U.ir(V.Type), Offset, Layout);
+                                                           true) == Object) {
+              auto *Image = Object->getInitializer();
+              if (!Layer)
+                V.IR = llvm::ConstantFoldLoadFromConst(Image, U.ir(V.Type),
+                                                       Offset, Layout);
+              else {
+                auto *Type = Record->second.Layer;
+                auto *FieldsLayout = Layout.getStructLayout(Type);
+                std::vector<llvm::Constant *> Fields;
+                for (unsigned I = 0; I < Type->getNumElements(); ++I) {
+                  auto *FieldType = Type->getElementType(I);
+                  auto *Field =
+                      Layout.getTypeAllocSize(FieldType).isZero()
+                          ? llvm::Constant::getNullValue(FieldType)
+                          : llvm::ConstantFoldLoadFromConst(
+                                Image, FieldType,
+                                Offset + FieldsLayout->getElementOffset(I)
+                                             .getFixedValue(),
+                                Layout);
+                  if (!Field || llvm::isa<llvm::UndefValue>(Field))
+                    fail({}, "constant object layer is unavailable");
+                  Fields.push_back(Field);
+                }
+                V.IR = llvm::ConstantStruct::get(Type, Fields);
+              }
+            }
           }
         }
       }
@@ -445,12 +489,12 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (integer(S) && S != "integer" && !StringRef(S).ends_with("size") &&
       !Opt.IntegerWidths.count(width(S)))
     fail(At, "CFG002: integer type " + S + " is disabled");
-  if (builtin(S) || S == "auto")
+  if (builtin(S) || S == "auto" || S == StorageViewType)
     return S;
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
     if (auto Alias = I->Aliases.find(S); Alias != I->Aliases.end())
       return Alias->second;
-    if (I->Names.count(S))
+    if (I->Names.count(S) || I->UnavailableNames.count(S))
       fail(At, "object name '" + S + "' does not name a type");
   }
   if (auto I = Env.Types.find(S); I != Env.Types.end())
@@ -519,6 +563,15 @@ std::string Frame::resolve(std::string S, const Token &At) {
       auto E = bind(Fam, Explicit, {}, At);
       auto Full = appliedName(Key, Fam, E);
       if (!U.Records.count(Full)) {
+        auto &Application =
+            U.TypeApplications.try_emplace(Full, TypeApplication{Key, {}})
+                .first->second;
+        if (Application.Arguments.empty())
+          for (const auto &Parameter : Fam.Decl.Generics)
+            Application.Arguments.push_back(
+                Parameter.K == Node::TypeParam
+                    ? Value{E.Types.at(Parameter.Text)}
+                    : E.Values.at(Parameter.Text));
         selectTypeSpecialization(Key, Fam, E, At);
         EnterDefinition Site(U, Fam.Site);
         llvm::SaveAndRestore Depth(U.SpecializationDepth,
@@ -571,35 +624,8 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
           Reject("expected a type argument");
         S.Types[P.Text] = resolve(A->Type, At);
       } else {
-        for (size_t J = 0; J < Actual.size() && J < Fam.Decl.Params.size();
-             ++J) {
-          auto Formal = Fam.Decl.Params[J].Type, Ty = Actual[J].Type;
-          if (StringRef(Formal).starts_with("forward ")) {
-            Formal = Formal.substr(8);
-            if (Actual[J].Address && !Actual[J].Expiring)
-              Ty += "&";
-          }
-          while (StringRef(Formal).ends_with("&"))
-            Formal.pop_back();
-          if (StringRef(Formal).starts_with("const<") &&
-              StringRef(Formal).ends_with(">"))
-            Formal = Formal.substr(6, Formal.size() - 7);
-          while (StringRef(Formal).ends_with("*") &&
-                 StringRef(Ty).ends_with("*")) {
-            Formal.pop_back();
-            Ty.pop_back();
-          }
-          if (Formal == P.Text) {
-            try {
-              Ty = materializationType(Ty, At);
-            } catch (const Diagnostic &D) {
-              throw DeductionFailure{D};
-            }
-            if (S.Types.count(P.Text) && S.Types[P.Text] != Ty)
-              Reject("conflicting deduction");
-            S.Types[P.Text] = Ty;
-          }
-        }
+        if (auto Deduced = deduceGenericArgument(Fam, P, Actual, At))
+          S.Types[P.Text] = Deduced->Type;
         if (!S.Types.count(P.Text) && !P.Children.empty()) {
           auto Ty = P.Children[0].Type;
           S.Types[P.Text] = Defaults.resolve(Ty, At);
@@ -610,13 +636,18 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
     } else {
       if (A && A->K == Node::TypeArg)
         Reject("expected a constant argument");
-      if (!A && !P.Children.empty())
-        A = &P.Children[0];
-      if (!A)
-        Reject("missing generic constant");
       auto Ty = Defaults.resolve(P.Type, At);
       if (!integer(Ty) && Ty != "bool" && Ty != "char" && !U.Enums.count(Ty))
         fail(P.At, "invalid generic constant parameter type");
+      if (!A) {
+        if (auto Deduced = deduceGenericArgument(Fam, P, Actual, At, Ty)) {
+          S.Values[P.Text] = *Deduced;
+          continue;
+        }
+        if (P.Children.empty())
+          Reject("missing generic constant");
+        A = &P.Children[0];
+      }
       auto V =
           I < Explicit.size() ? constantEval(*A) : Defaults.constantEval(*A);
       S.Values[P.Text] = convert(V, Ty, At);
@@ -1169,7 +1200,7 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
                      [&](const Field &F) { return F.Decl.Text == D.Text; }))
       fail(D.At, "duplicate member");
     D.Settings["identity"] = ID;
-    Statics.emplace_back(ID, D);
+    Statics.push_back({ID, P, D});
     llvm::SaveAndRestore MemberPolicy(Check.Opt);
     for (const auto &Config : D.Policies)
       configure(Check.Opt, Config, ConfigScope::Declaration);
@@ -1383,7 +1414,15 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       if (Primary == Families.end() || Primary->second.Decl.K != D.K ||
           Primary->second.Decl.Type != D.Type)
         fail(D.At, "specialization must match its owning type family");
-      if (D.Pattern.size() != Primary->second.Decl.Generics.size())
+      const auto &Parameters = Primary->second.Decl.Generics;
+      const bool VariableArity = !Parameters.empty() && Parameters.back().Pack;
+      const size_t FixedParameters = Parameters.size() - VariableArity;
+      const size_t Expansions =
+          llvm::count_if(D.Pattern, [](const Node &P) { return P.Pack; });
+      const size_t FixedArguments = D.Pattern.size() - Expansions;
+      if ((Expansions && (D.Generics.empty() || !D.Generics.back().Pack)) ||
+          (!Expansions && FixedArguments < FixedParameters) ||
+          (!VariableArity && FixedArguments > FixedParameters))
         fail(D.At, "specialization pattern has the wrong arity");
       for (auto &Req : D.Params)
         checkNormalForm(Req);
@@ -1438,7 +1477,7 @@ void Context::unit(const std::vector<Node> &Decls, std::string P) {
       continue;
     }
     if (D.K == Node::Object) {
-      Statics.emplace_back(Name, D);
+      Statics.push_back({Name, P, D});
       F.object(D, true);
       continue;
     }
@@ -1510,6 +1549,8 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   if (U.Whole || llvm::any_of(AST, Frame::usesStorage))
     U.enableStorage();
   U.bindScalarLibrary();
+  if (llvm::any_of(AST, usesNumericLibrary))
+    U.bindNumericLibrary();
   U.unit(AST);
   U.emitForeignContractAdapters();
   U.checkWholeContracts();
@@ -1523,34 +1564,55 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
           fail(F.Decl.At, "function needs a definition");
         Entry->eraseFromParent();
       }
-  std::set<std::string> Ids, Previous;
-  for (auto &[Name, N] : U.Statics) {
+  llvm::erase_if(U.Statics, [](const auto &Static) {
+    return Static.Decl.Foreign && !Static.Decl.Definition;
+  });
+  // Members, deferred bodies, and specializations can discover objects in
+  // a different order from the source definitions that own their lifetimes.
+  llvm::sort(U.Statics, [](const auto &L, const auto &R) {
+    return std::tie(L.Decl.At.Line, L.Decl.At.Column, L.Name) <
+           std::tie(R.Decl.At.Line, R.Decl.At.Column, R.Name);
+  });
+  auto Storage = [&](const std::string &Name) {
+    const auto &V = U.Globals.at(Name);
+    return V.ReferenceCell ? V.ReferenceCell : V.Address;
+  };
+  std::map<std::string, size_t> Ranks;
+  std::map<llvm::Value *, size_t> StorageRanks;
+  for (size_t I = 0; I < U.Statics.size(); ++I) {
+    const auto &Name = U.Statics[I].Name;
+    Ranks.emplace(Name, I);
+    StorageRanks.emplace(Storage(Name), I);
+  }
+  std::set<std::string> Ids;
+  for (const auto &[Name, Prefix, N] : U.Statics) {
     if (N.Settings.count("static_id") &&
         !Ids.insert(N.Settings.at("static_id")).second)
       fail(N.At, "STAT001: duplicate static identity");
     if (N.Settings.count("init_after")) {
-      auto Owner = StringRef(Name).rsplit("::");
-      auto Prefix =
-          Owner.second.empty() ? std::string{} : Owner.first.str() + "::";
       for (const auto &Spelling : splitArguments(N.Settings.at("init_after"))) {
         auto Dep = scopeKey(Prefix, Spelling, [&](const auto &Key) {
           return U.Globals.count(Key);
         });
-        if (Dep.empty())
+        auto Rank =
+            Dep.empty() ? StorageRanks.end() : StorageRanks.find(Storage(Dep));
+        if (Rank == StorageRanks.end())
           fail(N.At, "unknown static dependency");
         // One root source file has a declaration-order edge between successive
         // definitions. A backward dependency is already ordered and a forward
         // dependency closes a cycle, including through a constant object.
-        if (!Previous.count(Dep))
+        if (Rank->second >= Ranks.at(Name))
           fail(N.At, "cyclic static initialization");
       }
     }
-    Previous.insert(Name);
   }
   U.finishStaticReads();
-  auto Hook = [&](std::vector<llvm::Function *> &List, bool IsStartup) {
+  auto Hook = [&](auto &List, bool IsStartup) {
     if (List.empty())
       return;
+    llvm::sort(List, [&](const auto &L, const auto &R) {
+      return Ranks.at(L.first) < Ranks.at(R.first);
+    });
     if (!IsStartup)
       std::reverse(List.begin(), List.end());
     auto *FT = llvm::FunctionType::get(llvm::Type::getVoidTy(U.C), false);
@@ -1558,7 +1620,7 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
         llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                IsStartup ? "cpn.startup" : "cpn.shutdown", M);
     llvm::IRBuilder<> B(llvm::BasicBlock::Create(U.C, "entry", F));
-    for (auto *Call : List) {
+    for (const auto &[Name, Call] : List) {
       if (IsStartup && U.CurrentInitializer) {
         auto It = U.Initializing.find(Call);
         // Metadata setup for precommitted objects has no construction
@@ -1582,4 +1644,5 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Hook(U.Startup, true);
   Hook(U.Shutdown, false);
   U.finishPointerStorage();
+  U.finishLocalConstantAddresses();
 }

@@ -140,7 +140,7 @@ void Construction::advance(Frame &Current) {
           I >= Frontier ? Value{}
           : Current.IR
               ? Value{Member.Type, nullptr, Source->fieldAddress(Object, I)}
-              : Value{Member.Type, Source->B.CreateExtractValue(Object.IR, I)};
+              : Source->constantField(Object, I, Member.Decl.At);
     }
     // Constructor parameters shadow members. Body-local declarations never
     // participate in the declarative initializer environment.
@@ -160,10 +160,16 @@ void Construction::advance(Frame &Current) {
       Source->LookupLimit = F.DefaultSite->Through;
     }
     size_t Mark = Source->Temps.size();
-    auto Built = Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
-                                   Frontier < R.Bases.size());
-    if (!Current.IR)
-      Object.IR = Source->B.CreateInsertValue(Object.IR, Built.IR, Frontier);
+    if (!Current.IR && Frontier < R.Bases.size()) {
+      auto Base = Source->constantField(Object, Frontier, F.Decl.At);
+      Source->constantAggregate(F.Type, *Args, F.Decl.At, nullptr, &Base);
+    } else {
+      auto Built = Source->construct(F.Type, *Args, F.Decl.At, Address, nullptr,
+                                     Frontier < R.Bases.size());
+      if (!Current.IR)
+        Source->constantFieldPlace(Object, Frontier)
+            .write(*Source, Built, F.Decl.At);
+    }
     Source->endExpression(Mark);
     Source->Scopes = std::move(Old);
     Source->Self = Previous;

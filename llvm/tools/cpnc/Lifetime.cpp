@@ -34,13 +34,18 @@ void Frame::endField(const std::string &Slot, const Token &At,
     auto Field = member(Self, Name);
     checkAbandon(Field.Type, At);
     ensureLive(Field, At);
+    markStorageWrite(Field.Address);
     if (Field.Slot)
       retireStorage(Field, false);
   }
-  if (RunDestructor)
-    dropChild(Self, member(Self, Name),
+  if (RunDestructor) {
+    auto Field = member(Self, Name);
+    if (Explicit)
+      markStorageWrite(Field.Address);
+    dropChild(Self, Field,
               llvm::StringRef(Slot).starts_with("$base:") ||
                   llvm::StringRef(Slot).starts_with("$virtual:"));
+  }
   branch(Done);
   B.SetInsertPoint(Done);
 }
@@ -79,17 +84,21 @@ void Frame::endConstantField(const std::string &Slot, bool Run,
   auto &Alive = ConstantMembersAlive.at(Slot);
   if (!Alive)
     fail(At, "subobject destruction obligation already consumed");
-  Token Field = At;
-  Field.Text = Slot;
-  auto V = member(*ConstantReceiver, Field);
+  const auto &R = U.Records.at(ConstantReceiver->Type);
+  unsigned Index =
+      llvm::find_if(R.Fields,
+                    [&](const cpn::Field &F) { return F.Decl.Text == Slot; }) -
+      R.Fields.begin();
+  auto V = constantField(*ConstantReceiver, Index, At);
   Alive = false;
   if (Run)
-    constantDrop(V, At);
+    constantDrop(V, At, Index < R.Bases.size());
   else
     checkAbandon(V.Type, At);
 }
 
-void Frame::constantDrop(Value Object, const Token &At) {
+void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
+                         bool RunOwnDestructor) {
   requirePredicateCleanup(Object.Type, At);
   auto Type = unconst(Object.Type);
   if (!U.aggregate(Type))
@@ -97,7 +106,13 @@ void Frame::constantDrop(Value Object, const Token &At) {
   ConstantActivation Activation(U, At);
   Object = load(Object);
   Object.Type = Type;
-  Object.Location.reset();
+  if (!AsBase)
+    Object.Location.reset();
+  else if (Object.Location) {
+    auto Place = *Object.Location;
+    Place.Readonly = false;
+    Object.Location = std::make_shared<ConstantPlace>(std::move(Place));
+  }
   Object.ConstantTemporary.reset();
   Object.Address = nullptr;
   auto *C = llvm::dyn_cast_or_null<llvm::Constant>(Object.IR);
@@ -113,7 +128,8 @@ void Frame::constantDrop(Value Object, const Token &At) {
   auto &R = U.Records.at(Type);
   installConstantTables(Object, At);
   auto D = U.Overloads.find(Type + "::$drop");
-  Function *Destructor = D == U.Overloads.end() ? nullptr : D->second.front();
+  Function *Destructor =
+      RunOwnDestructor && D != U.Overloads.end() ? D->second.front() : nullptr;
   Frame Body(U, Destructor, nullptr, Type + "::");
   Object.Readonly = false;
   Body.ConstantReceiver = &Object;
@@ -122,7 +138,7 @@ void Frame::constantDrop(Value Object, const Token &At) {
   std::set<std::string> Manual;
   for (size_t I = 0; I < R.Fields.size(); ++I) {
     auto &Name = R.Fields[I].Decl.Text;
-    Body.ConstantMembersAlive[Name] = true;
+    Body.ConstantMembersAlive[Name] = !AsBase || I >= R.VirtualCount;
     if (R.Decl.Settings.count("manual") && I >= R.Bases.size())
       Manual.insert(Name);
   }
@@ -154,6 +170,8 @@ void Frame::constantDrop(Value Object, const Token &At) {
     const auto &Name = Field.Decl.Text;
     if (!Body.ConstantMembersAlive.at(Name))
       continue;
+    if (llvm::StringRef(Name).starts_with("$virtual:"))
+      break;
     if (Manual.count(Name) && Destructor)
       break;
     Body.endConstantField(Name, true, At);

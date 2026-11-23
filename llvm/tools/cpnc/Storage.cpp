@@ -1,8 +1,30 @@
 #include "Sema.h"
 #include "llvm/AsmParser/Parser.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 using namespace cpn;
+
+void Value::rememberPointerCell(const Value &Cell) {
+  PointerCell = PointerCellLifetime{
+      Cell.Slot,    Cell.Generation, Cell.ArraySlot, Cell.ArrayGeneration,
+      Cell.Storage, Cell.ExtentType, Cell.Subobject, Cell.BaseView};
+}
+
+Value Value::objectDesignation() const {
+  auto Object = *this;
+  if (PointerCell) {
+    Object.Slot = PointerCell->Slot;
+    Object.Generation = PointerCell->Generation;
+    Object.ArraySlot = PointerCell->ArraySlot;
+    Object.ArrayGeneration = PointerCell->ArrayGeneration;
+    Object.Storage = PointerCell->Storage;
+    Object.ExtentType = PointerCell->ExtentType;
+    Object.Subobject = PointerCell->Subobject;
+    Object.BaseView = PointerCell->BaseView;
+  }
+  return Object;
+}
 
 void Context::enableStorage() {
   static constexpr llvm::StringLiteral Runtime =
@@ -75,10 +97,25 @@ llvm::Constant *destructor(Frame &F, const std::string &T) {
     return D;
   return llvm::ConstantPointerNull::get(F.B.getPtrTy());
 }
+
+void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
+                          bool Destroy, bool MayRunCleanup, bool Explicit) {
+  auto CompleteType =
+      V.BaseView && !V.ExtentType.empty() ? V.ExtentType : V.Type;
+  auto *Entry = MayRunCleanup ? destructor(F, CompleteType)
+                              : llvm::ConstantPointerNull::get(F.B.getPtrTy());
+  llvm::Value *Operands[] = {
+      V.Address, Entry, F.B.getInt1(Explicit),
+      F.B.getInt1(MayRunCleanup && !Explicit),
+      F.B.getInt1(MayRunCleanup && V.BaseView && V.ExtentType.empty())};
+  llvm::OperandBundleDef Effects("cpn.storage.retire", Operands);
+  F.B.CreateCall(F.U.M.getFunction("cpn.slot.retire"),
+                 {Slot, F.B.getInt1(Destroy)}, {Effects});
+}
 } // namespace
 llvm::Value *Frame::slotFor(Value V) {
-  if (V.Slot)
-    return V.Slot;
+  if (auto *Slot = V.PointerCell ? V.PointerCell->Slot : V.Slot)
+    return Slot;
   return B.CreateCall(U.M.getFunction("cpn.slot.find"),
                       {V.Address, U.typeID(V.Type),
                        llvm::ConstantPointerNull::get(B.getPtrTy()),
@@ -106,6 +143,24 @@ void Frame::track(Value &V, llvm::GlobalVariable *GlobalSlot) {
     V.Generation =
         B.CreateCall(U.M.getFunction("cpn.generation"), {V.Slot, B.getTrue()});
     Registrations[V.Storage] = {V.Slot};
+  }
+}
+void Frame::trackLocal(Value &Cell, llvm::StringRef Prefix) {
+  bool Pointer = llvm::StringRef(Cell.Type).ends_with("*");
+  if (Cell.Type == StorageViewType || (Pointer && !TracksStorage))
+    return;
+  Value Owner{Cell.Type, nullptr, Cell.Address, Cell.Readonly};
+  Owner.Storage = (Prefix + std::to_string(U.Serial++)).str();
+  track(Owner);
+  Active[Owner.Storage] = true;
+  Extents[Owner.Storage] = Owner;
+  if (Pointer)
+    Cell.rememberPointerCell(Owner);
+  else {
+    Cell.Storage = Owner.Storage;
+    Cell.Slot = Owner.Slot;
+    Cell.Generation = Owner.Generation;
+    Cell.ExtentType = Owner.ExtentType;
   }
 }
 Value Frame::subobject(Value Parent, Value V) {
@@ -150,7 +205,7 @@ void Frame::dropChild(Value Parent, Value V, bool AsBase) {
        *Original = block("slot.original"), *Done = block("slot.done");
   B.CreateCondBr(B.CreateIsNotNull(Slot), Registered, Original);
   B.SetInsertPoint(Registered);
-  B.CreateCall(U.M.getFunction("cpn.slot.retire"), {Slot, B.getTrue()});
+  registeredRetirement(*this, V, Slot, true, true, false);
   branch(Done);
   B.SetInsertPoint(Original);
   drop(V);
@@ -158,29 +213,43 @@ void Frame::dropChild(Value Parent, Value V, bool AsBase) {
   B.SetInsertPoint(Done);
 }
 void Frame::ensureLive(const Value &V, const Token &At) {
-  if (!V.Storage.empty() && Active.count(V.Storage) &&
-      Active.at(V.Storage) == 0)
+  const auto &Storage = V.PointerCell ? V.PointerCell->Storage : V.Storage;
+  if (!Storage.empty() && Active.count(Storage) && Active.at(Storage) == 0)
     fail(At, "ended object generation");
-  if (!IR || !V.Slot)
+  auto *Slot = V.PointerCell ? V.PointerCell->Slot : V.Slot;
+  if (!IR || !Slot)
     return;
-  auto *Expected = V.Generation ? V.Generation : B.getInt64(0);
+  auto *Generation = V.PointerCell ? V.PointerCell->Generation : V.Generation;
   guard(B.CreateNot(
-      B.CreateCall(U.M.getFunction("cpn.borrow.valid"), {V.Slot, Expected})));
+      B.CreateCall(U.M.getFunction("cpn.borrow.valid"),
+                   {Slot, Generation ? Generation : B.getInt64(0)})));
 }
-void Frame::retireStorage(const Value &V, bool Destroy) {
-  B.CreateCall(U.M.getFunction("cpn.slot.retire"),
-               {V.Slot, B.getInt1(Destroy)});
+void Frame::retireStorage(const Value &V, bool Destroy, bool Explicit) {
+  bool KnownEnded =
+      !V.Subobject && Active.count(V.Storage) && Active.at(V.Storage) == 0;
+  registeredRetirement(*this, V, V.Slot, Destroy,
+                       Destroy && (Explicit || !KnownEnded), Explicit);
   if (!V.Subobject && !V.Storage.empty())
     Active[V.Storage] = 0;
+}
+void Frame::markStorageWrite(llvm::Value *Address) {
+  llvm::Value *Operands[] = {Address};
+  llvm::OperandBundleDef Effects("cpn.storage.write", Operands);
+  B.CreateCall(
+      llvm::Intrinsic::getOrInsertDeclaration(&U.M, llvm::Intrinsic::donothing),
+      {}, {Effects});
 }
 void Frame::replaceGeneration(const Value &V, const std::string &T,
                               const Token &) {
   auto *S = V.Slot;
   B.CreateStore(U.typeID(T), B.CreateStructGEP(U.SlotType, S, CurrentType));
-  B.CreateStore(destructor(*this, T),
-                B.CreateStructGEP(U.SlotType, S, Destructor));
-  B.CreateStore(B.CreateCall(U.M.getFunction("cpn.new.generation")),
-                B.CreateStructGEP(U.SlotType, S, Stamp));
+  auto *Entry = destructor(*this, T);
+  B.CreateStore(Entry, B.CreateStructGEP(U.SlotType, S, Destructor));
+  llvm::Value *Operands[] = {V.IR, S, Entry};
+  llvm::OperandBundleDef Effects("cpn.storage.replace", Operands);
+  B.CreateStore(
+      B.CreateCall(U.M.getFunction("cpn.new.generation"), {}, {Effects}),
+      B.CreateStructGEP(U.SlotType, S, Stamp));
   if (!V.Subobject && !V.Storage.empty())
     Active[V.Storage] = 1;
 }
@@ -189,7 +258,7 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     fail(C.At, "storage operation requires runtime object storage");
   if (C.Text == "construct_at") {
     auto S = eval(Args.front());
-    if (S.Type != "storage" || !S.Slot)
+    if (S.Type != StorageViewType || !S.Slot)
       fail(C.At, "storage view required");
     if (!S.Subobject && Active.count(S.Storage) && Active[S.Storage] == 1)
       fail(C.At, "storage contains a live generation");
@@ -226,14 +295,22 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     return P;
   }
   bool Storage = C.Text == "storage_of";
-  Value V = place(Args.front(), !Storage);
+  Value V = place(Args.front(), !Storage).objectDesignation();
   if (!V.Slot)
     V.Slot = slotFor(V);
   guard(B.CreateIsNull(V.Slot));
   if (Storage) {
-    guard(B.CreateNot(
-        B.CreateCall(U.M.getFunction("cpn.slot.linked"), {V.Slot})));
-    Value S{"storage",
+    auto *Linked = U.M.getFunction("cpn.slot.linked");
+    llvm::Value *Valid = nullptr;
+    if (!V.BaseView || V.ExtentType == V.Type) {
+      llvm::Value *Operands[] = {V.Address, U.typeID(V.Type)};
+      llvm::OperandBundleDef Origin("cpn.storage.view", Operands);
+      Valid = B.CreateCall(Linked, {V.Slot}, {Origin});
+    } else {
+      Valid = B.CreateCall(Linked, {V.Slot});
+    }
+    guard(B.CreateNot(Valid));
+    Value S{StorageViewType,
             B.CreateLoad(B.getPtrTy(),
                          B.CreateStructGEP(U.SlotType, V.Slot, Address))};
     S.borrow(V);
@@ -247,7 +324,7 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
          "complete destruction through a base requires virtual destruction");
   if (C.Text == "abandon")
     checkAbandon(V.Type, C.At);
-  retireStorage(V, C.Text == "destroy");
+  retireStorage(V, C.Text == "destroy", true);
   return {"void"};
 }
 void Frame::joinStorage(const std::map<std::string, int> &Other) {

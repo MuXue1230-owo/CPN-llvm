@@ -7,6 +7,7 @@
 #include <deque>
 #include <optional>
 namespace cpn {
+inline constexpr char StorageViewType[] = "$cpn.storage";
 using SourcePosition = std::pair<unsigned, unsigned>;
 struct JumpCleanups {
   std::map<SourcePosition, std::set<SourcePosition>> Exited;
@@ -15,9 +16,23 @@ struct JumpCleanups {
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
 struct ConstantPlace;
+struct ConstantStorage {
+  std::vector<llvm::GlobalVariable *> Designations;
+};
+// Each evaluation-local object has its own lifetime. Copying its value creates
+// a separate object, while assignment preserves the target storage identity.
+struct ConstantStorageIdentity {
+  std::shared_ptr<ConstantStorage> Storage;
+  ConstantStorageIdentity() = default;
+  ConstantStorageIdentity(const ConstantStorageIdentity &) {}
+  ConstantStorageIdentity &operator=(const ConstantStorageIdentity &) {
+    return *this;
+  }
+};
 struct Value {
   std::shared_ptr<ConstantPlace> Location;
   std::shared_ptr<Value> ConstantTemporary;
+  ConstantStorageIdentity ConstantIdentity;
   SourcePosition DeclaredAt;
   std::string Type;
   llvm::Value *IR = nullptr, *Address = nullptr;
@@ -31,6 +46,16 @@ struct Value {
   llvm::Value *ElementLower = nullptr, *ElementUpper = nullptr;
   llvm::GlobalVariable *ReferenceCell = nullptr;
   llvm::Value *ArraySlot = nullptr, *ArrayGeneration = nullptr;
+  struct PointerCellLifetime {
+    llvm::Value *Slot = nullptr, *Generation = nullptr, *ArraySlot = nullptr,
+                *ArrayGeneration = nullptr;
+    std::string Storage, ExtentType;
+    bool Subobject = false, BaseView = false;
+  };
+  // A pointer object's lifetime is independent of the designation stored in it.
+  std::optional<PointerCellLifetime> PointerCell;
+  void rememberPointerCell(const Value &Cell);
+  Value objectDesignation() const;
   std::set<unsigned> Origins;
   bool Subobject = false, OptionalTemp = false;
   void borrow(const Value &V) {
@@ -47,6 +72,7 @@ struct Value {
     ArrayGeneration = V.ArrayGeneration;
   }
   bool BaseView = false, Prvalue = false;
+  bool Rollback = false;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
         bool RO = false)
@@ -62,9 +88,19 @@ struct Substitution {
   std::map<std::string, std::string> Types;
   std::map<std::string, Value> Values;
 };
+struct TypeApplication {
+  std::string Family;
+  // Type arguments carry their canonical type and constant arguments also
+  // carry their constant LLVM value.
+  std::vector<Value> Arguments;
+};
 struct DefinitionSite {
   Options Configuration;
   size_t Through;
+};
+struct StaticDeclaration {
+  std::string Name, Prefix;
+  Node Decl;
 };
 class Frame;
 struct Family;
@@ -157,11 +193,19 @@ struct ConstantPlace {
   struct Step {
     unsigned Index;
     const Case *Alternative = nullptr;
+    std::string BaseOwner;
+    bool operator==(const Step &Other) const {
+      return Index == Other.Index && Alternative == Other.Alternative &&
+             BaseOwner == Other.BaseOwner;
+    }
   };
   Value *Root;
   std::vector<Step> Steps;
   std::string Type;
   bool Readonly;
+  std::shared_ptr<Value> SymbolicRoot;
+  std::optional<std::weak_ptr<ConstantStorage>> Lifetime;
+  void trackLifetime();
   Value read(Frame &, const Token &) const;
   void write(Frame &, Value, const Token &) const;
 };
@@ -212,8 +256,15 @@ struct Context {
   void checkStaticRead(llvm::IRBuilder<> &, llvm::Value *);
   void finishStaticReads();
   std::set<llvm::GlobalVariable *> ConstantObjects;
-  std::vector<std::pair<std::string, Node>> Statics;
+  std::vector<StaticDeclaration> Statics;
   std::map<llvm::Constant *, llvm::Constant *> ConstantPayloads;
+  struct LocalConstantAddress {
+    ConstantPlace Place;
+    std::weak_ptr<ConstantStorage> Lifetime;
+    Token At;
+  };
+  std::map<llvm::GlobalVariable *, LocalConstantAddress> LocalConstantAddresses;
+  void finishLocalConstantAddresses();
   std::vector<const Value *> ConstantInvariantLifetimes;
   void chargeConstant(const Token &, uint64_t Steps = 1);
   unsigned ConstantSteps = 0, ConstantDepth = 0, SpecializationDepth = 0;
@@ -226,6 +277,7 @@ struct Context {
 
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, Family> Families;
+  std::map<std::string, TypeApplication> TypeApplications;
   std::map<std::string, std::vector<Family>> Specializations;
   std::map<std::string, std::deque<Family>> FunctionFamilies;
   std::map<std::string, std::vector<std::string>> Signatures;
@@ -233,7 +285,7 @@ struct Context {
   std::map<std::string, std::vector<Function *>> Overloads;
   std::deque<Function> Functions;
   std::map<std::string, Function *> Instances;
-  std::vector<llvm::Function *> Startup, Shutdown;
+  std::vector<std::pair<std::string, llvm::Function *>> Startup, Shutdown;
   unsigned Serial = 0;
   size_t Sequence = 0, LookupLimit = SIZE_MAX;
   DefinitionSite site() const { return {Opt, std::min(Sequence, LookupLimit)}; }
@@ -269,6 +321,7 @@ struct Context {
   std::vector<ContractProof> ContractProofs;
   void verifyProvenContracts();
   void bindScalarLibrary();
+  void bindNumericLibrary();
   void checkBorrowEscapes();
   std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
   llvm::Function *coordinator(const std::string &);
@@ -319,6 +372,8 @@ std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
 bool sameGenericValueContracts(const Node &, const Node &);
+bool sameGenericArgument(const Node &, const Node &, const Node &SourceBinders,
+                         const Node &TargetBinders);
 EffectBound genericEffectBound(const Node &, bool HasReceiver);
 std::set<llvm::StringRef> callableFlags(llvm::StringRef);
 EffectBound callableEffects(llvm::StringRef);
@@ -346,6 +401,8 @@ struct Local {
   std::map<std::string, Node::Kind> Nominals;
   std::map<std::string, std::string> Aliases;
   std::map<std::string, Value> Names;
+  std::map<std::string, std::string> StaticNames;
+  std::set<std::string> UnavailableNames;
   std::vector<Value> Drops;
   std::vector<std::string> ConstantDrops;
   std::map<std::string, SourcePosition> ConstantTypeSites;
@@ -458,6 +515,8 @@ public:
   void offsetRegistration(Value &, llvm::Value *, const std::string &,
                           const Token &);
   Value binary(const Node &, Value, Value);
+  std::string commonIntegerType(const std::string &, const std::string &,
+                                const Token &);
   Value boolean(const Node &);
   llvm::Value *evaluatePredicate(const Node &, llvm::StringRef Declaration,
                                  unsigned Ordinal, llvm::StringRef Mode,
@@ -476,6 +535,7 @@ public:
   Value floatingBinary(const Node &, Value, Value,
                        const std::string &Expected = "");
   Value place(const Node &, bool NeedLive = true);
+  Value pointedObject(Value, const Token &);
   Value subscript(const Node &);
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
@@ -483,6 +543,8 @@ public:
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
   std::optional<Value> scalarConversion(const Node &, llvm::StringRef,
                                         const std::vector<Node> &);
+  std::optional<Value> namedInteger(const Node &, llvm::StringRef,
+                                    const std::vector<Node> &);
   CallArguments evaluateArguments(const std::vector<Node> &,
                                   Function *Context = nullptr,
                                   Value SingleDestination = {});
@@ -503,6 +565,11 @@ public:
                                 const Token &);
   Substitution bind(const Family &, const std::vector<Node> &,
                     const std::vector<Value> &, const Token &);
+  size_t deducePackArity(const Family &, const Node &, llvm::ArrayRef<Value>);
+  std::optional<Value> deduceGenericArgument(const Family &, const Node &,
+                                             llvm::ArrayRef<Value>,
+                                             const Token &,
+                                             const std::string &ValueType = "");
   std::string initSlot(const Node &);
   Initializer deferInitializer(const Node &, const std::string &Expected);
   Value runInitializer(Initializer &, Value Target, const Token &);
@@ -536,7 +603,7 @@ public:
   void rewindConstantScope(const ConstantTransfer &, const Token &Destination);
   void object(const Node &, bool Global = false);
   void drop(Value, bool AsBase = false);
-  void dropLayer(Value, bool AsBase);
+  void dropLayer(Value, bool AsBase, bool Rollback = false);
   BasePath selectBase(const Record &, const BasePath &, const Node &);
   Value transferOwner(const Node &, const Node &);
   Value baseRequest(const Node &, const Node &);
@@ -549,9 +616,11 @@ public:
   void dropChild(Value, Value, bool AsBase = false);
   Value storageCall(const Node &, const std::vector<Node> &);
   void track(Value &, llvm::GlobalVariable *GlobalSlot = nullptr);
+  void trackLocal(Value &, llvm::StringRef Prefix);
   void ensureLive(const Value &, const Token &);
   void replaceGeneration(const Value &, const std::string &, const Token &);
-  void retireStorage(const Value &, bool);
+  void retireStorage(const Value &, bool Destroy, bool Explicit = false);
+  void markStorageWrite(llvm::Value *);
   void forgetStorage();
   void joinStorage(const std::map<std::string, int> &);
   static bool usesStorage(const Node &);
@@ -588,6 +657,8 @@ public:
   llvm::Constant *packVariant(const Case &, llvm::Constant *, const Token &);
   llvm::Constant *unpackVariant(const Case &, llvm::Constant *, const Token &);
   std::optional<ConstantPlace> constantPlace(const Node &);
+  Value constantAddress(const ConstantPlace &, const Token &);
+  ConstantPlace constantPointerPlace(const Value &, const Token &);
   llvm::Value *fieldAddress(Value, unsigned);
   Value baseView(Value, const BasePath &);
   llvm::Value *ownerRecord(Value, unsigned);
@@ -601,11 +672,18 @@ public:
                              const std::vector<Node> &, Value, Function *);
   Value constantTemporary(Value);
   Value constantSelf(const Token &);
-  Value constantCopy(Value, const Token &, bool CheckInvariant = true);
+  Value constantCopy(Value, const Token &, bool CheckInvariant = true,
+                     Value *BaseDestination = nullptr);
   Value constantConstructor(Function &, const std::vector<Value> &,
-                            const Token &, const Node *);
+                            const Token &, const Node *,
+                            Value *BaseDestination = nullptr);
   Value constantAggregate(const std::string &, const std::vector<Node> &,
-                          const Token &, const Node *);
+                          const Token &, const Node *,
+                          Value *BaseDestination = nullptr);
+  ConstantPlace constantBasePlace(ConstantPlace, const BasePath &) const;
+  ConstantPlace constantFieldPlace(Value &, unsigned) const;
+  Value constantField(Value &, unsigned, const Token &);
+  void bindConstantVirtualLayout(Value &, const Token &);
   void finishVirtualBase(Value, unsigned);
   void bindVirtualLayout(Value);
   llvm::Value *snapshot(Value);
@@ -615,7 +693,8 @@ public:
   std::string methodOwner(const std::string &, const Token &);
   void bindParams();
   void endConstantScope();
-  void constantDrop(Value, const Token &);
+  void constantDrop(Value, const Token &, bool AsBase = false,
+                    bool RunOwnDestructor = true);
   void endConstantField(const std::string &, bool, const Token &);
   void constructorBody(const Node &);
   void bindInlineParams(const std::vector<Value> &,

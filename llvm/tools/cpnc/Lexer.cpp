@@ -147,7 +147,8 @@ bool cpn::builtin(StringRef S) {
          S == "usize" || S == "i8" || S == "i16" || S == "i32" || S == "i64" ||
          S == "u8" || S == "u16" || S == "u32" || S == "u64";
 }
-std::vector<Token> cpn::lex(StringRef S, const Options &Opt) {
+std::vector<Token> cpn::lex(StringRef S, const Options &Opt,
+                            bool ExpandedPackNames) {
   S.consume_front("\xef\xbb\xbf");
   std::vector<Token> Out;
   size_t I = 0;
@@ -259,6 +260,14 @@ std::vector<Token> cpn::lex(StringRef S, const Options &Opt) {
         if (!xid(decode(S, J, T), false))
           break;
         advance();
+      }
+      // The compiler reparses bound value arguments in canonical type
+      // spellings. A generated pack index is outside the source alphabet.
+      if (ExpandedPackNames && I + 1 < S.size() && S[I] == '$' &&
+          llvm::isDigit(S[I + 1])) {
+        advance();
+        while (I < S.size() && llvm::isDigit(S[I]))
+          advance();
       }
       auto Word = S.slice(Begin, I);
       if (Opt.ASCII &&

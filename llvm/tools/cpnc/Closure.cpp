@@ -1,8 +1,6 @@
 #include "Sema.h"
 using namespace cpn;
 Value Frame::closure(const Node &N) {
-  if (!IR)
-    fail(N.At, "constant evaluation of a closure is unavailable");
   std::string Type = "$closure." + std::string(F ? F->Name : Prefix) + "." +
                      std::to_string(N.At.Line) + "." +
                      std::to_string(N.At.Column);
@@ -11,8 +9,9 @@ Value Frame::closure(const Node &N) {
   for (auto &C : N.TemplateArgs) {
     // Capture types determine the closure layout. Redirect this opaque
     // address to its final field as soon as all capture types are known.
-    auto *Slot = B.CreateAlloca(B.getInt8Ty());
-    Slots.push_back(Slot);
+    auto *Slot = IR ? B.CreateAlloca(B.getInt8Ty()) : nullptr;
+    if (Slot)
+      Slots.push_back(Slot);
     Value V;
     if (C.Type == "borrow") {
       Node Address(Node::Unary, C.At);
@@ -24,7 +23,7 @@ Value Frame::closure(const Node &N) {
     } else if (C.Type == "this") {
       if (!F || F->Owner.empty())
         fail(C.At, "this capture requires an enclosing receiver");
-      V = load(lookup(C.At));
+      V = !IR ? eval(Node(Node::Name, C.At)) : load(lookup(C.At));
       if (TracksStorage && !V.Slot) {
         Value Receiver{unconst(element(V.Type)), nullptr, V.IR};
         V.Slot = slotFor(Receiver);
@@ -33,13 +32,13 @@ Value Frame::closure(const Node &N) {
       }
     } else {
       V = C.Type == "initializer" ? eval(C.Children[0], "", Slot)
-                                  : load(lookup(C.At));
+                                  : eval(Node(Node::Name, C.At));
       if (V.Type == "integer")
         V = convert(V, materializationType(V.Type, C.At), C.At);
       if (V.Type == "real")
         V = floatingConvert(V, materializationType(V.Type, C.At), C.At);
     }
-    materialize(V, C.At, Slot);
+    V = materialize(V, C.At, Slot);
     Values.push_back(V);
   }
   if (!U.Records.count(Type)) {
@@ -59,6 +58,7 @@ Value Frame::closure(const Node &N) {
     Op.K = Node::Function;
     Op.Text = Op.At.Text = "$call";
     Op.Settings["closure"] = "true";
+    Op.Required = true;
     Op.TemplateArgs.clear();
     EnterDefinition Site(U, {Opt, LookupLimit});
     auto Lexical = Env;
@@ -69,6 +69,19 @@ Value Frame::closure(const Node &N) {
     U.emit(*D);
   }
   auto &R = U.Records.at(Type);
+  if (!IR) {
+    std::vector<llvm::Constant *> Captures;
+    for (auto &V : Values) {
+      auto *C = llvm::dyn_cast_or_null<llvm::Constant>(V.IR);
+      if (!C)
+        fail(N.At, "constant closure capture required");
+      Captures.push_back(C);
+    }
+    Value V{Type, Captures.empty() ? llvm::Constant::getNullValue(R.IR)
+                                   : llvm::ConstantStruct::get(R.IR, Captures)};
+    V.Prvalue = V.Expiring = true;
+    return constantTemporary(V);
+  }
   auto *Ptr =
       ExpressionDestination.Address && (ExpressionDestination.Type == Type ||
                                         ExpressionDestination.Type.empty())
@@ -92,11 +105,24 @@ void Frame::bindCaptures() {
   Local Captures;
   for (size_t I = 0; I < R.Fields.size(); ++I) {
     auto &Field = R.Fields[I];
-    auto *Cell = B.CreateStructGEP(R.IR, Self.Address, I);
     auto &Name = Field.Decl.Text;
     auto &Type = Field.Type;
     if (Scopes[0].Names.count(Name) && Name != "this")
       fail(Field.Decl.At, "parameter shadows a capture");
+    if (!IR) {
+      auto Self = constantSelf(Field.Decl.At);
+      auto Place = *Self.Location;
+      Place.Type = Type;
+      Place.Steps.push_back({unsigned(I)});
+      if (Field.Decl.Type == "borrow")
+        Place = constantPointerPlace(Place.read(*this, Field.Decl.At),
+                                     Field.Decl.At);
+      Value Binding{Place.Type, nullptr, nullptr, Place.Readonly};
+      Binding.Location = std::make_shared<ConstantPlace>(std::move(Place));
+      Captures.Names[Name] = std::move(Binding);
+      continue;
+    }
+    auto *Cell = B.CreateStructGEP(R.IR, Self.Address, I);
     if (Field.Decl.Type == "borrow") {
       auto E = element(Type);
       bool Const = llvm::StringRef(E).starts_with("const<") && E.back() == '>';
@@ -124,6 +150,17 @@ Value Frame::callClosure(Value Receiver, const std::vector<Node> &Args,
   if (Owner.empty())
     fail(At, "callable expression required");
   adjust(Receiver, Owner, At);
+  if (!IR) {
+    auto Key = Owner + "::" + Designator.Text;
+    auto Group = U.Overloads.find(Key);
+    auto *Hint = Group != U.Overloads.end() && Group->second.size() == 1 &&
+                         !U.FunctionFamilies.count(Key)
+                     ? Group->second.front()
+                     : nullptr;
+    auto *Op =
+        constantOverload(Designator.Text, Designator, Args, Receiver, Hint);
+    return constantCall(*Op, Args, At, Receiver);
+  }
   auto Actual = evaluateArguments(Args);
   auto *Op = select(Designator.Text, Designator, Actual.Values, Receiver);
   admitArguments(Actual, Op, At);

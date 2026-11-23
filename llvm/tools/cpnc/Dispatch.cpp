@@ -7,6 +7,37 @@ bool same(Function *A, Function *B) {
          A->Decl.Const == B->Decl.Const &&
          A->Decl.Settings["category"] == B->Decl.Settings["category"];
 }
+
+ConstantPlace placeFor(Value &Object) {
+  return Object.Location
+             ? *Object.Location
+             : ConstantPlace{&Object, {}, Object.Type, Object.Readonly};
+}
+
+ConstantPlace completePlace(ConstantPlace Place) {
+  while (!Place.Steps.empty() && !Place.Steps.back().BaseOwner.empty()) {
+    Place.Type = std::move(Place.Steps.back().BaseOwner);
+    Place.Steps.pop_back();
+  }
+  return Place;
+}
+
+uint64_t layerOffset(const Context &U, const ConstantPlace &Place) {
+  uint64_t Offset = 0;
+  for (auto &Step : llvm::reverse(Place.Steps)) {
+    if (Step.BaseOwner.empty())
+      break;
+    const auto &Owner = U.Records.at(Step.BaseOwner);
+    Offset += U.M.getDataLayout().getStructLayout(Owner.IR)->getElementOffset(
+        Step.Index);
+  }
+  return Offset;
+}
+void writeLayoutSlot(Frame &F, ConstantPlace Place, unsigned Index,
+                     llvm::Constant *Value, const Token &At) {
+  Place.Steps.push_back({Index});
+  Place.write(F, {"", Value}, At);
+}
 } // namespace
 bool Record::contains(const BasePath &From, const BasePath &To) const {
   if (From == To)
@@ -185,8 +216,17 @@ llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
   auto &R = U.Records.at(Obj.Type);
   if (!IR) {
     auto *Address = symbolicAddress(Obj, {});
-    if (I < R.VirtualCount)
-      fail({}, "virtual base offset requires runtime storage");
+    if (I < R.VirtualCount) {
+      llvm::Constant *Indices[] = {B.getInt32(0), B.getInt32(R.offsetSlot(I))};
+      auto *OffsetCell = llvm::ConstantExpr::getGetElementPtr(
+          U.M.getDataLayout(), R.Layer, Address, Indices);
+      auto *Offset = llvm::dyn_cast_or_null<llvm::ConstantInt>(
+          load({"i64", nullptr, OffsetCell}).IR);
+      if (!Offset)
+        fail({}, "constant virtual base requires a layout offset");
+      return llvm::ConstantExpr::getGetElementPtr(
+          U.M.getDataLayout(), B.getInt8Ty(), Address, {Offset});
+    }
     llvm::Constant *Indices[] = {B.getInt32(0), B.getInt32(I)};
     return llvm::ConstantExpr::getGetElementPtr(U.M.getDataLayout(), R.IR,
                                                 Address, Indices);
@@ -197,24 +237,66 @@ llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
       B.getInt64Ty(), B.CreateStructGEP(R.IR, Obj.Address, R.offsetSlot(I)));
   return B.CreateGEP(B.getInt8Ty(), Obj.Address, Offset);
 }
-Value Frame::baseView(Value Obj, const BasePath &Path) {
-  if (!IR && !Path.empty() && !Obj.Address && !Obj.Location)
-    Obj = constantTemporary(Obj);
-  for (auto I : Path) {
-    if (!IR && !Obj.Address && llvm::isa_and_nonnull<llvm::Constant>(Obj.IR)) {
-      Obj.IR = llvm::cast<llvm::Constant>(Obj.IR)->getAggregateElement(I);
-    } else {
-      Obj.Address = fieldAddress(Obj, I);
-      Obj.IR = nullptr;
+
+ConstantPlace Frame::constantBasePlace(ConstantPlace Place,
+                                       const BasePath &Path) const {
+  for (unsigned Index : Path) {
+    const auto &R = U.Records.at(Place.Type);
+    const auto &Type = R.Bases[Index];
+    if (Index < R.VirtualCount) {
+      Place = completePlace(std::move(Place));
+      const auto &Complete = U.Records.at(Place.Type);
+      auto Virtual =
+          llvm::ArrayRef(Complete.Bases).take_front(Complete.VirtualCount);
+      Index = Complete.tailSlot(llvm::find(Virtual, Type) - Virtual.begin());
     }
+    Place.Steps.push_back({Index, nullptr, Place.Type});
+    Place.Type = Type;
+  }
+  return Place;
+}
+
+ConstantPlace Frame::constantFieldPlace(Value &Object, unsigned I) const {
+  auto Place = placeFor(Object);
+  const auto &R = U.Records.at(Object.Type);
+  if (I < R.Bases.size())
+    return constantBasePlace(std::move(Place), {I});
+  Place.Steps.push_back({I});
+  Place.Type = R.Fields[I].Type;
+  return Place;
+}
+
+Value Frame::constantField(Value &Object, unsigned I, const Token &At) {
+  const auto &R = U.Records.at(Object.Type);
+  if (Object.Address) {
+    auto V = Value{R.Fields[I].Type, nullptr, fieldAddress(Object, I),
+                   Object.Readonly || R.Fields[I].Decl.Const};
+    V.BaseView = I < R.Bases.size();
+    return load(V);
+  }
+  auto Place = constantFieldPlace(Object, I);
+  Place.Readonly |= Object.Readonly || R.Fields[I].Decl.Const;
+  auto V = Place.read(*this, At);
+  V.Location = std::make_shared<ConstantPlace>(std::move(Place));
+  return V;
+}
+
+Value Frame::baseView(Value Obj, const BasePath &Path) {
+  if (!IR && !Path.empty() && !Obj.Address) {
+    auto Place = constantBasePlace(placeFor(Obj), Path);
+    auto Result = Place.read(*this, {});
+    Result.ConstantTemporary = Obj.ConstantTemporary;
+    if (Obj.Location)
+      Result.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    return Result;
+  }
+  for (auto I : Path) {
+    Obj.Address = fieldAddress(Obj, I);
+    Obj.IR = nullptr;
     Obj.Type = U.Records.at(Obj.Type).Bases[I];
     Obj.BaseView = true;
-    if (!IR && Obj.Location) {
-      auto Place = *Obj.Location;
-      Place.Steps.push_back({I});
-      Place.Type = Obj.Type;
-      Obj.Location = std::make_shared<ConstantPlace>(std::move(Place));
-    }
+    if (!IR)
+      Obj.Location.reset();
   }
   return Obj;
 }
@@ -348,17 +430,7 @@ void Frame::installConstantTables(Value &Obj, const Token &At) {
   const auto &Root = U.Records.at(Obj.Type);
   if (Root.Tables.empty())
     return;
-  auto *Image = llvm::cast<llvm::Constant>(Obj.IR);
-  const auto &DL = U.M.getDataLayout();
-  auto offset = [&](const BasePath &Path) {
-    const auto *R = &Root;
-    uint64_t Bytes = 0;
-    for (unsigned I : Path) {
-      Bytes += DL.getStructLayout(R->IR)->getElementOffset(I);
-      R = &U.Records.at(R->Bases[I]);
-    }
-    return Bytes;
-  };
+  auto Layer = placeFor(Obj);
   for (const auto &Table : Root.Tables) {
     U.chargeConstant(At, 1 + Table.Targets.size());
     const auto &R = U.Records.at(Root.Views.at(Table.View));
@@ -367,18 +439,63 @@ void Frame::installConstantTables(Value &Obj, const Token &At) {
         llvm::cast<llvm::ArrayType>(R.IR->getElementType(Vptr + 1));
     std::vector<llvm::Constant *> Deltas(DeltaType->getNumElements(),
                                          B.getInt64(0));
-    uint64_t Start = offset(Table.View);
+    auto View = constantBasePlace(Layer, Table.View);
+    uint64_t Start = layerOffset(U, View);
     for (size_t I = 0; I < Table.Receivers.size(); ++I)
-      Deltas[I] = B.getInt64(offset(Table.Receivers[I]) - Start);
-    auto Path = Table.View;
-    Path.push_back(Vptr);
-    Image =
-        llvm::ConstantFoldInsertValueInstruction(Image, Table.Entries, Path);
-    Path.back() = Vptr + 1;
-    Image = llvm::ConstantFoldInsertValueInstruction(
-        Image, llvm::ConstantArray::get(DeltaType, Deltas), Path);
+      Deltas[I] = B.getInt64(
+          layerOffset(U, constantBasePlace(Layer, Table.Receivers[I])) - Start);
+    writeLayoutSlot(*this, View, Vptr, Table.Entries, At);
+    writeLayoutSlot(*this, View, Vptr + 1,
+                    llvm::ConstantArray::get(DeltaType, Deltas), At);
   }
-  Obj.IR = Image;
+  Obj.IR = Layer.read(*this, At).IR;
+}
+
+void Frame::bindConstantVirtualLayout(Value &Obj, const Token &At) {
+  const auto &Root = U.Records.at(Obj.Type);
+  if (!Root.VirtualCount || Obj.BaseView)
+    return;
+  auto Complete = placeFor(Obj);
+  auto *RootLayout = U.M.getDataLayout().getStructLayout(Root.IR);
+  auto *State = U.ownerRecordType();
+  std::map<BasePath, unsigned> Indices;
+  for (const auto &[Path, Type] : Root.Views)
+    Indices.emplace(Path, Indices.size());
+  std::vector<llvm::Constant *> Rows;
+  for (unsigned I = 0; I < Root.VirtualCount; ++I) {
+    auto Owner = Root.Owners.find(Root.Bases[I]);
+    unsigned Binding =
+        Owner == Root.Owners.end() ? Indices.at({}) : Indices.at(Owner->second);
+    Rows.push_back(
+        llvm::ConstantStruct::get(State, {B.getInt32(Binding), B.getInt32(-1),
+                                          B.getTrue(), B.getFalse()}));
+  }
+  auto *RowType = llvm::cast<llvm::ArrayType>(
+      Root.IR->getElementType(Root.obligationsSlot()));
+  writeLayoutSlot(*this, Complete, Root.obligationsSlot(),
+                  llvm::ConstantArray::get(RowType, Rows), At);
+  auto *RowsLayout = U.M.getDataLayout().getStructLayout(State);
+  for (const auto &[Path, Type] : Root.Views) {
+    const auto &Layer = U.Records.at(Type);
+    if (!Layer.VirtualCount)
+      continue;
+    U.chargeConstant(At, 1 + Layer.VirtualCount);
+    auto View = constantBasePlace(Complete, Path);
+    uint64_t Offset = layerOffset(U, View);
+    writeLayoutSlot(*this, View, Layer.layerIndexSlot(),
+                    B.getInt32(Indices.at(Path)), At);
+    writeLayoutSlot(*this, View, Layer.layerEnteredSlot(), B.getTrue(), At);
+    for (unsigned I = 0; I < Layer.VirtualCount; ++I) {
+      unsigned J = llvm::find(Root.Bases, Layer.Bases[I]) - Root.Bases.begin();
+      uint64_t Target = RootLayout->getElementOffset(Root.tailSlot(J));
+      writeLayoutSlot(*this, View, Layer.offsetSlot(I),
+                      B.getInt64(Target - Offset), At);
+      uint64_t Owner = RootLayout->getElementOffset(Root.obligationsSlot()) +
+                       J * RowsLayout->getSizeInBytes().getFixedValue();
+      writeLayoutSlot(*this, View, Layer.ownerOffsetSlot(I),
+                      B.getInt64(Owner - Offset), At);
+    }
+  }
 }
 
 Function &Frame::constantVirtualTarget(Function &D, Value &Receiver,
@@ -403,29 +520,31 @@ Function &Frame::constantVirtualTarget(Function &D, Value &Receiver,
   auto &Target = *Table.Targets[Slot];
   if (Path == Table.View)
     return Target;
+  auto *Deltas = Image->getAggregateElement(Static.Fields.size() + 1);
+  auto *Offset =
+      llvm::cast<llvm::ConstantInt>(Deltas->getAggregateElement(Slot));
   if (auto *Address =
           llvm::dyn_cast_or_null<llvm::Constant>(Receiver.Address)) {
-    auto *Deltas = Image->getAggregateElement(Static.Fields.size() + 1);
-    llvm::Constant *Offset = Deltas->getAggregateElement(Slot);
     auto *Adjusted = llvm::ConstantExpr::getGetElementPtr(
         U.M.getDataLayout(), B.getInt8Ty(), Address, {Offset});
     Receiver = load({Target.Owner, nullptr, Adjusted, Receiver.Readonly});
   } else if (Receiver.Location) {
-    auto Place = *Receiver.Location;
-    if (Place.Steps.size() < Table.View.size() ||
-        !std::equal(Table.View.rbegin(), Table.View.rend(),
-                    Place.Steps.rbegin(),
-                    [](unsigned Slot, const ConstantPlace::Step &Step) {
-                      return Slot == Step.Index && !Step.Alternative;
-                    }))
-      fail(At, "constant virtual receiver has no complete-object designation");
-    Place.Steps.resize(Place.Steps.size() - Table.View.size());
-    for (unsigned I : Path)
-      Place.Steps.push_back({I});
-    Place.Type = Target.Owner;
-    Place.Readonly |= Receiver.Readonly;
-    Receiver = Place.read(*this, At);
-    Receiver.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    auto Complete = completePlace(*Receiver.Location);
+    const auto &Root = U.Records.at(Complete.Type);
+    uint64_t Expected =
+        layerOffset(U, *Receiver.Location) + Offset->getZExtValue();
+    for (const auto &[Candidate, Type] : Root.Views) {
+      if (Type != Target.Owner)
+        continue;
+      auto Place = constantBasePlace(Complete, Candidate);
+      if (layerOffset(U, Place) != Expected)
+        continue;
+      Place.Readonly |= Receiver.Readonly;
+      Receiver = Place.read(*this, At);
+      Receiver.Location = std::make_shared<ConstantPlace>(std::move(Place));
+      return Target;
+    }
+    fail(At, "constant virtual receiver has no complete-object designation");
   } else
     fail(At, "constant virtual receiver has no complete-object designation");
   return Target;
@@ -456,9 +575,15 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
       fail(At, "constant call requires a designated function");
     auto Decl = llvm::find_if(
         U.Functions, [&](const Function &D) { return D.IR == Target; });
-    if (Decl == U.Functions.end())
-      fail(At, "constant call requires a CPN function definition");
-    return constantCall(*Decl, Args, At);
+    if (Decl != U.Functions.end())
+      return constantCall(*Decl, Args, At);
+    for (const auto &[Type, R] : U.Records)
+      if (R.ClosureEntry == Target) {
+        auto *Call = U.Overloads.at(Type + "::$call").front();
+        return constantCall(*Call, Args, At,
+                            {Type, llvm::Constant::getNullValue(R.IR)});
+      }
+    fail(At, "constant call requires a CPN function definition");
   }
   std::vector<llvm::Type *> Types;
   std::vector<llvm::Value *> Vals;

@@ -27,52 +27,48 @@ std::set<size_t> effectPositions(const Node &D, StringRef Key) {
 } // namespace
 
 void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
-  auto Qualifier = StringRef(D.Settings.at("qualifier")).drop_back(2);
-  auto [Base, Arguments] = Qualifier.split('<');
+  std::string Base;
+  if (StringRef(D.Settings.at("qualifier")).starts_with("::"))
+    Base = "::";
+  auto Applied = D.Pattern.begin();
+  for (; Applied != D.Pattern.end(); ++Applied) {
+    Base += Applied->Text;
+    if (Applied->ExplicitApplication)
+      break;
+    Base += "::";
+  }
+  if (Applied == D.Pattern.end())
+    fail(D.At, "qualified member definition requires an applied owner");
   auto Key =
       scopeKey(Prefix, Base, [&](const auto &S) { return Families.count(S); });
   if (Key.empty())
     fail(D.At, "qualified member definition requires a declared owner family");
-  auto application = [&](StringRef &Text) {
-    unsigned Depth = 1, Parens = 0;
-    for (size_t I = 0; I < Text.size(); ++I) {
-      char C = Text[I];
-      if (C == '(')
-        ++Parens;
-      else if (C == ')' && Parens)
-        --Parens;
-      else if (!Parens && C == '<')
-        ++Depth;
-      else if (!Parens && C == '>' && !--Depth) {
-        auto Args = splitArguments(Text.take_front(I));
-        Text = Text.drop_front(I + 1);
-        return Args;
-      }
-    }
-    fail(D.At, "unterminated owner application");
-  };
   Node Formals;
   std::vector<SourcePosition> GenericOwners;
-  auto matches = [&](const Node &Decl, const std::vector<std::string> &Args) {
+  auto matches = [&](const Node &Decl, const std::vector<Node> &Args) {
     size_t Begin = Formals.Generics.size(), Count = Decl.Generics.size();
     if (Begin + Count > D.Generics.size())
       return false;
     Node Binders;
     Binders.Generics.assign(D.Generics.begin() + Begin,
                             D.Generics.begin() + Begin + Count);
-    std::vector<std::string> Pattern;
+    std::vector<Node> Pattern;
     if (Decl.Settings.count("specialize")) {
-      for (const auto &P : Decl.Pattern) {
-        if (P.K != Node::TypeArg && P.K != Node::Name && P.K != Node::Number)
-          return false;
-        Pattern.push_back(rebindTypeNames(
-            P.K == Node::TypeArg ? P.Type : P.Text, Decl, Binders));
-      }
+      Pattern = Decl.Pattern;
     } else {
-      for (const auto &G : Binders.Generics)
-        Pattern.push_back(G.Text + (G.Pack ? "..." : ""));
+      for (const auto &G : Decl.Generics) {
+        Node A(G.K == Node::TypeParam ? Node::TypeArg : Node::Name, G.At);
+        if (G.K == Node::TypeParam)
+          A.Type = G.Text;
+        A.Pack = G.Pack;
+        Pattern.push_back(std::move(A));
+      }
     }
-    return Pattern == Args;
+    return Pattern.size() == Args.size() &&
+           std::equal(Pattern.begin(), Pattern.end(), Args.begin(),
+                      [&](const Node &L, const Node &R) {
+                        return sameGenericArgument(L, R, Decl, Binders);
+                      });
   };
   auto addOwner = [&](const Node &Owner) {
     GenericOwners.push_back(position(Owner));
@@ -81,10 +77,9 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
     Formals.Params.insert(Formals.Params.end(), Owner.Params.begin(),
                           Owner.Params.end());
   };
-  auto Args = application(Arguments);
   const Node *Class = nullptr;
   auto matchRoot = [&](const Node &Decl) {
-    if (!matches(Decl, Args))
+    if (!matches(Decl, Applied->TemplateArgs))
       return;
     if (Class)
       fail(D.At, "ambiguous qualified owner pattern");
@@ -98,25 +93,22 @@ void Context::defineFamilyMember(const Node &D, const std::string &Prefix) {
     fail(D.At,
          "owner application must identify a declared family or specialization");
   addOwner(*Class);
-  while (Arguments.consume_front("::")) {
-    auto Part = Arguments.take_front(Arguments.find_first_of("<:"));
+  for (++Applied; Applied != D.Pattern.end(); ++Applied) {
     auto Inner = llvm::find_if(Class->Children, [&](const Node &N) {
-      return (N.K == Node::Record || N.K == Node::Union) && N.Text == Part &&
-             !N.Prototype;
+      return (N.K == Node::Record || N.K == Node::Union) &&
+             N.Text == Applied->Text && !N.Prototype;
     });
     if (Inner == Class->Children.end())
       fail(D.At, "unknown nested owning declaration");
     Class = &*Inner;
-    Arguments = Arguments.drop_front(Part.size());
-    if (Arguments.consume_front("<")) {
-      if (Class->Generics.empty() || !matches(*Class, application(Arguments)))
+    if (Applied->ExplicitApplication) {
+      if (Class->Generics.empty() || !matches(*Class, Applied->TemplateArgs))
         fail(D.At, "invalid nested owner application");
       addOwner(*Class);
     } else if (!Class->Generics.empty())
       fail(D.At, "nested owner family requires an application");
   }
-  if (!Arguments.empty() ||
-      (Class->K != Node::Record && Class->K != Node::Union))
+  if (Class->K != Node::Record && Class->K != Node::Union)
     fail(D.At, "qualified definition requires a record or union owner");
   if (Formals.Generics.size() != D.Generics.size())
     fail(D.At,

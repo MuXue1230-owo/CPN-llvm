@@ -107,6 +107,17 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
         return V;
       V.BaseView = true;
       if (!IR) {
+        auto *Identity = llvm::dyn_cast<llvm::GlobalVariable>(V.IR);
+        if (U.LocalConstantAddresses.count(Identity)) {
+          auto Original = V;
+          Original.Type = A + "*";
+          auto Place = constantPointerPlace(Original, At);
+          View = Place.read(*this, At);
+          View.Location = std::make_shared<ConstantPlace>(std::move(Place));
+          adjust(View, Target, At);
+          V.IR = constantAddress(*View.Location, At).IR;
+          return V;
+        }
         adjust(View, Target, At);
         V.IR = View.Address;
         return V;
@@ -146,6 +157,26 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
     fail(At, "no implicit lossless conversion from " + V.Type + " to " + T);
   return {T, B.CreateIntCast(V.IR, U.ir(T), signedType(V.Type))};
 }
+std::string Frame::commonIntegerType(const std::string &Left,
+                                     const std::string &Right,
+                                     const Token &At) {
+  if (Left == "integer")
+    return materializationType(Right, At);
+  if (Right == "integer" || Left == Right)
+    return Left;
+  if (StringRef(Left).ends_with("size") || StringRef(Right).ends_with("size"))
+    fail(At, "incompatible integer families");
+  unsigned W = std::max(width(Left), width(Right));
+  const bool Signed = signedType(Left) || signedType(Right);
+  if (Signed && ((!signedType(Left) && width(Left) == W) ||
+                 (!signedType(Right) && width(Right) == W)))
+    W *= 2;
+  auto Type = (Signed ? "i" : "u") + std::to_string(W);
+  if (W > 64 || !Opt.IntegerWidths.count(W))
+    fail(At, "CFG002: " + Type + " is unavailable as a common integer type");
+  return Type;
+}
+
 void Frame::guard(llvm::Value *Bad, StringRef Kind) {
   if (auto *C = dyn_cast<ConstantInt>(Bad); C && C->isZero())
     return;
@@ -225,19 +256,7 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
     if (Op == "&" || Op == "|" || Op == "^")
       fail(At,
            "bitwise operands require identical integer width and signedness");
-    if (StringRef(A.Type).ends_with("size") ||
-        StringRef(D.Type).ends_with("size"))
-      fail(At, "incompatible integer families");
-    unsigned W = std::max(WA, WB);
-    bool Signed = signedType(A.Type) || signedType(D.Type);
-    if (Signed &&
-        ((!signedType(A.Type) && WA == W) || (!signedType(D.Type) && WB == W)))
-      W *= 2;
-    if (W > 64)
-      fail(At, "i128 is unavailable as a common integer type");
-    T = (Signed ? "i" : "u") + std::to_string(W);
-    if (!Opt.IntegerWidths.count(W))
-      fail(At, "CFG002: " + T + " is unavailable as a common integer type");
+    T = commonIntegerType(A.Type, D.Type, At);
   }
   unsigned W = Exact ? std::max(WA, WB) + 2 : width(T);
   unsigned Distance = 0;

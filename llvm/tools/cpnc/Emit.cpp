@@ -23,6 +23,9 @@ bool assignment(StringRef Op) {
 } // namespace
 Value Frame::lookup(const Token &T) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+    if (I->UnavailableNames.count(T.Text))
+      fail(T, "unknown name '" + T.Text +
+                  "' in static initializer: automatic object is unavailable");
     if (I->Aliases.count(T.Text))
       fail(T, "type alias requires a type or construction context");
     auto V = I->Names.find(T.Text);
@@ -155,6 +158,8 @@ void Frame::bindParams() {
         V.Slot = slotFor(V);
         V.Generation = B.CreateCall(U.M.getFunction("cpn.generation"),
                                     {V.Slot, B.getFalse()});
+        if (ends(V.Type, "*"))
+          V.rememberPointerCell(V);
       }
     } else {
       llvm::Value *Ptr = A;
@@ -163,12 +168,8 @@ void Frame::bindParams() {
         B.CreateStore(A, Ptr);
       }
       V = {T, nullptr, Ptr, P.Const};
-      if (TracksStorage && !ends(T, "*")) {
-        V.Storage = "parameter." + std::to_string(U.Serial++);
-        track(V);
-        Extents[V.Storage] = V;
-        Active[V.Storage] = 1;
-      }
+      if (TracksStorage)
+        trackLocal(V, "parameter.");
       Scopes[0].Drops.push_back(V);
     }
     if (carriesPointerBounds(T)) {
@@ -236,12 +237,8 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual,
       }
       V.Readonly = Param.Const;
       V.Prvalue = V.Expiring = false;
-      if (TracksStorage && !ends(Type, "*")) {
-        V.Storage = "parameter." + std::to_string(U.Serial++);
-        track(V);
-        Extents[V.Storage] = V;
-        Active[V.Storage] = 1;
-      }
+      if (TracksStorage)
+        trackLocal(V, "parameter.");
       if (IR)
         Scopes.front().Drops.push_back(V);
       else if (U.aggregate(V.Type)) {
@@ -269,42 +266,43 @@ Value Frame::boolean(const Node &N) {
     Opt.warn(N.At, "assignment used directly as a Boolean condition");
   return V;
 }
+Value Frame::pointedObject(Value P, const Token &At) {
+  if (!ends(P.Type, "*") || unconst(element(P.Type)) == "void")
+    fail(At, "typed object pointer required");
+  if (llvm::isa<llvm::ConstantPointerNull>(P.IR))
+    fail(At, "null pointer access");
+  if (IR && Opt.RawValidation)
+    guard(B.CreateIsNull(P.IR));
+  if (!IR && P.Upper) {
+    int64_t Position, End;
+    const auto &Layout = U.M.getDataLayout();
+    if (llvm::GetPointerBaseWithConstantOffset(P.IR, Position, Layout) ==
+            llvm::GetPointerBaseWithConstantOffset(P.Upper, End, Layout) &&
+        Position == End)
+      fail(At, "cannot dereference a one-past pointer");
+  }
+  if (IR && P.Upper)
+    guard(
+        B.CreateAnd(B.CreateIsNotNull(P.Upper), B.CreateICmpEQ(P.IR, P.Upper)));
+  auto Base = element(P.Type);
+  Value V{unconst(Base), nullptr, P.IR, Base != unconst(Base)};
+  V.borrow(P);
+  V.ElementLower = P.Lower;
+  V.ElementUpper = P.Upper;
+  return V;
+}
+
 Value Frame::place(const Node &N, bool NeedLive) {
   Value V;
   if (N.K == Node::Name)
     V = lookup(N.At);
-  else if (N.K == Node::Unary && N.Text == "*") {
-    auto P = eval(N.Children[0]);
-    if (!ends(P.Type, "*") || P.Type == "void*")
-      fail(N.At, "typed object pointer required");
-    auto Base = element(P.Type);
-    V = {unconst(Base), nullptr, P.IR, Base != unconst(Base)};
-    V.borrow(P);
-    V.ElementLower = P.Lower;
-    V.ElementUpper = P.Upper;
-    if (!IR && P.Upper) {
-      int64_t Position, End;
-      const auto &DL = U.M.getDataLayout();
-      if (llvm::GetPointerBaseWithConstantOffset(P.IR, Position, DL) ==
-              llvm::GetPointerBaseWithConstantOffset(P.Upper, End, DL) &&
-          Position == End)
-        fail(N.At, "cannot dereference a one-past pointer");
-    }
-    if (P.Upper && IR)
-      guard(B.CreateAnd(B.CreateIsNotNull(P.Upper),
-                        B.CreateICmpEQ(P.IR, P.Upper)));
-    if (llvm::isa<llvm::ConstantPointerNull>(P.IR))
-      fail(N.At, "null pointer access");
-  } else if (N.K == Node::Member) {
+  else if (N.K == Node::Unary && N.Text == "*")
+    V = pointedObject(eval(N.Children[0]), N.At);
+  else if (N.K == Node::Member) {
     auto Base = N.Definition ? eval(N.Children[0]) : place(N.Children[0]);
     if (N.Definition) {
-      if (!ends(Base.Type, "*"))
-        fail(N.At, "typed object pointer required");
-      auto T = element(Base.Type);
-      Value Receiver{unconst(T), nullptr, Base.IR, unconst(T) != T};
-      Receiver.borrow(Base);
-      ensureLive(Receiver, N.At);
-      Base = Receiver;
+      Base = pointedObject(Base, N.At);
+      ensureLive(Base, N.At);
     }
     V = member(Base, N.At);
   } else if (N.K == Node::Index)
@@ -313,7 +311,12 @@ Value Frame::place(const Node &N, bool NeedLive) {
     V = eval(N);
   if (!V.Address)
     fail(N.At, "object lvalue required");
-  if (NeedLive && !V.BoundsCell)
+  if (IR && V.Slot && !V.PointerCell && !V.IR && !V.BoundsCell &&
+      ends(V.Type, "*")) {
+    V.rememberPointerCell(V);
+    V.Storage.clear();
+  }
+  if (NeedLive && (!V.BoundsCell || V.PointerCell))
     ensureLive(V, N.At);
   if (IR && carriesPointerBounds(V.Type) && !V.BoundsCell)
     V.BoundsCell = storedPointerCell(V.Address);
@@ -446,10 +449,13 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         return *V;
     return constantAssignment(N);
   }
-  if (ConstantReceiver && N.K == Node::Unary && Op == "*" &&
-      A[0].K == Node::Name && A[0].Text == "this")
+  const bool ImplicitThis =
+      ConstantReceiver && (!F || !F->Decl.Settings.count("closure"));
+  if (ImplicitThis && N.K == Node::Unary && Op == "*" && A[0].K == Node::Name &&
+      A[0].Text == "this")
     return constantSelf(N.At);
-  if (!IR && (N.K == Node::Name || N.K == Node::Member || N.K == Node::Index))
+  if (!IR && (N.K == Node::Name || N.K == Node::Member || N.K == Node::Index ||
+              (N.K == Node::Unary && Op == "*")))
     if (auto Place = constantPlace(N)) {
       if (Place->Type.empty())
         fail(N.At, "use before initialization");
@@ -457,6 +463,10 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       V.Location = std::make_shared<ConstantPlace>(std::move(*Place));
       return V;
     }
+  if (!IR && ImplicitThis && N.K == Node::Name && Op == "this") {
+    auto Self = constantSelf(N.At);
+    return constantAddress(*Self.Location, N.At);
+  }
   switch (N.K) {
   case Node::Lambda:
     return closure(N);
@@ -513,7 +523,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     }
     return load(subscript(N));
   case Node::Member:
-    if (ConstantReceiver && N.Definition && A[0].K == Node::Name &&
+    if (ImplicitThis && N.Definition && A[0].K == Node::Name &&
         A[0].Text == "this") {
       if (Transaction)
         Transaction->checkAccess(*this, N.At);
@@ -592,13 +602,16 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
           fail(N.At, "incompatible function-pointer effect or borrow contract");
         return {Expected, U.foreignContractEntry(*Match)};
       }
+      if (!IR)
+        if (auto Place = constantPlace(A[0]))
+          return constantAddress(*Place, N.At);
       auto V = place(A[0]);
       Value P{(V.Readonly ? qualifyConst(V.Type) : V.Type) + "*", V.Address};
-      P.borrow(V);
+      P.borrow(V.objectDesignation());
       if (!V.ElementLower) {
         P.ArraySlot = nullptr;
         P.ArrayGeneration = nullptr;
-        if (V.BoundsCell) {
+        if (V.BoundsCell && !V.PointerCell) {
           P.Slot = nullptr;
           P.Generation = nullptr;
           P.Storage.clear();
@@ -850,6 +863,19 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       V.ElementUpper = metadata(X.ElementUpper, Y.ElementUpper);
       V.ArraySlot = metadata(X.ArraySlot, Y.ArraySlot);
       V.ArrayGeneration = metadata(X.ArrayGeneration, Y.ArrayGeneration);
+      if (V.Address && (X.PointerCell || Y.PointerCell)) {
+        auto A = X.PointerCell.value_or(Value::PointerCellLifetime{});
+        auto D = Y.PointerCell.value_or(Value::PointerCellLifetime{});
+        V.PointerCell = Value::PointerCellLifetime{
+            metadata(A.Slot, D.Slot),
+            metadata(A.Generation, D.Generation),
+            metadata(A.ArraySlot, D.ArraySlot),
+            metadata(A.ArrayGeneration, D.ArrayGeneration),
+            A.Storage == D.Storage ? A.Storage : "",
+            A.ExtentType == D.ExtentType ? A.ExtentType : "",
+            A.Subobject || D.Subobject,
+            A.BaseView || D.BaseView};
+      }
       V.Slot = metadata(X.Slot, Y.Slot);
       V.Generation = metadata(X.Generation, Y.Generation);
       if (X.BoundsCell && Y.BoundsCell)
@@ -1044,16 +1070,8 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
                                   const Node &N,
                                   const std::vector<Value> &Args) {
   Family Fam = Source;
-  if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack) {
-    size_t Fixed = Fam.Decl.Generics.size() - 1;
-    size_t FixedParams =
-        std::count_if(Fam.Decl.Params.begin(), Fam.Decl.Params.end(),
-                      [](auto &P) { return !P.Pack; });
-    size_t Count = N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed
-                   : Args.size() > FixedParams   ? Args.size() - FixedParams
-                                                 : 0;
-    Fam = expand(Fam, Count, N.At);
-  }
+  if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack)
+    Fam = expand(Fam, deducePackArity(Fam, N, Args), N.At);
   if (Args.size() > Fam.Decl.Params.size() ||
       (Args.size() < Fam.Decl.Params.size() &&
        Fam.Decl.Params[Args.size()].Children.empty()))
@@ -1308,6 +1326,15 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     }
     CF.bindInlineParams(
         Actual, &D, StaticReceiver.Type.empty() ? nullptr : &StaticReceiver);
+    bool Closure = Target.Decl.Settings.count("closure");
+    if (Closure)
+      CF.bindCaptures();
+    auto Retire = [&] {
+      if (Closure)
+        CF.Scopes.pop_back();
+      CF.endConstantScope();
+      CF.checkMethodInvariant(false);
+    };
     CF.checkMethodInvariant(true);
     CF.checkContracts(true);
     try {
@@ -1316,14 +1343,12 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       if (R.Kind != Node::Return)
         throw;
       CF.checkContracts(false, R.Result);
-      CF.endConstantScope();
-      CF.checkMethodInvariant(false);
+      Retire();
       return R.Result;
     }
     if (Target.Result == "void") {
       CF.checkContracts(false);
-      CF.endConstantScope();
-      CF.checkMethodInvariant(false);
+      Retire();
       return {"void"};
     }
     fail(T, "constant invocation completed without a result");
@@ -1423,9 +1448,14 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   if (!Receiver.Storage.empty() && Active.count(Receiver.Storage))
     Active[Receiver.Storage] = -1;
   for (size_t I = 0; I < Actual.size(); ++I)
-    if ((ends(D.Params[I], "&") || ends(D.Params[I], "*")) &&
-        !Actual[I].Storage.empty() && Active.count(Actual[I].Storage))
-      Active[Actual[I].Storage] = -1;
+    if (ends(D.Params[I], "&") || ends(D.Params[I], "*")) {
+      const auto &Argument = Actual[I];
+      const auto &Storage = ends(D.Params[I], "&") && Argument.PointerCell
+                                ? Argument.PointerCell->Storage
+                                : Argument.Storage;
+      if (Active.count(Storage))
+        Active[Storage] = -1;
+    }
   auto Returned = callResult(D.Result, Call, T, ResultStorage);
   if (D.BorrowedResult.size() == 1) {
     auto Index = *D.BorrowedResult.begin();
@@ -1520,11 +1550,15 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     return indirect(eval(C.Children[0]), Args, C.At);
   if (C.K == Node::Name) {
     for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+      if (I->UnavailableNames.count(C.Text))
+        fail(C.At,
+             "unknown callable '" + C.Text +
+                 "' in static initializer: automatic object is unavailable");
       if (I->Aliases.count(C.Text))
         break;
       auto V = I->Names.find(C.Text);
       if (V != I->Names.end() && U.Records.count(V->second.Type))
-        return callClosure(V->second, Args, C.At);
+        return callClosure(IR ? V->second : eval(C), Args, C.At);
       if (V != I->Names.end() && ends(V->second.Type, "*") &&
           U.Signatures.count(element(V->second.Type)))
         return indirect(load(V->second), Args, C.At);
@@ -1546,15 +1580,22 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
     }
   }
   if (C.K == Node::Member) {
-    if (ConstantReceiver && C.Definition && C.Children[0].K == Node::Name &&
+    if (ConstantReceiver && (!F || !F->Decl.Settings.count("closure")) &&
+        C.Definition && C.Children[0].K == Node::Name &&
         C.Children[0].Text == "this")
       Receiver = constantSelf(C.At);
     else {
       Receiver =
           C.Definition || !IR ? eval(C.Children[0]) : place(C.Children[0]);
       if (C.Definition) {
-        auto T = element(Receiver.Type);
-        Receiver = {unconst(T), nullptr, Receiver.IR, T != unconst(T)};
+        if (!IR) {
+          auto Place = constantPointerPlace(Receiver, C.At);
+          Receiver = Place.read(*this, C.At);
+          Receiver.Location = std::make_shared<ConstantPlace>(std::move(Place));
+        } else {
+          Receiver = pointedObject(Receiver, C.At);
+          ensureLive(Receiver, C.At);
+        }
       }
     }
   } else if (C.K != Node::Name)
@@ -1640,6 +1681,9 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
       Name = Owner + "::" + Name;
   auto Key = callKey(Name, Receiver.Type);
   auto Group = visibleOverloads(Key);
+  if (Receiver.Type.empty() && Group.empty() && !U.FunctionFamilies.count(Key))
+    if (auto Numeric = namedInteger(C, Name, Args))
+      return *Numeric;
   auto *Hint = Group.size() == 1 && !U.FunctionFamilies.count(Key)
                    ? Group.front()
                    : nullptr;
@@ -1663,7 +1707,7 @@ bool Frame::typeCallee(const std::string &Name, const Token &At) {
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
     if (I->Aliases.count(Name))
       return true;
-    if (I->Names.count(Name))
+    if (I->Names.count(Name) || I->UnavailableNames.count(Name))
       return false;
   }
   if (builtin(Name) || Env.Types.count(Name))
@@ -1737,6 +1781,14 @@ void Frame::runConstructionTail(Value Object, const Node *Tail,
   llvm::SaveAndRestore<Construction *> OuterTransaction(Transaction, nullptr);
   Scopes.emplace_back();
   Scopes.back().Names["this"] = {Object.Type + "*", Object.Address};
+  const bool HasSubobjects = U.aggregate(Object.Type);
+  if (HasSubobjects) {
+    // The tail executes after subobject completion and before the containing
+    // object's lifetime begins. A transfer out retires the completed parts.
+    Object.Rollback = true;
+    Object.DeclaredAt = {Tail->At.Line, Tail->At.Column};
+    Scopes.back().Drops.push_back(Object);
+  }
   for (const auto &S : Tail->Children) {
     if (S.K == Node::Init) {
       if (!BoundSlots)
@@ -1744,7 +1796,11 @@ void Frame::runConstructionTail(Value Object, const Node *Tail,
     } else
       stmt(S);
   }
-  cleanup(Scopes.size() - 1);
+  if (Live) {
+    if (HasSubobjects)
+      Scopes.back().Drops.erase(Scopes.back().Drops.begin());
+    cleanup(Scopes.size() - 1);
+  }
   Scopes.pop_back();
 }
 
@@ -2055,7 +2111,12 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
 void Frame::drop(Value V, bool AsBase) {
   if (!IR || !V.Address)
     return;
+  V = V.objectDesignation();
   requirePredicateCleanup(V.Type, F ? F->Decl.At : Token{});
+  if (V.Rollback) {
+    dropLayer(V, V.BaseView, true);
+    return;
+  }
   if (!V.Storage.empty() && Extents.count(V.Storage) &&
       Extents.at(V.Storage).Address == V.Address &&
       Registrations.count(V.Storage)) {
@@ -2071,7 +2132,7 @@ void Frame::drop(Value V, bool AsBase) {
   }
   dropLayer(V, AsBase);
 }
-void Frame::dropLayer(Value V, bool AsBase) {
+void Frame::dropLayer(Value V, bool AsBase, bool Rollback) {
   if (ends(V.Type, "]")) {
     auto E = unconst(element(V.Type));
     if (ends(V.Type, "[0]") ||
@@ -2094,7 +2155,8 @@ void Frame::dropLayer(Value V, bool AsBase) {
   }
   if (!U.Records.count(V.Type))
     return;
-  if (auto It = U.Overloads.find(V.Type + "::$drop"); It != U.Overloads.end()) {
+  if (auto It = U.Overloads.find(V.Type + "::$drop");
+      !Rollback && It != U.Overloads.end()) {
     auto *D = It->second.front();
     B.CreateCall(AsBase && D->BaseIR ? D->BaseIR : D->IR, {V.Address});
     return;
@@ -2107,8 +2169,12 @@ void Frame::dropLayer(Value V, bool AsBase) {
   installTables(V);
   for (size_t I = R.Fields.size(); I > (AsBase ? R.VirtualCount : 0); --I) {
     auto &F = R.Fields[I - 1];
-    dropChild(V, {F.Type, nullptr, fieldAddress(V, I - 1)},
-              I - 1 < R.Bases.size());
+    Value Child{F.Type, nullptr, fieldAddress(V, I - 1)};
+    bool Base = I - 1 < R.Bases.size();
+    if (Rollback && Base)
+      dropLayer(Child, true);
+    else
+      dropChild(V, Child, Base);
   }
 }
 void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
@@ -2116,9 +2182,10 @@ void Frame::cleanup(size_t From, const std::set<SourcePosition> *Exited) {
     cleanupScope(I - 1, Exited);
 }
 void Frame::cleanupScope(size_t I, const std::set<SourcePosition> *Exited) {
-  for (const auto &V : llvm::reverse(Scopes[I].Drops)) {
-    if (Exited && !Exited->count(V.DeclaredAt))
+  for (const auto &Drop : llvm::reverse(Scopes[I].Drops)) {
+    if (Exited && !Exited->count(Drop.DeclaredAt))
       continue;
+    auto V = Drop.objectDesignation();
     drop(V);
     if (V.Slot && !V.Subobject && Extents.count(V.Storage) &&
         Extents.at(V.Storage).Address == V.Address)
@@ -2127,6 +2194,7 @@ void Frame::cleanupScope(size_t I, const std::set<SourcePosition> *Exited) {
 }
 void Frame::consume(Value V) {
   if (!IR && V.ConstantTemporary) {
+    V.ConstantTemporary->ConstantIdentity.Storage.reset();
     llvm::erase_if(Temps, [&](const Value &T) {
       return T.ConstantTemporary == V.ConstantTemporary;
     });
@@ -2143,6 +2211,7 @@ void Frame::endExpression(size_t From) {
     Temps.pop_back();
     if (!IR && V.ConstantTemporary) {
       constantDrop(*V.ConstantTemporary, F ? F->Decl.At : Token{});
+      V.ConstantTemporary->ConstantIdentity.Storage.reset();
       continue;
     }
     if (V.OptionalTemp) {
@@ -2183,18 +2252,55 @@ void Frame::object(const Node &N, bool Global) {
     if (!U.Globals.count(ID)) {
       Node D = N;
       D.Settings["identity"] = ID;
+      if (auto After = D.Settings.find("init_after");
+          After != D.Settings.end()) {
+        std::string Bound;
+        for (auto Dep : splitArguments(After->second)) {
+          if (Dep == N.Text)
+            Dep = "::" + ID;
+          else
+            for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
+              if (auto Static = I->StaticNames.find(Dep);
+                  Static != I->StaticNames.end()) {
+                Dep = "::" + Static->second;
+                break;
+              }
+              if (I->Names.count(Dep) || I->Aliases.count(Dep) ||
+                  I->UnavailableNames.count(Dep))
+                fail(N.At, "initialization dependency '" + Dep +
+                               "' does not name a static object");
+            }
+          if (!Bound.empty())
+            Bound += ",";
+          Bound += Dep;
+        }
+        After->second = std::move(Bound);
+      }
       Frame Init(U, nullptr, nullptr, Prefix);
       Init.Env = Env;
       Init.Opt = Opt;
-      for (const auto &Scope : Scopes)
-        for (const auto &[Alias, Type] : Scope.Aliases)
-          Init.Env.Types[Alias] = Type;
+      Init.LookupLimit = LookupLimit;
+      Init.Scopes.clear();
+      // Eager initialization retains the declaration's lexical bindings
+      // without importing storage from the invocation that defined them.
+      for (const auto &Scope : Scopes) {
+        auto &Visible = Init.Scopes.emplace_back();
+        Visible.Aliases = Scope.Aliases;
+        Visible.StaticNames = Scope.StaticNames;
+        Visible.UnavailableNames = Scope.UnavailableNames;
+        for (const auto &[Name, V] : Scope.Names)
+          if (Scope.StaticNames.count(Name))
+            Visible.Names.emplace(Name, V);
+          else
+            Visible.UnavailableNames.insert(Name);
+      }
       Init.object(D, true);
-      U.Statics.emplace_back(ID, D);
+      U.Statics.push_back({ID, Prefix, std::move(D)});
     }
     auto V = U.Globals.at(ID);
     V.DeclaredAt = {N.At.Line, N.At.Column};
     Scopes.back().Names[N.Text] = std::move(V);
+    Scopes.back().StaticNames[N.Text] = ID;
     return;
   }
   auto names = [&]() -> std::map<std::string, Value> & {
@@ -2297,6 +2403,8 @@ void Frame::object(const Node &N, bool Global) {
     Frame Init(U, nullptr, Fn, Prefix);
     Init.Env = Env;
     Init.Opt = Opt;
+    Init.LookupLimit = LookupLimit;
+    Init.Scopes = Scopes;
     Init.B.SetInsertPoint(Init.block("entry"));
     if (!Simple) {
       Init.construct(Ty, Args, N.At, G, Tail);
@@ -2329,9 +2437,11 @@ void Frame::object(const Node &N, bool Global) {
           U.M, U.SlotType, false, llvm::GlobalValue::InternalLinkage,
           llvm::Constant::getNullValue(U.SlotType), "cpn.static.slot");
       Init.track(Cell, GlobalSlot);
+      if (ends(Cell.Type, "*"))
+        Cell.rememberPointerCell(Cell);
     }
     Init.B.CreateRetVoid();
-    U.Startup.push_back(Fn);
+    U.Startup.emplace_back(Name, Fn);
     names()[Name] = Cell;
     if (Cell.Slot || U.Records.count(Ty) || ends(Ty, "]")) {
       auto *D = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
@@ -2344,7 +2454,7 @@ void Frame::object(const Node &N, bool Global) {
       } else
         DF.drop(Cell);
       DF.B.CreateRetVoid();
-      U.Shutdown.push_back(D);
+      U.Shutdown.emplace_back(Name, D);
     }
     return;
   }
@@ -2369,11 +2479,15 @@ void Frame::object(const Node &N, bool Global) {
     V = bindReference(V, Ty, N.At);
     V.DeclaredAt = {N.At.Line, N.At.Column};
     names()[Name] = V;
+    if (!IR)
+      endExpression();
     return;
   }
   if (!IR) {
     auto V = Ty == "auto" ? constantEval(Args.at(0))
                           : construct(Ty, Args, N.At, nullptr, Tail);
+    if (Ty == "auto")
+      V = materialize(V, N.At);
     if (V.Type == "real")
       V = floatingConvert(V, materializationType(V.Type, N.At), N.At);
     if (V.Type == "integer")
@@ -2430,18 +2544,13 @@ void Frame::object(const Node &N, bool Global) {
   if (N.Required && !llvm::isa_and_nonnull<llvm::Constant>(V.IR))
     fail(N.At, "constexpr initializer requires a constant");
   Value Cell{Ty, N.Required ? V.IR : nullptr, Ptr, Readonly};
-  if (Ty == "storage" || ends(Ty, "*"))
+  if (Ty == StorageViewType || ends(Ty, "*"))
     Cell.borrow(V);
   if (carriesPointerBounds(Ty)) {
     Cell.BoundsCell = storedPointerCell(Ptr);
     saveBounds(Cell.BoundsCell, V);
   }
-  if (Cell.Storage.empty() && Ty != "storage" && !ends(Ty, "*")) {
-    Cell.Storage = "local." + std::to_string(U.Serial++);
-    Active[Cell.Storage] = true;
-    track(Cell);
-    Extents[Cell.Storage] = Cell;
-  }
+  trackLocal(Cell, "local.");
   names()[Name] = Cell;
   Cell.DeclaredAt = {N.At.Line, N.At.Column};
   Scopes.back().Drops.push_back(Cell);

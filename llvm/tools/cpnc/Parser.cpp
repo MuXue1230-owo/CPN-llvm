@@ -209,8 +209,14 @@ class Parser {
                                                     : name();
     std::string Schema = T.Text;
     while (true) {
+      const bool NumericApplication =
+          Application && is("<") && integerLibraryName(T.Text, true) &&
+          (StringRef(T.Text).contains("::") ||
+           ((Root || !HiddenTypes.count(T.Text)) &&
+            (known(peek(1).Text) || peek(1).Text == "::" ||
+             peek(2).Text == "::")));
       if (is("<") &&
-          (Families.count(Schema) ||
+          (Families.count(Schema) || NumericApplication ||
            (Application &&
             (builtinPredicate(T.Text) || T.Text == "construct_at" ||
              T.Text == "destroy_base" || T.Text == "abandon_base" ||
@@ -273,7 +279,8 @@ class Parser {
     if (Canonical)
       *Canonical = "<";
     std::vector<Node> Out;
-    if (eat(">")) {
+    if (is(">") || is(">>")) {
+      closeAngle();
       if (Canonical)
         *Canonical += ">";
       return Out;
@@ -284,7 +291,7 @@ class Parser {
       bool T = It != Families.end() && !It->second.empty()
                    ? It->second[std::min(I, It->second.size() - 1)].K ==
                          Node::TypeParam
-                   : known(peek().Text);
+                   : integerLibraryName(Name, true) || known(peek().Text);
       if (T) {
         Node A(Node::TypeArg, peek());
         A.Type = type();
@@ -294,7 +301,16 @@ class Parser {
       if (Canonical) {
         if (I)
           *Canonical += ",";
-        *Canonical += T ? Out.back().Type : spelling(Begin);
+        if (T)
+          *Canonical += Out.back().Type;
+        else {
+          const auto &Argument = Out.back();
+          auto Text = spelling(Begin);
+          if (!Argument.Grouped &&
+              (Argument.K == Node::Binary || Argument.K == Node::Conditional))
+            Text = "(" + Text + ")";
+          *Canonical += Text;
+        }
       }
       Out.back().Pack = eat("...");
       if (Canonical && Out.back().Pack)
@@ -678,8 +694,20 @@ class Parser {
     return Match;
   }
   Node simple() {
+    if (is("[") && peek(1).Text == "[") {
+      auto Attrs = attributes();
+      if (!is("static") && !is("thread_local"))
+        fail(peek(), "block static attributes require a storage modifier");
+      auto N = simple();
+      applyAttributes(N, Attrs);
+      return N;
+    }
     if (is("static") || is("thread_local")) {
       auto Storage = take();
+      if (is("static") || is("thread_local"))
+        fail(peek(), "duplicate storage modifier");
+      if (is("[") && peek(1).Text == "[")
+        fail(peek(), "static attributes must precede the storage modifier");
       auto N = simple();
       if (N.K != Node::Object)
         fail(Storage, "storage modifier requires an object declaration");
@@ -695,7 +723,7 @@ class Parser {
     if (RO || CX || is("auto") || typeBefore(true)) {
       auto Ty = eat("auto") ? std::string("auto") : type();
       auto Id = name();
-      if (Types.count(Id.Text))
+      if (Types.count(Id.Text) || integerLibraryName(Id.Text, true))
         HiddenTypes.insert(Id.Text);
       return object(Id, Ty, RO, CX);
     }
@@ -978,15 +1006,18 @@ class Parser {
       return false;
     }
   }
-  Token declarationName(std::string &Qualifier, bool &Dtor) {
+  Token declarationName(std::string &Qualifier, bool &Dtor,
+                        std::vector<Node> *Owners = nullptr) {
     bool Root = eat("::");
     auto Id = is("operator") ? operatorName() : name();
     std::string Schema = Id.Text;
     for (;;) {
       auto Component = Id.Text;
+      Node Owner(Node::Name, Id);
       if (is("<") && Families.count(Schema)) {
         std::string Args;
-        templateArgs(Schema, &Args);
+        Owner.TemplateArgs = templateArgs(Schema, &Args);
+        Owner.ExplicitApplication = true;
         Component += Args;
         if (!is("::"))
           fail(peek(),
@@ -994,6 +1025,8 @@ class Parser {
       }
       if (!eat("::"))
         break;
+      if (Owners)
+        Owners->push_back(std::move(Owner));
       Qualifier += Component + "::";
       Dtor = eat("~");
       Id = !Dtor && is("operator") ? operatorName() : name();
@@ -1487,9 +1520,11 @@ class Parser {
     if (!Member && !Foreign && separateSpecial()) {
       std::string Q;
       bool Dtor = false;
-      auto Id = declarationName(Q, Dtor);
+      std::vector<Node> Owners;
+      auto Id = declarationName(Q, Dtor, &Owners);
       Node D(Dtor ? Node::Destructor : Node::Constructor, Id);
       D.Settings["qualifier"] = Q;
+      D.Pattern = std::move(Owners);
       D.Generics = G;
       if (Requires.K != Node::Empty)
         D.TemplateArgs.push_back(std::move(Requires));
@@ -1513,7 +1548,8 @@ class Parser {
     auto Ty = eat("auto") ? std::string("auto") : type();
     std::string Q;
     bool Dtor = false;
-    auto Id = declarationName(Q, Dtor);
+    std::vector<Node> Owners;
+    auto Id = declarationName(Q, Dtor, &Owners);
     if (Dtor || (!Q.empty() && (Member || Foreign || Proto || Def)))
       fail(Id, "invalid qualified declaration");
     bool Fn = !Def && (!Q.empty() || operatorSpelling(Id.Text) || Proto ||
@@ -1541,6 +1577,7 @@ class Parser {
       F.Settings["virtual"] = "1";
     F.Type = Ty;
     F.Generics = G;
+    F.Pattern = std::move(Owners);
     if (!Q.empty())
       F.Settings["qualifier"] = Q;
     F.Foreign = Foreign;
@@ -1573,7 +1610,7 @@ class Parser {
     } else {
       auto OuterHidden = HiddenTypes;
       for (const auto &P : F.Params)
-        if (Types.count(P.Text))
+        if (Types.count(P.Text) || integerLibraryName(P.Text, true))
           HiddenTypes.insert(P.Text);
       F.Children.push_back(block());
       HiddenTypes = std::move(OuterHidden);
@@ -1585,8 +1622,12 @@ class Parser {
 public:
   explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {
     Types.insert({"std::ScalarError", "std::Result"});
+    Types.insert({"std::numeric::NumericResult", "std::numeric::NumericStatus",
+                  "std::numeric::NumericErrorCode", "std::numeric::FPFlag",
+                  "std::numeric::FPFlagSet"});
     Node TypeParam(Node::TypeParam, {});
     Families["std::Result"] = {TypeParam, TypeParam};
+    Families["std::numeric::NumericResult"] = {TypeParam};
     Families["std::from_underlying"] = {TypeParam};
     Families["std::try_from_underlying"] = {TypeParam};
   }
@@ -1610,7 +1651,7 @@ std::vector<Node> cpn::parse(StringRef S, const Options &O) {
   return Parser(lex(S, O)).unit();
 }
 Node cpn::parseExpression(StringRef S, const Options &O) {
-  return Parser(lex(S, O)).expression();
+  return Parser(lex(S, O, true)).expression();
 }
 void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
   auto requireFloatFormat = [&](StringRef Format) {
@@ -1648,6 +1689,7 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     Default("construction.analysis", O.InterproceduralConstruction, Debug);
     Default("effects.inference", O.InterproceduralEffects, Debug);
     Default("effects.diagnostics", O.StrictEffectDiagnostics, false);
+    Default("memory.raw_validation", O.RawValidation, Debug);
     Default("numeric.fp.profile", O.FPProfile, Debug ? "strict" : "native");
     Default("numeric.integer.overflow", O.Overflow,
             Debug ? "checked" : "native");
@@ -1678,6 +1720,12 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (K == "compilation.modules" || K == "compilation.separate" ||
         K == "tooling.contract_export")
       continue;
+    if (K == "memory.raw_validation") {
+      if (V != "available" && V != "contract")
+        fail(N.At, "CFG001: invalid raw memory validation policy");
+      O.RawValidation = V == "available";
+      continue;
+    }
     if (StringRef(K).starts_with("contracts.")) {
       if (Scope > ConfigScope::Declaration)
         fail(N.At, "CFG001: contract policy binds at declaration scope");

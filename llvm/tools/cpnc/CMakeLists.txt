@@ -31,6 +31,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     ForeignContracts.cpp
     Generic.cpp
     Integer.cpp
+    IntegerLibrary.cpp
     Invariants.cpp
     Lexer.cpp
     Lifetime.cpp

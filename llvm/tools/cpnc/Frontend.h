@@ -43,6 +43,7 @@ struct Options {
   std::string ContractValidation = "check", InvariantValidation = "check";
   bool ASCII = false, Check = false, IR = false;
   bool CustomPreset = false;
+  bool RawValidation = true;
   bool InterproceduralConstruction = true, InterproceduralEffects = true;
   bool StrictEffectDiagnostics = false;
   Severity Minimum = Severity::Warning;
@@ -52,7 +53,8 @@ struct Options {
                 llvm::StringRef Message) const;
   void warn(const Token &, llvm::StringRef) const;
 };
-std::vector<Token> lex(llvm::StringRef, const Options &);
+std::vector<Token> lex(llvm::StringRef, const Options &,
+                       bool ExpandedPackNames = false);
 std::string unquote(const Token &);
 llvm::APInt integerLiteral(const Token &);
 bool identifier(llvm::StringRef);
@@ -62,6 +64,7 @@ inline bool operatorSpelling(llvm::StringRef Name) {
 }
 bool builtin(llvm::StringRef);
 bool builtinPredicate(llvm::StringRef);
+bool integerLibraryName(llvm::StringRef, bool ExplicitDestination = false);
 bool realToken(llvm::StringRef);
 bool floating(llvm::StringRef);
 struct Node {
@@ -135,6 +138,7 @@ struct Node {
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
 using EffectSet = std::set<std::string>;
+bool usesNumericLibrary(const Node &);
 using EffectBound = std::optional<EffectSet>;
 EffectSet bindEffectNames(llvm::StringRef, const std::vector<Node> &,
                           bool HasReceiver, const Token &);

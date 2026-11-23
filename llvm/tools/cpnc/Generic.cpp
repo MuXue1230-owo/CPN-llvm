@@ -1,8 +1,9 @@
 #include "Sema.h"
 #include "llvm/ADT/StringExtras.h"
 using namespace cpn;
+using llvm::StringRef;
 namespace {
-std::string substitute(llvm::StringRef S, const std::set<std::string> &Names,
+std::string substitute(StringRef S, const std::set<std::string> &Names,
                        size_t Index) {
   std::string R;
   auto IdentifierByte = [](char C) {
@@ -21,6 +22,199 @@ std::string substitute(llvm::StringRef S, const std::set<std::string> &Names,
     }
   }
   return R;
+}
+size_t angleEnd(StringRef S, size_t Open) {
+  unsigned Angles = 1, Groups = 0;
+  char Quote = 0;
+  for (size_t I = Open + 1; I < S.size(); ++I) {
+    char C = S[I];
+    if (Quote) {
+      if (C == '\\' && I + 1 < S.size())
+        ++I;
+      else if (C == Quote)
+        Quote = 0;
+    } else if (C == '\'' || C == '"')
+      Quote = C;
+    else if (C == '(' || C == '[' || C == '{')
+      ++Groups;
+    else if (C == ')' || C == ']' || C == '}') {
+      if (Groups)
+        --Groups;
+    } else if (!Groups && C == '<')
+      ++Angles;
+    else if (!Groups && C == '>' && !--Angles)
+      return I;
+  }
+  return StringRef::npos;
+}
+
+std::string expandPackLists(StringRef Text, const std::set<std::string> &Names,
+                            size_t Count, std::optional<size_t> Index,
+                            const Token &At) {
+  auto Rewrite = [&](StringRef Part) {
+    return Index ? substitute(Part, Names, *Index) : Part.str();
+  };
+  auto Open = Text.find('<');
+  if (!Text.contains("...") || Open == StringRef::npos)
+    return Rewrite(Text);
+  auto Close = angleEnd(Text, Open);
+  if (Close == StringRef::npos)
+    return Rewrite(Text);
+
+  std::string Out = Rewrite(Text.take_front(Open + 1));
+  bool First = true;
+  auto Append = [&](StringRef Arg, std::optional<size_t> I) {
+    if (!First)
+      Out += ",";
+    First = false;
+    Out += expandPackLists(Arg, Names, Count, I, At);
+  };
+  for (const auto &Spelling : splitArguments(Text.slice(Open + 1, Close))) {
+    StringRef Arg = Spelling;
+    if (!Arg.consume_back("...")) {
+      Append(Arg, Index);
+      continue;
+    }
+    if (substitute(Arg, Names, 0) == Arg)
+      fail(At, "generic argument expansion requires a pack binding");
+    for (size_t I = 0; I < Count; ++I)
+      Append(Arg, I);
+  }
+  Out += ">";
+  Out += expandPackLists(Text.drop_front(Close + 1), Names, Count, Index, At);
+  return Out;
+}
+
+const TypeApplication *matchingApplication(const Context &U, const Family &Fam,
+                                           StringRef Formal, StringRef Actual,
+                                           size_t &Open) {
+  Open = Formal.find('<');
+  if (Open == StringRef::npos || angleEnd(Formal, Open) + 1 != Formal.size())
+    return nullptr;
+  auto Instance = U.TypeApplications.find(Actual.str());
+  if (Instance == U.TypeApplications.end())
+    return nullptr;
+  auto Key = scopeKey(Fam.Prefix, Formal.take_front(Open),
+                      [&](const std::string &Name) {
+                        auto I = U.Families.find(Name);
+                        return I != U.Families.end() &&
+                               I->second.Site.Through <= Fam.Site.Through;
+                      });
+  return Key == Instance->second.Family ? &Instance->second : nullptr;
+}
+
+std::string deductionType(StringRef Formal, const Value &Actual,
+                          StringRef &Pattern) {
+  auto Type = Actual.Type;
+  if (Formal.consume_front("forward ") && Actual.Address && !Actual.Expiring)
+    Type += "&";
+  while (Formal.consume_back("&")) {
+  }
+  if (Formal.starts_with("const<") && Formal.ends_with(">"))
+    Formal = Formal.slice(6, Formal.size() - 1);
+  Pattern = Formal;
+  return Type;
+}
+
+void visitTypeArguments(Frame &F, const Family &Fam, StringRef Formal,
+                        StringRef Actual,
+                        llvm::function_ref<void(StringRef, Value)> Deduce) {
+  Deduce(Formal, {Actual.str()});
+  for (StringRef Suffix : {"&&", "&", "*"}) {
+    if (Formal.ends_with(Suffix) && Actual.ends_with(Suffix)) {
+      visitTypeArguments(F, Fam, Formal.drop_back(Suffix.size()),
+                         Actual.drop_back(Suffix.size()), Deduce);
+      return;
+    }
+  }
+  if (Formal.starts_with("const<") && Formal.ends_with(">") &&
+      Actual.starts_with("const<") && Actual.ends_with(">")) {
+    visitTypeArguments(F, Fam, Formal.slice(6, Formal.size() - 1),
+                       Actual.slice(6, Actual.size() - 1), Deduce);
+    return;
+  }
+  if (Formal.ends_with("]") && Actual.ends_with("]")) {
+    auto P = Formal.rfind('['), A = Actual.rfind('[');
+    uint64_t Extent;
+    if (P != StringRef::npos && A != StringRef::npos &&
+        !Actual.slice(A + 1, Actual.size() - 1).getAsInteger(10, Extent)) {
+      Deduce(Formal.slice(P + 1, Formal.size() - 1),
+             F.literal(Extent, "usize"));
+      visitTypeArguments(F, Fam, Formal.take_front(P), Actual.take_front(A),
+                         Deduce);
+    }
+    return;
+  }
+  size_t Open;
+  auto *App = matchingApplication(F.U, Fam, Formal, Actual, Open);
+  if (!App)
+    return;
+  const auto Params = splitArguments(Formal.slice(Open + 1, Formal.size() - 1));
+  if (Params.size() != App->Arguments.size())
+    return;
+  for (size_t I = 0; I < Params.size(); ++I) {
+    const auto &Arg = App->Arguments[I];
+    if (Arg.IR)
+      Deduce(Params[I], Arg);
+    else
+      visitTypeArguments(F, Fam, Params[I], Arg.Type, Deduce);
+  }
+}
+
+void inferNestedPack(Frame &F, const Family &Fam, StringRef Formal,
+                     StringRef Actual, const std::set<std::string> &Pack,
+                     llvm::function_ref<void(size_t)> DeduceCount,
+                     const Token &At) {
+  for (StringRef Suffix : {"&&", "&", "*"}) {
+    if (Formal.ends_with(Suffix) && Actual.ends_with(Suffix)) {
+      inferNestedPack(F, Fam, Formal.drop_back(Suffix.size()),
+                      Actual.drop_back(Suffix.size()), Pack, DeduceCount, At);
+      return;
+    }
+  }
+  if (Formal.starts_with("const<") && Formal.ends_with(">") &&
+      Actual.starts_with("const<") && Actual.ends_with(">")) {
+    inferNestedPack(F, Fam, Formal.slice(6, Formal.size() - 1),
+                    Actual.slice(6, Actual.size() - 1), Pack, DeduceCount, At);
+    return;
+  }
+  if (Formal.ends_with("]") && Actual.ends_with("]")) {
+    inferNestedPack(F, Fam, Formal.take_front(Formal.rfind('[')),
+                    Actual.take_front(Actual.rfind('[')), Pack, DeduceCount,
+                    At);
+    return;
+  }
+  size_t Open;
+  auto *App = matchingApplication(F.U, Fam, Formal, Actual, Open);
+  if (!App)
+    return;
+  const auto Patterns =
+      splitArguments(Formal.slice(Open + 1, Formal.size() - 1));
+  const size_t Expansions = llvm::count_if(Patterns, [&](StringRef P) {
+    return P.consume_back("...") && substitute(P, Pack, 0) != P;
+  });
+  const size_t Fixed = Patterns.size() - Expansions;
+  if (App->Arguments.size() < Fixed ||
+      (!Expansions && App->Arguments.size() != Fixed))
+    return;
+  size_t Count = 0;
+  if (Expansions) {
+    size_t Remaining = App->Arguments.size() - Fixed;
+    if (Remaining % Expansions)
+      throw DeductionFailure{{At, "inconsistent nested pack pattern arity"}};
+    Count = Remaining / Expansions;
+    DeduceCount(Count);
+  }
+  size_t I = 0;
+  for (StringRef P : Patterns) {
+    if (P.consume_back("...") && substitute(P, Pack, 0) != P)
+      I += Count;
+    else {
+      const auto &Arg = App->Arguments[I++];
+      if (!Arg.IR)
+        inferNestedPack(F, Fam, P, Arg.Type, Pack, DeduceCount, At);
+    }
+  }
 }
 // Compare the admitted structural type patterns symbolically. A repeated
 // parameter has to match the same pattern at every occurrence.
@@ -174,6 +368,31 @@ bool cpn::sameGenericValueContracts(const Node &A, const Node &B) {
                        normalizedValueContracts(B));
 }
 
+bool cpn::sameGenericArgument(const Node &A, const Node &B, const Node &From,
+                              const Node &To) {
+  if (A.K != B.K || A.Pack != B.Pack || A.Definition != B.Definition ||
+      A.ExplicitApplication != B.ExplicitApplication ||
+      A.Settings != B.Settings || A.Children.size() != B.Children.size() ||
+      A.TemplateArgs.size() != B.TemplateArgs.size() ||
+      normalized(A.Type, From) != normalized(B.Type, To))
+    return false;
+  if (A.K == Node::Number) {
+    auto X = integerLiteral(A.At), Y = integerLiteral(B.At);
+    unsigned W = std::max(X.getBitWidth(), Y.getBitWidth());
+    if (X.zextOrTrunc(W) != Y.zextOrTrunc(W))
+      return false;
+  } else if (A.K != Node::TypeArg && A.K != Node::Call &&
+             normalized(A.Text, From) != normalized(B.Text, To))
+    return false;
+  auto Match = [&](const Node &L, const Node &R) {
+    return sameGenericArgument(L, R, From, To);
+  };
+  return std::equal(A.Children.begin(), A.Children.end(), B.Children.begin(),
+                    Match) &&
+         std::equal(A.TemplateArgs.begin(), A.TemplateArgs.end(),
+                    B.TemplateArgs.begin(), Match);
+}
+
 EffectBound cpn::genericEffectBound(const Node &D, bool HasReceiver) {
   auto E = D.Settings.find("effects");
   if (E == D.Settings.end())
@@ -205,6 +424,75 @@ bool cpn::sameGenericSignature(const Node &A, const Node &B) {
       return false;
   return requirements(A) == requirements(B);
 }
+
+size_t Frame::deducePackArity(const Family &Fam, const Node &Call,
+                              llvm::ArrayRef<Value> Actual) {
+  const auto &D = Fam.Decl;
+  const size_t Fixed = D.Generics.size() - 1;
+  if (Call.TemplateArgs.size() > Fixed)
+    return Call.TemplateArgs.size() - Fixed;
+  std::optional<size_t> Count;
+  auto Establish = [&](size_t N) {
+    if (Count && *Count != N)
+      throw DeductionFailure{{Call.At, "conflicting deduced pack lengths"}};
+    Count = N;
+  };
+  const size_t Expanded =
+      llvm::count_if(D.Params, [](const Node &P) { return P.Pack; });
+  const size_t FixedParams = D.Params.size() - Expanded;
+  if (Expanded && Actual.size() >= FixedParams) {
+    const size_t Remaining = Actual.size() - FixedParams;
+    if (Remaining % Expanded)
+      throw DeductionFailure{{Call.At, "inconsistent parameter pack arity"}};
+    Establish(Remaining / Expanded);
+  }
+  const std::set<std::string> Pack{D.Generics.back().Text};
+  size_t I = 0;
+  for (const auto &Param : D.Params) {
+    if (Param.Pack) {
+      I += Count.value_or(0);
+      continue;
+    }
+    if (I >= Actual.size())
+      break;
+    StringRef Formal;
+    auto Type = deductionType(Param.Type, Actual[I++], Formal);
+    inferNestedPack(*this, Fam, Formal, Type, Pack, Establish, Call.At);
+  }
+  return Count.value_or(0);
+}
+
+std::optional<Value>
+Frame::deduceGenericArgument(const Family &Fam, const Node &Param,
+                             llvm::ArrayRef<Value> Actual, const Token &At,
+                             const std::string &ValueType) {
+  std::optional<Value> Result;
+  auto Establish = [&](StringRef Name, Value Candidate) {
+    if (Name != Param.Text || bool(Candidate.IR) != !ValueType.empty())
+      return;
+    try {
+      if (!ValueType.empty())
+        Candidate = convert(Candidate, ValueType, At);
+      else
+        Candidate.Type = materializationType(Candidate.Type, At);
+    } catch (const ResourceExhausted &) {
+      throw;
+    } catch (const Diagnostic &D) {
+      throw DeductionFailure{D};
+    }
+    if (Result &&
+        (Result->Type != Candidate.Type || Result->IR != Candidate.IR))
+      throw DeductionFailure{{At, "conflicting deduction"}};
+    Result = std::move(Candidate);
+  };
+  for (size_t I = 0; I < Actual.size() && I < Fam.Decl.Params.size(); ++I) {
+    StringRef Formal;
+    auto Type = deductionType(Fam.Decl.Params[I].Type, Actual[I], Formal);
+    visitTypeArguments(*this, Fam, Formal, Type, Establish);
+  }
+  return Result;
+}
+
 Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
   Family Result = Source;
   auto &D = Result.Decl;
@@ -238,12 +526,11 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
         Nodes = std::move(Out);
       };
   transform = [&](Node &N, std::optional<size_t> I) {
-    if (I) {
-      N.Text = substitute(N.Text, Names, *I);
-      N.At.Text = substitute(N.At.Text, Names, *I);
-      N.Type = substitute(N.Type, Names, *I);
-    } else if (N.K == Node::Name && Names.count(N.Text))
+    if (!I && N.K == Node::Name && Names.count(N.Text))
       fail(N.At, "unexpanded pack in expression");
+    N.Text = expandPackLists(N.Text, Names, Count, I, N.At);
+    N.At.Text = expandPackLists(N.At.Text, Names, Count, I, N.At);
+    N.Type = expandPackLists(N.Type, Names, Count, I, N.At);
     if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
       std::string Bound;
       auto Add = [&](llvm::StringRef Effect) {
@@ -271,6 +558,7 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
     sequence(N.Params, I);
     sequence(N.Children, I);
     sequence(N.TemplateArgs, I);
+    sequence(N.Pattern, I);
     sequence(N.Contracts, I);
   };
   sequence(D.Generics, {});
@@ -414,14 +702,65 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
   if (Group == U.Specializations.end())
     return;
   struct Candidate {
-    const Family *Source;
+    Family Definition;
     Node Head;
     Substitution Env;
+    bool VariableArity;
+  };
+  auto Better = [](const Candidate &A, const Candidate &B) {
+    if (A.VariableArity != B.VariableArity && acceptsPattern(A.Head, B.Head) &&
+        acceptsPattern(B.Head, A.Head))
+      return !A.VariableArity;
+    return betterTypePattern(A.Head, B.Head);
   };
   std::vector<Candidate> Best;
-  for (auto &Spec : Group->second) {
-    if (Spec.Site.Through > LookupLimit)
+  for (const auto &Declaration : Group->second) {
+    if (Declaration.Site.Through > LookupLimit)
       continue;
+    Family Spec = Declaration;
+    const bool Packed =
+        !Spec.Decl.Generics.empty() && Spec.Decl.Generics.back().Pack;
+    if (Packed) {
+      const auto &Patterns = Spec.Decl.Pattern;
+      const auto &Params = Primary.Decl.Generics;
+      const size_t Expansions =
+          llvm::count_if(Patterns, [](const Node &P) { return P.Pack; });
+      const size_t Fixed = Patterns.size() - Expansions;
+      if (Params.size() < Fixed || (!Expansions && Params.size() != Fixed))
+        continue;
+      std::optional<size_t> Count;
+      auto Establish = [&](size_t N) {
+        if (Count && *Count != N)
+          throw DeductionFailure{
+              {At, "conflicting specialization pack lengths"}};
+        Count = N;
+      };
+      if (Expansions) {
+        const size_t Remaining = Params.size() - Fixed;
+        if (Remaining % Expansions)
+          continue;
+        Establish(Remaining / Expansions);
+      }
+      const std::set<std::string> Pack{Spec.Decl.Generics.back().Text};
+      size_t I = 0;
+      try {
+        for (const auto &Pattern : Patterns) {
+          if (Pattern.Pack) {
+            I += Count.value_or(0);
+            continue;
+          }
+          const auto &Param = Params[I++];
+          if (Param.K == Node::TypeParam && Pattern.K == Node::TypeArg)
+            inferNestedPack(*this, Spec, Pattern.Type,
+                            Actual.Types.at(Param.Text), Pack, Establish, At);
+        }
+      } catch (const DeductionFailure &) {
+        continue;
+      }
+      if (!Count)
+        continue;
+      Spec = expand(Spec, *Count, At);
+    }
     Frame Probe(U, nullptr, nullptr, Spec.Prefix);
     Probe.Opt = Spec.Site.Configuration;
     Probe.LookupLimit = Spec.Site.Through;
@@ -433,51 +772,41 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
         return P.K == K && P.Text == Name;
       });
     };
-    auto matchType = [&](auto &&Match, llvm::StringRef P,
-                         llvm::StringRef T) -> bool {
-      if (binder(P, Node::TypeParam)) {
-        auto [I, New] = Probe.Env.Types.emplace(P.str(), T.str());
-        return New || I->second == T;
-      }
-      for (auto S : {"&&", "&", "*"})
-        if (P.consume_back(S))
-          return T.consume_back(S) && Match(Match, P, T);
-      if (P.consume_front("const<") && P.consume_back(">"))
-        return T.consume_front("const<") && T.consume_back(">") &&
-               Match(Match, P, T);
-      auto A = P.find('<'), B = T.find('<');
-      if (A != llvm::StringRef::npos && B != llvm::StringRef::npos &&
-          P.take_front(A) == T.take_front(B)) {
-        auto L = splitArguments(P.slice(A + 1, P.size() - 1)),
-             R = splitArguments(T.slice(B + 1, T.size() - 1));
-        if (L.size() != R.size())
-          return false;
-        for (size_t I = 0; I < L.size(); ++I)
-          if (!Match(Match, L[I], R[I]))
-            return false;
-        return true;
-      }
-      return Probe.resolve(P.str(), At) == T;
-    };
     bool Fits = Spec.Decl.Pattern.size() == Primary.Decl.Generics.size();
+    auto Deduce = [&](StringRef Name, Value Arg) {
+      if (Arg.IR && binder(Name, Node::ValueParam)) {
+        auto [I, New] = Probe.Env.Values.emplace(Name.str(), Arg);
+        Fits &= New || I->second.IR == Arg.IR;
+      } else if (!Arg.IR && binder(Name, Node::TypeParam)) {
+        auto [I, New] = Probe.Env.Types.emplace(Name.str(), Arg.Type);
+        Fits &= New || I->second == Arg.Type;
+      }
+    };
+    std::vector<std::pair<const Node *, StringRef>> TypeChecks;
+    std::vector<std::pair<const Node *, Value>> ValueChecks;
     for (size_t I = 0; Fits && I < Spec.Decl.Pattern.size(); ++I) {
       const auto &Pattern = Spec.Decl.Pattern[I],
                  &Param = Primary.Decl.Generics[I];
       Node Slot(Node::Parameter, Pattern.At);
       if (Param.K == Node::TypeParam) {
-        Fits = Pattern.K == Node::TypeArg &&
-               matchType(matchType, Pattern.Type, Actual.Types.at(Param.Text));
+        Fits = Pattern.K == Node::TypeArg;
+        if (Fits) {
+          StringRef T = Actual.Types.at(Param.Text);
+          visitTypeArguments(Probe, Spec, Pattern.Type, T, Deduce);
+          TypeChecks.emplace_back(&Pattern, T);
+        }
         Slot.Type = Pattern.Type;
       } else {
         auto V = Actual.Values.at(Param.Text);
-        Slot.Type = Pattern.Text;
-        if (Pattern.K == Node::Name && binder(Pattern.Text, Node::ValueParam)) {
+        bool Direct =
+            Pattern.K == Node::Name && binder(Pattern.Text, Node::ValueParam);
+        Slot.Type = Direct ? Pattern.Text : atom(Pattern, Spec.Decl);
+        if (Direct) {
           auto [It, New] = Probe.Env.Values.emplace(Pattern.Text, V);
           Fits = New || It->second.IR == V.IR;
         } else {
-          Fits =
-              Pattern.K != Node::TypeArg &&
-              Probe.convert(Probe.constantEval(Pattern), V.Type, At).IR == V.IR;
+          Fits = Pattern.K != Node::TypeArg;
+          ValueChecks.emplace_back(&Pattern, V);
         }
       }
       Head.Params.push_back(std::move(Slot));
@@ -485,24 +814,41 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
     if (!Fits || Probe.Env.Types.size() + Probe.Env.Values.size() !=
                      Head.Generics.size())
       continue;
+    for (const auto &[Pattern, T] : TypeChecks)
+      if (Probe.resolve(Pattern->Type, At) != T) {
+        Fits = false;
+        break;
+      }
+    if (!Fits)
+      continue;
+    // A computed argument checks previously deduced values. It cannot infer
+    // a binder merely because an equation could be solved for it.
+    for (const auto &[Pattern, V] : ValueChecks)
+      if (Probe.convert(Probe.constantEval(*Pattern), V.Type, At).IR != V.IR) {
+        Fits = false;
+        break;
+      }
+    if (!Fits)
+      continue;
     if (!Spec.Decl.Params.empty() &&
         !llvm::cast<llvm::ConstantInt>(
              Probe.constantEval(Spec.Decl.Params.front()).IR)
              ->isOne())
       continue;
+    Candidate Current{std::move(Spec), std::move(Head), std::move(Probe.Env),
+                      Packed};
     if (llvm::any_of(Best, [&](const Candidate &Entry) {
-          return betterTypePattern(Entry.Head, Head);
+          return Better(Entry, Current);
         }))
       continue;
-    llvm::erase_if(Best, [&](const Candidate &Entry) {
-      return betterTypePattern(Head, Entry.Head);
-    });
-    Best.push_back({&Spec, std::move(Head), std::move(Probe.Env)});
+    llvm::erase_if(
+        Best, [&](const Candidate &Entry) { return Better(Current, Entry); });
+    Best.push_back(std::move(Current));
   }
   if (Best.size() > 1)
     fail(At, "ambiguous type specialization");
   if (!Best.empty()) {
-    Primary = *Best.front().Source;
+    Primary = std::move(Best.front().Definition);
     Actual = std::move(Best.front().Env);
   }
 }

@@ -21,6 +21,8 @@ Value Frame::openStaticReference(Value V) {
   auto *Cell = storedPointerCell(V.ReferenceCell);
   V.Address = B.CreateLoad(B.getPtrTy(), V.ReferenceCell);
   readReferent(V, Cell);
+  if (llvm::StringRef(V.Type).ends_with("*") && V.Slot)
+    V.rememberPointerCell(V);
   if (carriesPointerBounds(V.Type))
     V.BoundsCell = storedPointerCell(V.Address);
   return V;
@@ -52,8 +54,10 @@ void Frame::staticReference(const Node &N, const std::string &Name,
   Init.Env = Env;
   Init.Opt = Opt;
   Init.LookupLimit = LookupLimit;
+  Init.Scopes = Scopes;
   Init.B.SetInsertPoint(Init.block("entry"));
-  auto V = Init.bindReference(Init.place(Source), Type, N.At);
+  auto V =
+      Init.bindReference(Init.place(Source), Type, N.At).objectDesignation();
   Init.B.CreateStore(V.Address, Cell);
   V.Lower = V.ElementLower;
   V.Upper = V.ElementUpper;
@@ -61,7 +65,7 @@ void Frame::staticReference(const Node &N, const std::string &Name,
   Init.endExpression();
   Init.B.CreateStore(B.getTrue(), Ready);
   Init.B.CreateRetVoid();
-  U.Startup.push_back(Fn);
+  U.Startup.emplace_back(Name, Fn);
   U.Ready[Cell] = Ready;
   U.Initializing[Fn] = Cell;
   Bound.Type = V.Type;

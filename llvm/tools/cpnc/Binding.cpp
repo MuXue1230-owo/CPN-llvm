@@ -27,8 +27,9 @@ struct Check {
                                      "SameType",
                                      "ObjectType",
                                      "CompleteType"};
-    if (Names.count(S) || Intrinsics.count(S) || builtin(S) ||
-        builtinPredicate(S) || U.Aliases.count(S) || U.Cases.count(S))
+    if (Names.count(S) || Intrinsics.count(S) || integerLibraryName(S) ||
+        builtin(S) || builtinPredicate(S) || U.Aliases.count(S) ||
+        U.Cases.count(S))
       return true;
     if (!Owner.empty() && U.Records.count(Owner)) {
       const auto &R = U.Records.at(Owner);
@@ -41,6 +42,12 @@ struct Check {
     }
     if (Dependent && llvm::StringRef(S).contains("::") &&
         Names.count(llvm::StringRef(S).split("::").first.str()))
+      return true;
+    auto [Family, Arguments] = llvm::StringRef(S).split('<');
+    if (!Arguments.empty() &&
+        !scopeKey(Prefix, Family, [&](const std::string &Key) {
+           return U.Families.count(Key);
+         }).empty())
       return true;
     return !scopeKey(Prefix, S, [&](const std::string &Key) {
               return U.Globals.count(Key) || U.Overloads.count(Key) ||
