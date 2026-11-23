@@ -1025,6 +1025,36 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     fail(N.At, "expected a value expression");
   }
 }
+ReferenceKind cpn::referenceKind(StringRef Spelling) {
+  return Spelling.ends_with("&&")  ? ReferenceKind::Rvalue
+         : Spelling.ends_with("&") ? ReferenceKind::Lvalue
+                                   : ReferenceKind::None;
+}
+
+std::optional<unsigned> cpn::referenceBindingRank(ReferenceKind Reference,
+                                                  bool ParameterConst,
+                                                  bool ArgumentConst,
+                                                  bool Lvalue) {
+  if (Reference == ReferenceKind::None)
+    return 0;
+  if ((Reference == ReferenceKind::Rvalue && Lvalue) ||
+      (!ParameterConst &&
+       (ArgumentConst || (Reference == ReferenceKind::Lvalue && !Lvalue))))
+    return std::nullopt;
+  return unsigned(ParameterConst && !ArgumentConst);
+}
+
+std::optional<unsigned> cpn::receiverBindingRank(ReferenceKind Category,
+                                                 bool MethodConst,
+                                                 bool ReceiverConst,
+                                                 bool Expiring) {
+  auto Actual = Expiring ? ReferenceKind::Rvalue : ReferenceKind::Lvalue;
+  if ((Category != ReferenceKind::None && Category != Actual) ||
+      (ReceiverConst && !MethodConst))
+    return std::nullopt;
+  return unsigned(MethodConst && !ReceiverConst);
+}
+
 // Ranks order exact binding, then qualification/base/null conversions, then
 // numeric conversions. Each argument retains its own rank during selection.
 std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
@@ -1032,12 +1062,13 @@ std::optional<unsigned> Frame::conversionRank(Value V, const std::string &Param,
   if (V.Type == "never")
     return 0;
   auto Base = baseRef(Param), T = unconst(Base);
-  bool Ref = Base != Param, RO = T != Base,
+  const auto Reference = referenceKind(Param);
+  bool Ref = Reference != ReferenceKind::None, RO = T != Base,
        Lvalue = (V.Address || V.Location) && !V.Expiring;
-  if (Ref && ((ends(Param, "&&") && Lvalue) ||
-              (!ends(Param, "&&") && !RO && !Lvalue) || (!RO && V.Readonly)))
-    return {};
-  unsigned Qual = Ref && RO && !V.Readonly ? 1 : 0;
+  auto Binding = referenceBindingRank(Reference, RO, V.Readonly, Lvalue);
+  if (!Binding)
+    return std::nullopt;
+  unsigned Qual = *Binding;
   if (V.Type == T)
     return Qual;
   if (Ref && U.Records.count(V.Type) && adjust(V, T, At, false))
@@ -1204,13 +1235,17 @@ Function *Frame::select(std::string Name, const Node &N,
     const auto &Object = MemberOperand ? Args.front() : Receiver;
     if (Object.Type.empty() && !D->Owner.empty() && !D->isStatic())
       continue;
+    unsigned ReceiverRank = unsigned(D->Decl.Const && !Object.Readonly);
     if (!Object.Type.empty() && !D->isStatic()) {
       auto Q = D->Decl.Settings.find("category");
-      if (Q != D->Decl.Settings.end() && !Q->second.empty() &&
-          Q->second != (Object.Expiring ? "&&" : "&"))
+      auto Category = Q == D->Decl.Settings.end() ? ReferenceKind::None
+                                                  : referenceKind(Q->second);
+      auto Rank = receiverBindingRank(
+          Category, D->Decl.Const,
+          Object.Readonly && D->Decl.K == Node::Function, Object.Expiring);
+      if (!Rank)
         continue;
-      if (Object.Readonly && !D->Decl.Const && D->Decl.K == Node::Function)
-        continue;
+      ReceiverRank = *Rank;
     }
     if (Actual.size() > D->Params.size() ||
         (Actual.size() < D->Params.size() &&
@@ -1219,8 +1254,7 @@ Function *Frame::select(std::string Name, const Node &N,
     Candidate Current{D, {}};
     if (!Operator || MemberOperand)
       Current.Ranks.push_back(
-          unsigned(D->Decl.Const && !Object.Readonly) +
-          unsigned(MemberOperand && Object.Type != D->Owner));
+          ReceiverRank + unsigned(MemberOperand && Object.Type != D->Owner));
     for (size_t I = 0; I < Actual.size(); ++I) {
       auto Rank = conversionRank(Actual[I], D->Params[I], N.At);
       if (!Rank)
@@ -2564,7 +2598,7 @@ void Frame::object(const Node &N, bool Global) {
       names()[Name] = {Ty, nullptr, G, Readonly};
       return;
     }
-    const bool RegisterExtent = U.SlotType && (!N.Foreign || !Readonly);
+    const bool RegisterExtent = U.SlotType != nullptr;
     G->setInitializer(llvm::Constant::getNullValue(LT));
     bool Simple = !Tail && !U.Records.count(Ty) && !ends(Ty, "]") &&
                   (Args.empty() ||

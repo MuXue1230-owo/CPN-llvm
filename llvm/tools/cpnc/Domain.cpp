@@ -59,7 +59,8 @@ struct Checker {
   Frame Names;
   std::set<std::string> Parameters;
   Bindings Variables;
-  bool InConstructor = false;
+  const Node *ConstructionOwner = nullptr;
+  std::set<std::string> LocalBindings;
   uint64_t Steps = 0;
   Checker(Context &U, const std::string &Prefix)
       : U(U), Names(U, nullptr, nullptr, Prefix) {}
@@ -246,13 +247,33 @@ struct Checker {
     }
     return Alts;
   }
+  bool mayStartFieldLifetime(const Node &N) const {
+    if (!ConstructionOwner || N.K != Node::Binary || N.Text != "=")
+      return false;
+    const auto &LHS = N.Children.front();
+    bool Direct = LHS.K == Node::Name && !LocalBindings.count(LHS.Text);
+    if (LHS.K == Node::Member && LHS.Definition) {
+      const auto &Receiver = LHS.Children.front();
+      Direct = Receiver.K == Node::Name && Receiver.Text == "this";
+    }
+    return Direct &&
+           llvm::any_of(ConstructionOwner->Children, [&](const Node &Field) {
+             return Field.K == Node::Field && Field.Text == LHS.Text &&
+                    !Field.Settings.count("storage");
+           });
+  }
   std::string visit(const Node &N, const Alternatives &Alts) {
     if (Alts.empty())
       return "";
     if (N.K == Node::Block || N.K == Node::For || N.K == Node::Lambda) {
       llvm::SaveAndRestore Scope(Variables);
-      for (auto &P : N.Params)
+      llvm::SaveAndRestore Bindings(LocalBindings);
+      llvm::SaveAndRestore Constructor(
+          ConstructionOwner, N.K == Node::Lambda ? nullptr : ConstructionOwner);
+      for (auto &P : N.Params) {
         Variables[P.Text] = P.Type;
+        LocalBindings.insert(P.Text);
+      }
       for (auto &C : N.Children)
         visit(C, Alts);
       return "";
@@ -295,11 +316,13 @@ struct Checker {
     }
     // A constructor's first write to a slot can start its lifetime. The
     // specialized construction plan identifies those writes before lowering.
-    auto Op = InConstructor && N.K == Node::Binary && N.Text == "="
+    auto Op = mayStartFieldLifetime(N)
                   ? std::optional<Operation>{}
                   : operation(N, Variables,
                               [&](const Node &C) { return visit(C, Alts); });
     if (!Op) {
+      if (N.K == Node::Object)
+        LocalBindings.insert(N.Text);
       std::string First;
       for (size_t I = 0; I < N.Children.size(); ++I) {
         auto T = visit(N.Children[I], Alts);
@@ -465,10 +488,14 @@ void Context::checkDomain(const Node &N, const std::string &Prefix,
       Alts = Check.refine(Q, true, std::move(Alts));
   auto Body = [&](const Node &D) {
     llvm::SaveAndRestore Scope(Check.Variables);
-    llvm::SaveAndRestore Constructor(Check.InConstructor,
-                                     D.K == Node::Constructor);
-    for (auto &P : D.Params)
+    llvm::SaveAndRestore Bindings(Check.LocalBindings);
+    llvm::SaveAndRestore Constructor(Check.ConstructionOwner,
+                                     D.K == Node::Constructor ? SymbolOwner
+                                                              : nullptr);
+    for (auto &P : D.Params) {
       Check.Variables[P.Text] = P.Type;
+      Check.LocalBindings.insert(P.Text);
+    }
     for (const auto &Clause : D.Contracts) {
       llvm::SaveAndRestore Names(Check.Variables);
       if (Clause.Text == "ensures" && D.Type != "void" && D.Type != "never")

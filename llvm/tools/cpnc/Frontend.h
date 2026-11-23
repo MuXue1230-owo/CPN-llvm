@@ -75,6 +75,14 @@ bool floatingSpecialName(llvm::StringRef);
 bool bitExtractionName(llvm::StringRef);
 bool realToken(llvm::StringRef);
 bool floating(llvm::StringRef);
+bool integer(const std::string &);
+std::string integerCommonType(const std::string &, const std::string &);
+enum class ReferenceKind { None, Lvalue, Rvalue };
+ReferenceKind referenceKind(llvm::StringRef);
+std::optional<unsigned> referenceBindingRank(ReferenceKind, bool ParameterConst,
+                                             bool ArgumentConst, bool Lvalue);
+std::optional<unsigned> receiverBindingRank(ReferenceKind, bool MethodConst,
+                                            bool ReceiverConst, bool Expiring);
 struct Node {
   enum Kind {
     Empty,

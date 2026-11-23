@@ -121,10 +121,26 @@ class Parser {
     std::string Owner, Layers;
     bool Dependent = false;
     std::shared_ptr<const ReceiverType> CallableResult;
-    bool known() const { return !Owner.empty() || Dependent || CallableResult; }
+    std::string Scalar;
+    std::string TypeParameter;
+    ReferenceKind Reference = ReferenceKind::None;
+    bool Readonly = false;
+    bool QualificationUnknown = false;
+    bool ExactNominal = false;
+    std::optional<bool> PointeeReadonly;
+    std::string PointeeScalar;
+    bool known() const {
+      return !Owner.empty() || Dependent || CallableResult || !Scalar.empty();
+    }
     bool operator==(const ReceiverType &Other) const {
       return Owner == Other.Owner && Layers == Other.Layers &&
-             Dependent == Other.Dependent &&
+             Dependent == Other.Dependent && Scalar == Other.Scalar &&
+             TypeParameter == Other.TypeParameter &&
+             Reference == Other.Reference && Readonly == Other.Readonly &&
+             QualificationUnknown == Other.QualificationUnknown &&
+             ExactNominal == Other.ExactNominal &&
+             PointeeReadonly == Other.PointeeReadonly &&
+             PointeeScalar == Other.PointeeScalar &&
              (CallableResult == Other.CallableResult ||
               (CallableResult && Other.CallableResult &&
                *CallableResult == *Other.CallableResult));
@@ -133,6 +149,7 @@ class Parser {
   using Receivers = std::map<std::string, ReceiverType>;
   Receivers NominalReceivers, ValueReceivers, FieldReceivers;
   std::map<std::pair<unsigned, unsigned>, ReceiverType> ReceiverDeclarations;
+  std::map<std::pair<unsigned, unsigned>, ReceiverType> ParameterTypes;
   std::map<std::pair<unsigned, unsigned>, ReceiverType> NominalExpressions;
   std::map<std::pair<unsigned, unsigned>, std::string>
       QualifiedMemberExpressions;
@@ -140,7 +157,11 @@ class Parser {
     size_t Required;
     std::optional<size_t> Maximum;
     ReceiverType Result;
-    std::optional<std::vector<std::string>> ScalarParameters;
+    std::vector<ReceiverType> Parameters;
+    std::optional<size_t> ResultDeduction;
+    bool Generic = false;
+    bool Instance = false, Const = false;
+    ReferenceKind Receiver = ReferenceKind::None;
     bool accepts(size_t Count) const {
       return Count >= Required && (!Maximum || Count <= *Maximum);
     }
@@ -149,11 +170,15 @@ class Parser {
   std::map<std::string, std::vector<ReceiverType>> BaseReceivers;
   std::set<std::string> SpecializedReceivers;
   ReceiverType CurrentReceiver;
+  bool ReceiverReadonly = false;
+  bool ReceiverAvailable = false;
   std::set<std::string> OwnMembers;
-  static ReceiverType recordReceiver(const Node &R) {
-    return {"$record." + std::to_string(R.At.Line) + "." +
-                std::to_string(R.At.Column),
-            {}};
+  static ReceiverType recordReceiver(const Node &R, bool Exact = false) {
+    ReceiverType Type;
+    Type.Owner = "$record." + std::to_string(R.At.Line) + "." +
+                 std::to_string(R.At.Column);
+    Type.ExactNominal = Exact;
+    return Type;
   }
   std::map<std::string, std::string> AliasSchemas;
   void publishReceiver(const Node &Decl, const std::string &Name) {
@@ -232,19 +257,37 @@ class Parser {
     Previous = Parameters;
   }
   void publishCallResult(const std::string &Key, const ReceiverType &Result,
-                         const Node &Function, bool FreeFunction) {
+                         const Node &Function, const Parser &Scope,
+                         bool Member) {
     CallShape Shape{0, std::nullopt, Result};
+    Shape.Generic = !Function.Generics.empty();
+    Shape.Instance = Member && !Function.Settings.count("static");
+    Shape.Const = Function.Const;
+    if (auto Category = Function.Settings.find("category");
+        Category != Function.Settings.end())
+      Shape.Receiver = referenceKind(Category->second);
     const auto Params = llvm::ArrayRef(Function.Params);
     if (llvm::none_of(Params, [](const Node &P) { return P.Pack; })) {
       Shape.Maximum = Params.size();
       auto Defaulted = llvm::find_if(
           Params, [](const Node &P) { return !P.Children.empty(); });
       Shape.Required = std::distance(Params.begin(), Defaulted);
-      if (FreeFunction && Function.Generics.empty() &&
-          llvm::all_of(Params, [](const Node &P) { return builtin(P.Type); })) {
-        Shape.ScalarParameters.emplace();
+      if (!Shape.Generic)
         for (const auto &P : Params)
-          Shape.ScalarParameters->push_back(P.Type);
+          Shape.Parameters.push_back(
+              Scope.ParameterTypes.at({P.At.Line, P.At.Column}));
+      if (Result.Dependent && Result.Layers.empty() &&
+          llvm::any_of(Function.Generics, [&](const Node &G) {
+            return G.K == Node::TypeParam && !G.Pack &&
+                   G.Text == Result.TypeParameter;
+          })) {
+        auto Source = llvm::find_if(Params, [&](const Node &P) {
+          return P.Type == Result.TypeParameter ||
+                 P.Type == Result.TypeParameter + "&" ||
+                 P.Type == Result.TypeParameter + "&&";
+        });
+        if (Source != Params.end())
+          Shape.ResultDeduction = std::distance(Params.begin(), Source);
       }
     }
     auto &Overloads = CallResults[Key];
@@ -252,7 +295,12 @@ class Parser {
           return Existing.Required == Shape.Required &&
                  Existing.Maximum == Shape.Maximum &&
                  Existing.Result == Result &&
-                 Existing.ScalarParameters == Shape.ScalarParameters;
+                 Existing.Parameters == Shape.Parameters &&
+                 Existing.ResultDeduction == Shape.ResultDeduction &&
+                 Existing.Generic == Shape.Generic &&
+                 Existing.Instance == Shape.Instance &&
+                 Existing.Const == Shape.Const &&
+                 Existing.Receiver == Shape.Receiver;
         }))
       Overloads.push_back(std::move(Shape));
   }
@@ -273,50 +321,120 @@ class Parser {
     Search(Search, Owner);
     return Matches.size() == 1 ? *Matches.begin() : std::string();
   }
-  StringRef scalarExpressionType(const Node &N) const {
-    if (N.K == Node::Character)
-      return "char";
-    if (N.K == Node::Name) {
-      if (N.Text == "true" || N.Text == "false")
-        return "bool";
-      if (N.Text == "nullptr")
-        return "nullptr_t";
+  static ReceiverType scalarReceiver(StringRef Name) {
+    ReceiverType Result;
+    Result.Scalar = Name == "byte" ? "u8" : Name.str();
+    return Result;
+  }
+  static ReceiverType lvalue(ReceiverType Type) {
+    Type.Reference = ReferenceKind::Lvalue;
+    return Type;
+  }
+  static ReceiverType pointee(ReceiverType Type) {
+    Type.Layers.pop_back();
+    Type.QualificationUnknown |= !Type.PointeeReadonly;
+    Type.Readonly = Type.PointeeReadonly.value_or(false);
+    Type.PointeeReadonly.reset();
+    Type.Scalar = std::move(Type.PointeeScalar);
+    Type.PointeeScalar.clear();
+    return lvalue(std::move(Type));
+  }
+  struct ConversionEvidence {
+    unsigned Minimum = 0;
+    bool Exact = false;
+  };
+  static std::optional<ConversionEvidence>
+  bindingEvidence(const ReceiverType &Argument, const ReceiverType &Parameter) {
+    bool Scalar = !Argument.Scalar.empty() && !Parameter.Scalar.empty();
+    bool Nominal = Argument.ExactNominal && Parameter.ExactNominal;
+    bool Pointer = Argument.Layers == "*" && Parameter.Layers == "*" &&
+                   Argument.PointeeReadonly && Parameter.PointeeReadonly &&
+                   (Nominal || (!Argument.PointeeScalar.empty() &&
+                                !Parameter.PointeeScalar.empty()));
+    if (Argument.Scalar == "never" || Argument.Scalar == "integer" ||
+        Argument.Scalar == "real" || Argument.QualificationUnknown ||
+        Parameter.QualificationUnknown)
+      return ConversionEvidence{};
+    if ((StringRef(Argument.Layers).ends_with("*") &&
+         !Parameter.Scalar.empty()) ||
+        (StringRef(Parameter.Layers).ends_with("*") &&
+         !Argument.Scalar.empty() && Argument.Scalar != "nullptr_t"))
+      return std::nullopt;
+    if (!Pointer && ((!Scalar && !Nominal) || !Argument.Layers.empty() ||
+                     !Parameter.Layers.empty()))
+      return ConversionEvidence{};
+    const bool Lvalue = Argument.Reference == ReferenceKind::Lvalue;
+    auto Rank = referenceBindingRank(Parameter.Reference, Parameter.Readonly,
+                                     Argument.Readonly, Lvalue);
+    if (!Rank)
+      return std::nullopt;
+    if (Pointer) {
+      const bool Same = Nominal
+                            ? Argument.Owner == Parameter.Owner
+                            : Argument.PointeeScalar == Parameter.PointeeScalar;
+      const bool SourceConst = *Argument.PointeeReadonly;
+      const bool TargetConst = *Parameter.PointeeReadonly;
+      if (Same && SourceConst == TargetConst)
+        return ConversionEvidence{*Rank, true};
+      if ((SourceConst && !TargetConst) || (!Nominal && !Same) ||
+          (Parameter.Reference != ReferenceKind::None && Lvalue))
+        return std::nullopt;
+      return ConversionEvidence{1, false};
     }
-    if (N.K == Node::Call && N.Children.front().K == Node::Name) {
-      const auto &Name = N.Children.front().Text;
-      if (builtin(Name) && !HiddenTypes.count(Name) &&
-          !ValueReceivers.count(Name) && !TypeParameters.count(Name) &&
-          indexedMember(CurrentReceiver.Owner, Name).empty())
-        return Name;
+    if (Scalar ? Argument.Scalar == Parameter.Scalar
+               : Argument.Owner == Parameter.Owner)
+      return ConversionEvidence{*Rank, true};
+    if (Nominal) {
+      if (Parameter.Reference == ReferenceKind::None)
+        return std::nullopt;
+      return ConversionEvidence{1 + *Rank, false};
     }
-    return {};
+    if (Parameter.Reference != ReferenceKind::None && Lvalue)
+      return std::nullopt;
+    // Different scalar identities can only participate through conversion.
+    // Value-dependent numeric viability is still checked by semantic binding.
+    return ConversionEvidence{3, false};
   }
   ReceiverType callReceiver(const Node &Call) const {
     const auto &Callee = Call.Children.front();
     ReceiverType Callable;
+    std::optional<ReceiverType> Object;
     std::string Key;
     if (Callee.K == Node::Member) {
       auto Base = receiverType(Callee.Children.front());
       if (Base.Dependent)
         return Base;
-      if (Base.Layers == (Callee.Definition ? "*" : ""))
+      if (Base.Layers == (Callee.Definition ? "*" : "")) {
         Key = indexedMember(Base.Owner, Callee.Text);
+        Object = Callee.Definition ? pointee(Base) : Base;
+      }
       if (auto I = FieldReceivers.find(Key); I != FieldReceivers.end())
         Callable = I->second;
     } else if (Callee.K == Node::Name && !ValueReceivers.count(Callee.Text)) {
       auto Name = StringRef(Callee.Text);
       bool Root = Name.consume_front("::");
       if ((Name == "std::move" || Name == "std::forward") &&
-          Call.Children.size() == 2)
-        return receiverType(Call.Children.back());
+          Call.Children.size() == 2) {
+        auto Type = receiverType(Call.Children.back());
+        if (Name == "std::move")
+          Type.Reference = ReferenceKind::Rvalue;
+        else
+          Type.Scalar.clear();
+        return Type;
+      }
       const auto Site = std::pair(Callee.At.Line, Callee.At.Column);
       if (auto I = NominalExpressions.find(Site); I != NominalExpressions.end())
         return I->second;
       if (auto I = QualifiedMemberExpressions.find(Site);
           I != QualifiedMemberExpressions.end())
         Key = I->second;
-      else if (!Root && !Name.contains("::"))
+      else if (!Root && !Name.contains("::")) {
         Key = indexedMember(CurrentReceiver.Owner, Name);
+        if (!Key.empty() && ReceiverAvailable) {
+          Object = lvalue(CurrentReceiver);
+          Object->Readonly = ReceiverReadonly;
+        }
+      }
       if (Key.empty())
         Key = scopeKey(Namespace, Callee.Text, [&](const std::string &Entry) {
           return CallResults.count(Entry);
@@ -330,44 +448,119 @@ class Parser {
       const auto Args = llvm::ArrayRef(Call.Children).drop_front();
       const bool Expanded =
           llvm::any_of(Args, [](const Node &A) { return A.Pack; });
-      llvm::SmallVector<const CallShape *, 4> Viable;
-      for (const auto &Overload : I->second)
-        if (Expanded || Overload.accepts(Args.size()))
-          Viable.push_back(&Overload);
-      auto Uniform = [](llvm::ArrayRef<const CallShape *> Group) {
-        return !Group.empty() && llvm::all_of(Group, [&](const CallShape *S) {
-          return S->Result == Group.front()->Result;
-        });
+      struct Candidate {
+        ReceiverType Result;
+        llvm::SmallVector<ConversionEvidence, 4> Ranks;
       };
-      if (Uniform(Viable))
-        return Viable.front()->Result;
-      // An exact scalar value match dominates implicit conversions. A
-      // reference, member receiver, or generic family needs semantic ranking.
-      if (!Expanded && llvm::all_of(Viable, [](const CallShape *S) {
-            return S->ScalarParameters.has_value();
-          })) {
-        llvm::SmallVector<StringRef, 4> Types;
+      llvm::SmallVector<ReceiverType, 4> Types;
+      if (!Expanded)
         for (const auto &Arg : Args)
-          Types.push_back(scalarExpressionType(Arg));
-        llvm::erase_if(Viable, [&](const CallShape *S) {
-          return !std::equal(Types.begin(), Types.end(),
-                             S->ScalarParameters->begin());
-        });
-        if (Uniform(Viable))
-          return Viable.front()->Result;
+          Types.push_back(receiverType(Arg));
+      llvm::SmallVector<Candidate, 4> Viable;
+      for (const auto &Overload : I->second) {
+        if ((Callee.ExplicitApplication && !Overload.Generic) ||
+            (!Expanded && !Overload.accepts(Args.size())))
+          continue;
+        Candidate C{Overload.Result};
+        if (!Expanded && !Callee.ExplicitApplication &&
+            Overload.ResultDeduction &&
+            *Overload.ResultDeduction < Types.size()) {
+          const auto &Source = Types[*Overload.ResultDeduction];
+          if (Source.known() && Source.Scalar != "integer" &&
+              Source.Scalar != "real") {
+            C.Result = Source;
+            C.Result.Reference = Overload.Result.Reference;
+            C.Result.Readonly = Overload.Result.Readonly;
+            C.Result.QualificationUnknown |=
+                Source.Readonly &&
+                Overload.Result.Reference != ReferenceKind::None;
+          }
+        }
+        if (!Expanded && Overload.Parameters.size() >= Types.size()) {
+          for (size_t A = 0; A < Types.size(); ++A) {
+            auto Rank = bindingEvidence(Types[A], Overload.Parameters[A]);
+            if (!Rank)
+              break;
+            C.Ranks.push_back(*Rank);
+          }
+          if (C.Ranks.size() != Types.size())
+            continue;
+        } else {
+          C.Ranks.resize(Types.size());
+        }
+        ConversionEvidence ReceiverRank{0, true};
+        if (Overload.Instance) {
+          if (!Object) {
+            if (!ReceiverAvailable)
+              continue;
+            ReceiverRank.Exact = false;
+          } else if (Object->QualificationUnknown) {
+            ReceiverRank.Exact = false;
+          } else {
+            auto Rank = receiverBindingRank(
+                Overload.Receiver, Overload.Const, Object->Readonly,
+                Object->Reference != ReferenceKind::Lvalue);
+            if (!Rank)
+              continue;
+            ReceiverRank.Minimum = *Rank;
+          }
+        }
+        C.Ranks.push_back(ReceiverRank);
+        Viable.push_back(std::move(C));
       }
+      const ReceiverType *Uniform = nullptr;
+      auto Better = [](const Candidate &A, const Candidate &B) {
+        bool Strict = false;
+        for (size_t I = 0; I < A.Ranks.size(); ++I) {
+          if (!A.Ranks[I].Exact || A.Ranks[I].Minimum > B.Ranks[I].Minimum)
+            return false;
+          Strict |= A.Ranks[I].Minimum < B.Ranks[I].Minimum;
+        }
+        return Strict;
+      };
+      for (const auto &C : Viable) {
+        if (llvm::any_of(Viable,
+                         [&](const Candidate &O) { return Better(O, C); }))
+          continue;
+        if (Uniform && !(*Uniform == C.Result))
+          return {};
+        Uniform = &C.Result;
+      }
+      if (Uniform)
+        return *Uniform;
     }
     return {};
   }
   ReceiverType receiverType(const Node &N) const {
+    if (N.K == Node::Number || N.K == Node::Real)
+      return scalarReceiver(N.K == Node::Number ? "integer" : "real");
+    if (N.K == Node::Character)
+      return scalarReceiver("char");
     if (N.K == Node::Name) {
-      if (N.Text == "this" && !CurrentReceiver.Owner.empty())
-        return {CurrentReceiver.Owner, "*"};
-      if (auto I = ValueReceivers.find(N.Text); I != ValueReceivers.end())
-        return I->second;
+      if (N.Text == "true" || N.Text == "false")
+        return scalarReceiver("bool");
+      if (N.Text == "nullptr")
+        return scalarReceiver("nullptr_t");
+      if (N.Text == "this" && !CurrentReceiver.Owner.empty()) {
+        auto Self = CurrentReceiver;
+        Self.Layers += '*';
+        Self.PointeeReadonly = ReceiverReadonly;
+        return Self;
+      }
       auto Key = indexedMember(CurrentReceiver.Owner, N.Text);
-      if (auto I = FieldReceivers.find(Key); I != FieldReceivers.end())
-        return I->second;
+      if (auto I = ValueReceivers.find(N.Text); I != ValueReceivers.end()) {
+        auto Value = lvalue(I->second);
+        // The field index is also visible in lexical bindings. A local that
+        // shadows the field may have the same type but different qualification.
+        if (ReceiverReadonly && FieldReceivers.count(Key))
+          Value.QualificationUnknown = true;
+        return Value;
+      }
+      if (auto I = FieldReceivers.find(Key); I != FieldReceivers.end()) {
+        auto Field = lvalue(I->second);
+        Field.Readonly |= ReceiverReadonly;
+        return Field;
+      }
       return {};
     }
     if (N.K == Node::Configured)
@@ -376,7 +569,42 @@ class Parser {
       return callReceiver(N);
     if (N.K == Node::Conditional) {
       auto Left = receiverType(N.Children[1]);
-      return Left == receiverType(N.Children[2]) ? Left : ReceiverType{};
+      auto Right = receiverType(N.Children[2]);
+      if (Left == Right)
+        return Left;
+      if (!Left.Owner.empty() && Left.Owner == Right.Owner &&
+          Left.Layers == Right.Layers) {
+        Left.QualificationUnknown = true;
+        Left.ExactNominal &= Right.ExactNominal;
+        return Left;
+      }
+      return {};
+    }
+    if (N.K == Node::Binary) {
+      StringRef Op(N.Text);
+      if (Op == "&&" || Op == "||")
+        return scalarReceiver("bool");
+      auto L = receiverType(N.Children[0]).Scalar;
+      auto R = receiverType(N.Children[1]).Scalar;
+      if (L.empty() || R.empty() || L == "never" || R == "never")
+        return {};
+      if (Op == "==" || Op == "!=" || Op == "<" || Op == ">" || Op == "<=" ||
+          Op == ">=")
+        return scalarReceiver("bool");
+      if (integer(L) && integer(R)) {
+        if (Op == "<<" || Op == ">>")
+          return scalarReceiver(L);
+        if (Op == "+" || Op == "-" || Op == "*" || Op == "/" || Op == "%" ||
+            Op == "&" || Op == "|" || Op == "^")
+          return scalarReceiver(integerCommonType(L, R));
+      }
+      if (Op == "+" || Op == "-" || Op == "*" || Op == "/") {
+        if (L == "f64" || R == "f64")
+          return scalarReceiver("f64");
+        if (L == "f32" || R == "f32")
+          return scalarReceiver("f32");
+      }
+      return {};
     }
     if (N.K == Node::Member) {
       auto Base = receiverType(N.Children.front());
@@ -385,8 +613,15 @@ class Parser {
       if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
         return {};
       if (auto I = FieldReceivers.find(indexedMember(Base.Owner, N.Text));
-          I != FieldReceivers.end())
-        return I->second;
+          I != FieldReceivers.end()) {
+        if (N.Definition)
+          Base = pointee(std::move(Base));
+        auto Field = lvalue(I->second);
+        Field.Readonly |= Base.Readonly;
+        Field.QualificationUnknown |= Base.QualificationUnknown ||
+                                      Base.Reference != ReferenceKind::Lvalue;
+        return Field;
+      }
       return {};
     }
     if (N.K != Node::Unary && N.K != Node::Index)
@@ -397,17 +632,24 @@ class Parser {
     if (!Base.known())
       return {};
     if (N.K == Node::Unary && N.Text == "&") {
+      Base.PointeeScalar = Base.Layers.empty() ? Base.Scalar : std::string{};
+      if (Base.Layers.empty() && !Base.QualificationUnknown)
+        Base.PointeeReadonly = Base.Readonly;
+      else
+        Base.PointeeReadonly.reset();
       Base.Layers += '*';
+      Base.Reference = ReferenceKind::None;
+      Base.Readonly = false;
+      Base.Scalar.clear();
       return Base;
     }
     if (N.K == Node::Index || N.Text == "*") {
       if (StringRef(Base.Layers).ends_with("*")) {
-        Base.Layers.pop_back();
-        return Base;
+        return pointee(std::move(Base));
       }
       if (N.K == Node::Index && StringRef(Base.Layers).ends_with("[")) {
         Base.Layers.pop_back();
-        return Base;
+        return lvalue(Base);
       }
     }
     return {};
@@ -641,15 +883,23 @@ class Parser {
       *NominalSchema = (Root ? "::" : "") + AliasSchema(Schema);
     if (Receiver) {
       if (!Root &&
-          TypeParameters.count(StringRef(Schema).split("::").first.str()))
+          TypeParameters.count(StringRef(Schema).split("::").first.str())) {
         Receiver->Dependent = true;
-      else if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
-               I != NominalReceivers.end()) {
+        if (TypeParameters.count(Schema))
+          Receiver->TypeParameter = Schema;
+      } else if (auto I = NominalReceivers.find((Root ? "::" : "") + Schema);
+                 I != NominalReceivers.end()) {
         if (SpecializedReceivers.count(I->second.Owner))
           Receiver->Dependent = true;
         else
           *Receiver = I->second;
-      }
+      } else if (builtin(Schema) &&
+                 (!Application || !HiddenTypes.count(Schema)))
+        *Receiver = scalarReceiver(Schema);
+      if (Application && !Root && ValueReceivers.count(Schema))
+        *Receiver = {};
+      if (StringRef(T.Text).contains('<'))
+        Receiver->ExactNominal = false;
     }
     if (Root)
       T.Text = "::" + T.Text;
@@ -852,6 +1102,8 @@ class Parser {
     } else if (eat("const")) {
       expect("<");
       S = "const<" + type(nullptr, Receiver) + ">";
+      if (Receiver)
+        Receiver->Readonly = true;
       closeAngle();
     } else if (eat("function")) {
       expect("<");
@@ -929,8 +1181,22 @@ class Parser {
       if (is("*") || is("&") || is("&&")) {
         auto Suffix = take().Text;
         S += Suffix;
-        if (Receiver && Suffix == "*" && Receiver->known())
-          Receiver->Layers += '*';
+        if (Receiver) {
+          if (Suffix == "*" && Receiver->known()) {
+            Receiver->PointeeScalar =
+                Receiver->Layers.empty() ? Receiver->Scalar : std::string{};
+            if (Receiver->Layers.empty() && !Receiver->QualificationUnknown)
+              Receiver->PointeeReadonly = Receiver->Readonly;
+            else
+              Receiver->PointeeReadonly.reset();
+            Receiver->Layers += '*';
+            Receiver->Scalar.clear();
+            Receiver->Readonly = false;
+            Receiver->Reference = ReferenceKind::None;
+          } else if (Suffix != "*") {
+            Receiver->Reference = referenceKind(Suffix);
+          }
+        }
         if (NominalSchema)
           NominalSchema->clear();
       } else if (eat("[")) {
@@ -938,8 +1204,10 @@ class Parser {
         expr();
         S += "[" + spelling(Begin) + "]";
         expect("]");
-        if (Receiver && Receiver->known())
+        if (Receiver && Receiver->known()) {
           Receiver->Layers += '[';
+          Receiver->Scalar.clear();
+        }
         if (NominalSchema)
           NominalSchema->clear();
       } else
@@ -974,6 +1242,7 @@ class Parser {
     } else if (eat("[")) {
       N = Node(Node::Lambda, T);
       std::set<std::string> Captures;
+      Receivers CaptureTypes;
       if (!eat("]")) {
         do {
           bool Borrow = eat("&");
@@ -992,6 +1261,10 @@ class Parser {
           }
           if (!Captures.insert(Id.Text).second)
             fail(Id, "duplicate closure capture");
+          if (Capture.Type != "this")
+            CaptureTypes[Id.Text] = Capture.Type == "initializer"
+                                        ? receiverType(Capture.Children.front())
+                                        : receiverType(Node(Node::Name, Id));
           N.TemplateArgs.push_back(std::move(Capture));
         } while (eat(","));
         expect("]");
@@ -1002,6 +1275,19 @@ class Parser {
       llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
       N.Params = params(true);
       N.Const = !eat("mutable");
+      for (const auto &Capture : N.TemplateArgs) {
+        if (Capture.Type == "this" ||
+            llvm::any_of(N.Params,
+                         [&](const Node &P) { return P.Text == Capture.Text; }))
+          continue;
+        auto Type = CaptureTypes.at(Capture.Text);
+        if (Capture.Type != "borrow") {
+          Type.Readonly = N.Const;
+          Type.QualificationUnknown = false;
+        }
+        ValueReceivers[Capture.Text] = std::move(Type);
+      }
+      llvm::SaveAndRestore InstanceScope(ReceiverAvailable, false);
       N.Noexcept = eat("noexcept");
       applyAttributes(N, attributes());
       N.Children = {block()};
@@ -1291,12 +1577,17 @@ class Parser {
       ReceiverType Receiver;
       auto Ty = eat("auto") ? std::string("auto") : type(nullptr, &Receiver);
       auto Id = name();
+      Receiver.Readonly |= RO || CX;
       ValueReceivers[Id.Text] = std::move(Receiver);
       if (Types.count(Id.Text) || integerLibraryName(Id.Text, true))
         HiddenTypes.insert(Id.Text);
       auto O = object(Id, Ty, RO, CX);
-      if (Ty == "auto" && O.Children.size() == 1)
-        ValueReceivers[Id.Text] = receiverType(O.Children.front());
+      if (Ty == "auto" && O.Children.size() == 1) {
+        auto Deduced = receiverType(O.Children.front());
+        Deduced.Readonly = RO || CX;
+        Deduced.QualificationUnknown = false;
+        ValueReceivers[Id.Text] = std::move(Deduced);
+      }
       return O;
     }
     Node S(Node::Expression, peek());
@@ -1494,8 +1785,12 @@ class Parser {
         } else
           P.Children = args();
       }
-      if (BindReceivers && !P.Text.empty())
-        ValueReceivers[P.Text] = std::move(Receiver);
+      if (BindReceivers) {
+        Receiver.Readonly |= P.Const;
+        ParameterTypes[{P.At.Line, P.At.Column}] = Receiver;
+        if (!P.Text.empty())
+          ValueReceivers[P.Text] = std::move(Receiver);
+      }
       V.push_back(std::move(P));
     } while (eat(","));
     expect(")");
@@ -1959,7 +2254,7 @@ class Parser {
         publishCallResult(
             Key,
             Index.ReceiverDeclarations.at({Member.At.Line, Member.At.Column}),
-            Member, false);
+            Member, Index, true);
       if (Member.K == Node::Field) {
         const auto &Type = Index.FieldReceivers.at(Key);
         FieldReceivers[Key] = Type;
@@ -2168,7 +2463,9 @@ class Parser {
       bool Manual = Class && eat("Manual");
       Node R(Union ? Node::Union : Node::Record, name());
       R.Type = Kind;
-      auto Receiver = recordReceiver(R);
+      auto Receiver = recordReceiver(R, G.empty() && !Specialize &&
+                                            (CurrentReceiver.Owner.empty() ||
+                                             CurrentReceiver.ExactNominal));
       if (!Specialize) {
         NominalReceivers[R.Text] = Receiver;
         ReceiverDeclarations[{R.At.Line, R.At.Column}] = Receiver;
@@ -2176,6 +2473,7 @@ class Parser {
       auto RecordTypes = NominalReceivers;
       auto RecordValues = ValueReceivers;
       llvm::SaveAndRestore ReceiverScope(CurrentReceiver, Receiver);
+      llvm::SaveAndRestore InstanceScope(ReceiverAvailable, true);
       R.Generics = G;
       if (Specialize) {
         while (eat("::"))
@@ -2291,10 +2589,15 @@ class Parser {
         fail(Id, "a constexpr external object requires a definition");
       if (Virtual || Eval || (Static && !StorageStatic) || (Foreign && Static))
         fail(Id, "invalid object declaration modifier");
+      Receiver.Readonly |= RO || CE;
       ValueReceivers[Id.Text] = Receiver;
       auto O = object(Id, Ty, RO, CE);
-      if (Ty == "auto" && O.Children.size() == 1)
-        ValueReceivers[Id.Text] = receiverType(O.Children.front());
+      if (Ty == "auto" && O.Children.size() == 1) {
+        auto Deduced = receiverType(O.Children.front());
+        Deduced.Readonly = RO || CE;
+        Deduced.QualificationUnknown = false;
+        ValueReceivers[Id.Text] = std::move(Deduced);
+      }
       ReceiverDeclarations[{Id.Line, Id.Column}] = ValueReceivers.at(Id.Text);
       if (Static || ThreadLocal)
         O.Settings["storage"] = Static ? "static" : "thread_local";
@@ -2327,16 +2630,19 @@ class Parser {
       F.TemplateArgs.push_back(std::move(Requires));
     llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
     F.Params = params(true);
-    if (Member)
-      publishCallResult(CurrentReceiver.Owner + "::" + Id.Text, Receiver, F,
-                        false);
-    else if (Q.empty())
-      publishCallResult(Namespace + Id.Text, Receiver, F, true);
     if ((Member && !Static) || !Q.empty()) {
       F.Const = eat("const");
       if (is("&") || is("&&"))
         F.Settings["category"] = take().Text;
     }
+    if (Member)
+      publishCallResult(CurrentReceiver.Owner + "::" + Id.Text, Receiver, F,
+                        *this, true);
+    else if (Q.empty())
+      publishCallResult(Namespace + Id.Text, Receiver, F, *this, false);
+    llvm::SaveAndRestore ConstReceiver(ReceiverReadonly, F.Const);
+    llvm::SaveAndRestore InstanceScope(ReceiverAvailable,
+                                       (Member && !Static) || !Q.empty());
     F.Noexcept = eat("noexcept");
     applyAttributes(F, attributes());
     if (Member && eat("override"))

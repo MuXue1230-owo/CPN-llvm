@@ -162,7 +162,10 @@ void Frame::trackLocal(Value &Cell, llvm::StringRef Prefix) {
   Value Owner{Cell.Type, nullptr, Cell.Address, Cell.Readonly};
   Owner.Storage = (Prefix + std::to_string(U.StorageSerial++)).str();
   track(Owner);
-  Active[Owner.Storage] = true;
+  const int Generation = NextStorageGeneration++;
+  Active[Owner.Storage] = Generation;
+  if (Owner.Generation)
+    StorageGenerations[Owner.Generation] = Generation;
   Extents[Owner.Storage] = Owner;
   if (Pointer)
     Cell.rememberPointerCell(Owner);
@@ -224,12 +227,18 @@ void Frame::dropChild(Value Parent, Value V, bool AsBase) {
 }
 void Frame::ensureLive(const Value &V, const Token &At) {
   const auto &Storage = V.PointerCell ? V.PointerCell->Storage : V.Storage;
-  if (!Storage.empty() && Active.count(Storage) && Active.at(Storage) == 0)
-    fail(At, "ended object generation");
+  auto *Generation = V.PointerCell ? V.PointerCell->Generation : V.Generation;
+  if (auto State = Active.find(Storage); State != Active.end()) {
+    if (State->second == 0)
+      fail(At, "ended object generation");
+    auto Stamp = StorageGenerations.find(Generation);
+    if (State->second > 0 && Stamp != StorageGenerations.end() &&
+        State->second != Stamp->second)
+      fail(At, "ended object generation");
+  }
   auto *Slot = V.PointerCell ? V.PointerCell->Slot : V.Slot;
   if (!IR || !Slot)
     return;
-  auto *Generation = V.PointerCell ? V.PointerCell->Generation : V.Generation;
   guard(B.CreateNot(
       B.CreateCall(U.M.getFunction("cpn.borrow.valid"),
                    {Slot, Generation ? Generation : B.getInt64(0)})));
@@ -249,19 +258,22 @@ void Frame::markStorageWrite(llvm::Value *Address) {
       llvm::Intrinsic::getOrInsertDeclaration(&U.M, llvm::Intrinsic::donothing),
       {}, {Effects});
 }
-void Frame::replaceGeneration(const Value &V, const std::string &T,
-                              const Token &) {
+llvm::Value *Frame::replaceGeneration(const Value &V, const std::string &T) {
   auto *S = V.Slot;
   B.CreateStore(U.typeID(T), B.CreateStructGEP(U.SlotType, S, CurrentType));
   auto *Entry = destructor(*this, T);
   B.CreateStore(Entry, B.CreateStructGEP(U.SlotType, S, Destructor));
   llvm::Value *Operands[] = {V.IR, S, Entry};
   llvm::OperandBundleDef Effects("cpn.storage.replace", Operands);
-  B.CreateStore(
-      B.CreateCall(U.M.getFunction("cpn.new.generation"), {}, {Effects}),
-      B.CreateStructGEP(U.SlotType, S, Stamp));
-  if (!V.Subobject && !V.Storage.empty())
-    Active[V.Storage] = 1;
+  auto *StampValue =
+      B.CreateCall(U.M.getFunction("cpn.new.generation"), {}, {Effects});
+  B.CreateStore(StampValue, B.CreateStructGEP(U.SlotType, S, Stamp));
+  if (!V.Subobject && !V.Storage.empty()) {
+    const int Generation = NextStorageGeneration++;
+    Active[V.Storage] = Generation;
+    StorageGenerations[StampValue] = Generation;
+  }
+  return StampValue;
 }
 
 Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
@@ -393,8 +405,11 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     auto S = eval(Args.front());
     if (S.Type != StorageViewType || !S.Slot)
       fail(C.At, "storage view required");
-    if (!S.Subobject && Active.count(S.Storage) && Active[S.Storage] == 1)
-      fail(C.At, "storage contains a live generation");
+    if (!S.Subobject)
+      if (auto State = Active.find(S.Storage);
+          State != Active.end() &&
+          (State->second > 0 || State->second == LiveGeneration))
+        fail(C.At, "storage contains a live generation");
     guard(B.CreateNot(B.CreateCall(U.M.getFunction("cpn.extent.valid"),
                                    {S.Slot, S.Generation})));
     auto *Current =
@@ -420,11 +435,9 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     guard(B.CreateOr(B.CreateICmpULT(loadBound(Capacity), B.getInt64(Size)),
                      B.CreateICmpULT(loadBound(Alignment), B.getInt64(Align))));
     construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR);
-    replaceGeneration(S, T, C.At);
     Value P{T + "*", S.IR};
     P.borrow(S);
-    P.Generation =
-        B.CreateCall(U.M.getFunction("cpn.generation"), {S.Slot, B.getFalse()});
+    P.Generation = replaceGeneration(S, T);
     return P;
   }
   bool Storage = C.Text == "storage_of";
@@ -466,10 +479,11 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
   return {"void"};
 }
 void Frame::joinStorage(const std::map<std::string, int> &Other) {
-  for (auto &[ID, Live] : Active) {
+  auto Live = [](int State) { return State > 0 || State == LiveGeneration; };
+  for (auto &[ID, State] : Active) {
     auto I = Other.find(ID);
-    if (I != Other.end() && I->second != Live)
-      Live = -1;
+    if (I != Other.end() && I->second != State)
+      State = Live(State) && Live(I->second) ? LiveGeneration : -1;
   }
 }
 void Frame::forgetStorage() {

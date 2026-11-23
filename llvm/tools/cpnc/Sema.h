@@ -467,7 +467,6 @@ bool sameContracts(const Node &, const Node &);
 std::vector<std::string> splitArguments(llvm::StringRef);
 Family expand(const Family &, size_t, const Token &);
 std::string element(const std::string &T);
-bool integer(const std::string &T);
 bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);
 unsigned width(const std::string &T);
@@ -528,7 +527,12 @@ public:
   std::vector<Local> Scopes;
   std::vector<Loop> Loops;
   std::vector<Value> Temps;
+  // Positive states name a live generation. Zero is ended, -1 is unknown,
+  // and LiveGeneration is a live registration with an unknown generation.
+  static constexpr int LiveGeneration = -2;
   std::map<std::string, int> Active;
+  std::map<const llvm::Value *, int> StorageGenerations;
+  int NextStorageGeneration = 1;
   struct Registration {
     llvm::Value *Slot;
   };
@@ -725,7 +729,7 @@ public:
   void track(Value &, llvm::GlobalVariable *GlobalSlot = nullptr);
   void trackLocal(Value &, llvm::StringRef Prefix);
   void ensureLive(const Value &, const Token &);
-  void replaceGeneration(const Value &, const std::string &, const Token &);
+  llvm::Value *replaceGeneration(const Value &, const std::string &);
   void retireStorage(const Value &, bool Destroy, bool Explicit = false);
   void markStorageWrite(llvm::Value *);
   void forgetStorage();

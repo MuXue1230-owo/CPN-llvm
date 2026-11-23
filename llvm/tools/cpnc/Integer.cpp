@@ -159,6 +159,21 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
     fail(At, "no implicit lossless conversion from " + V.Type + " to " + T);
   return {T, B.CreateIntCast(V.IR, U.ir(T), signedType(V.Type))};
 }
+std::string cpn::integerCommonType(const std::string &Left,
+                                   const std::string &Right) {
+  if (Left == "integer")
+    return Right;
+  if (Right == "integer" || Left == Right)
+    return Left;
+  if (StringRef(Left).ends_with("size") || StringRef(Right).ends_with("size"))
+    return {};
+  unsigned W = std::max(width(Left), width(Right));
+  const bool Signed = signedType(Left) || signedType(Right);
+  if (Signed && ((!signedType(Left) && width(Left) == W) ||
+                 (!signedType(Right) && width(Right) == W)))
+    W *= 2;
+  return (Signed ? "i" : "u") + std::to_string(W);
+}
 std::string Frame::commonIntegerType(const std::string &Left,
                                      const std::string &Right,
                                      const Token &At) {
@@ -166,14 +181,10 @@ std::string Frame::commonIntegerType(const std::string &Left,
     return materializationType(Right, At);
   if (Right == "integer" || Left == Right)
     return Left;
-  if (StringRef(Left).ends_with("size") || StringRef(Right).ends_with("size"))
+  auto Type = integerCommonType(Left, Right);
+  if (Type.empty())
     fail(At, "incompatible integer families");
-  unsigned W = std::max(width(Left), width(Right));
-  const bool Signed = signedType(Left) || signedType(Right);
-  if (Signed && ((!signedType(Left) && width(Left) == W) ||
-                 (!signedType(Right) && width(Right) == W)))
-    W *= 2;
-  auto Type = (Signed ? "i" : "u") + std::to_string(W);
+  auto W = width(Type);
   if (W > 64 || !Opt.IntegerWidths.count(W))
     fail(At, "CFG002: " + Type + " is unavailable as a common integer type");
   return Type;

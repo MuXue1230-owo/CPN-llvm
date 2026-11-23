@@ -328,6 +328,9 @@ class CompilerTests(unittest.TestCase):
             "generic<type T> requires(Moves<T>) void f(T& a,T& b){a=b;}",
             "generic<type T> void f(T& a,const<T>& b){"
             "if constexpr(!SameType<T,const<T>>){a=b;}}",
+            "generic<type T> struct Copier {Copier(T& a,const<T>& b){a=b;}};",
+            "generic<type T> struct Copier {T item;"
+            "Copier(T& item,const<T>& source){item=source;}};",
         ):
             with self.subTest(definition=definition):
                 result = self.compile(requirements + definition, "--check")
@@ -1847,6 +1850,61 @@ class CompilerTests(unittest.TestCase):
                            lib::select(true).get<5>();
                 }
                 i32 main(){return exercise(true);}
+            """),
+            42,
+        )
+
+    def test_reference_and_receiver_overloads_bind_following_member_syntax(self):
+        self.assertEqual(
+            self.program("""
+                struct Range {bool operator>(i32 n) const {return n==0;}};
+                struct Less {Range operator<(i32 n) const {return Range();}};
+                struct Relation {Less get;};
+                struct Generic {generic<const i32 N> i32 get() const {return N;}};
+                alias Count=i32;
+                Relation pick(Count& value){return Relation();}
+                Generic pick(const<Count>& value){return Generic();}
+                Generic pick(Count&& value){return Generic();}
+                Relation computation(i32 value){return Relation();}
+                Generic computation(bool value){return Generic();}
+                generic<type T> T& identity(T& value) [[returns_borrowed_from(value)]] {
+                    return value;
+                }
+                struct Input {};
+                Relation nominal(Input& value){return Relation();}
+                Generic nominal(Input&& value){return Generic();}
+                Relation pointer(Input* value){return Relation();}
+                Generic pointer(bool value){return Generic();}
+                Relation scalar_pointer(i32* value){return Relation();}
+                Generic scalar_pointer(bool* value){return Generic();}
+                struct Maker {
+                    Relation read() & {return Relation();}
+                    Generic read() const & {return Generic();}
+                    Generic read() && {return Generic();}
+                };
+                i32 main(){
+                    Count n; const Count fixed(0); Input input; bool checked(true);
+                    Relation relation; Generic generic_value;
+                    Maker maker; const Maker readonly;
+                    Maker* mutable_ptr(&maker); const<Maker>* readonly_ptr(&readonly);
+                    auto copy([n] i32(){return pick(n).get<4>();});
+                    auto borrow([&n] bool(){return pick(n).get < 1 > (0);});
+                    auto init_copy([captured(i32(0))] i32(){return pick(captured).get<5>();});
+                    if (!(pick(n).get < 1 > (0)) || !(nominal(input).get < 2 > (0)) ||
+                        !(maker.read().get < 3 > (0)) || !(mutable_ptr->read().get < 4 > (0)) ||
+                        !(computation(n + 1).get < 5 > (0)) ||
+                        !(computation(n == 0).get<1>() == 1) ||
+                        !(identity(relation).get < 6 > (0)) ||
+                        !(identity(generic_value).get<1>() == 1) ||
+                        !(pointer(&input).get < 7 > (0)) ||
+                        !(scalar_pointer(&n).get < 8 > (0)) ||
+                        !(scalar_pointer(&checked).get<1>() == 1) ||
+                        !borrow()) {return 0;}
+                    return pick(fixed).get<3>() + pick(i32(0)).get<5>() +
+                           pick(std::move(n)).get<7>() + nominal(Input()).get<2>() +
+                           readonly.read().get<8>() + readonly_ptr->read().get<6>() +
+                           std::move(maker).read().get<2>() + copy() + init_copy();
+                }
             """),
             42,
         )
@@ -6958,23 +7016,27 @@ class CompilerTests(unittest.TestCase):
         source = """
             const i32 first(18);
             constexpr i32 second(24);
+            extern "C" define const i32 exposed(7);
             constexpr i32 original_sum(18+second);
             i32 main(){
                 if(original_sum!=42){return 3;}
                 auto a(storage_of(first));
                 auto b(storage_of(second));
+                auto c(storage_of(exposed));
                 if (a.capacity_bytes()!=usize(4) || a.identity()==b.identity()) {return 1;}
                 destroy(first);
                 destroy(second);
-                auto current(construct_at<i32>(a,40));
+                destroy(exposed);
+                auto current(construct_at<i32>(a,33));
                 auto another(construct_at<i32>(b,2));
-                return *current+*another;
+                auto linked(construct_at<i32>(c,7));
+                return *current+*another+*linked;
             }
         """
         for preset in ("Debug", "Release"):
             with self.subTest(preset=preset):
                 self.assertEqual(self.program(source, "--preset", preset), 42)
-        stale = source.replace("return *current+*another;", "return second;")
+        stale = source.replace("return *current+*another+*linked;", "return second;")
         self.assertEqual(self.program(stale), -signal.SIGILL)
         invalid = self.compile(
             "i32 main(){i32 local; auto view(storage_of(local));"
@@ -7740,11 +7802,22 @@ class CompilerTests(unittest.TestCase):
             ("i32 f(){ for(int i=0;i<2;i++){ } return 1;}", "expected"),
             ("i32 f(){ i32 a; destroy(a); return a; }", "ended object generation"),
             (
+                "i32 f(){i32 a; i32& prior(a);auto view(storage_of(a));"
+                "destroy(a);construct_at<i32>(view,42);return prior;}",
+                "ended object generation",
+            ),
+            (
                 "i32 f(){ i32 a; auto p(&a); destroy(a); return *p; }",
                 "ended object generation",
             ),
             (
                 "i32 f(){ i32 x; auto s(storage_of(x)); construct_at<i32>(s,4); return 0; }",
+                "live generation",
+            ),
+            (
+                "void f(bool side){i32 x; auto view(storage_of(x)); destroy(x);"
+                "if(side){construct_at<i32>(view,1);}else{construct_at<i32>(view,2);}"
+                "construct_at<i32>(view,3);}",
                 "live generation",
             ),
             (
