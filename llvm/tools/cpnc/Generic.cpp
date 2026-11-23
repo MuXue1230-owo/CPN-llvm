@@ -7,9 +7,17 @@ std::optional<CallableTypeParts> cpn::splitCallableType(StringRef Type) {
   if (!Type.consume_front("function<") || !Type.consume_back(">"))
     return {};
   unsigned Angles = 0, Brackets = 0;
+  char Quote = 0;
   for (size_t I = 0; I < Type.size(); ++I) {
     char C = Type[I];
-    if (C == '[')
+    if (Quote) {
+      if (C == '\\' && I + 1 < Type.size())
+        ++I;
+      else if (C == Quote)
+        Quote = 0;
+    } else if (C == '\'' || C == '"')
+      Quote = C;
+    else if (C == '[')
       ++Brackets;
     else if (C == ']' && Brackets)
       --Brackets;
@@ -29,16 +37,32 @@ std::optional<CallableTypeParts> cpn::splitCallableType(StringRef Type) {
 }
 
 namespace {
+bool identifierByte(char C) {
+  return llvm::isAlnum(C) || C == '_' || C == '$' ||
+         static_cast<unsigned char>(C) >= 128;
+}
+
+StringRef quotedSpelling(StringRef S) {
+  size_t I = 1;
+  for (; I < S.size(); ++I) {
+    if (S[I] == '\\' && I + 1 < S.size())
+      ++I;
+    else if (S[I] == S.front())
+      return S.take_front(I + 1);
+  }
+  return S;
+}
+
 std::string substitute(StringRef S, const std::set<std::string> &Names,
                        size_t Index) {
   std::string R;
-  auto IdentifierByte = [](char C) {
-    return llvm::isAlnum(C) || C == '_' || C == '$' ||
-           static_cast<unsigned char>(C) >= 128;
-  };
   while (!S.empty()) {
-    if (IdentifierByte(S[0])) {
-      auto W = S.take_while(IdentifierByte);
+    if (S.front() == '\'' || S.front() == '"') {
+      auto Quoted = quotedSpelling(S);
+      R += Quoted;
+      S = S.drop_front(Quoted.size());
+    } else if (identifierByte(S[0])) {
+      auto W = S.take_while(identifierByte);
       R += W;
       if (Names.count(W.str()))
         R += "$" + std::to_string(Index);
@@ -73,6 +97,87 @@ size_t angleEnd(StringRef S, size_t Open) {
       return I;
   }
   return StringRef::npos;
+}
+
+using PackLengths = std::map<std::string, size_t>;
+using PackNames = std::set<std::string>;
+
+struct PackReferences {
+  PackNames Bound;
+  bool Deferred = false;
+};
+
+struct PackExpansion {
+  PackNames Names;
+  size_t Count, Index = 0;
+};
+
+void unexpandedNames(StringRef Text, llvm::function_ref<void(StringRef)> Use) {
+  auto Words = [&](StringRef S) {
+    while (!S.empty()) {
+      if (S.front() == '\'' || S.front() == '"')
+        S = S.drop_front(quotedSpelling(S).size());
+      else if (identifierByte(S.front())) {
+        auto Name = S.take_while(identifierByte);
+        Use(Name);
+        S = S.drop_front(Name.size());
+      } else
+        S = S.drop_front();
+    }
+  };
+  auto Open = Text.find('<');
+  auto Close = Open == StringRef::npos ? StringRef::npos : angleEnd(Text, Open);
+  if (Close == StringRef::npos) {
+    Words(Text);
+    return;
+  }
+  auto Callable = splitCallableType(Text.take_front(Close + 1));
+  if (Callable)
+    unexpandedNames(Callable->Result, Use);
+  else
+    Words(Text.take_front(Open));
+  auto List = Callable ? Callable->Parameters : Text.slice(Open + 1, Close);
+  for (const auto &Item : splitArguments(List))
+    if (!StringRef(Item).ends_with("..."))
+      unexpandedNames(Item, Use);
+  unexpandedNames(Text.drop_front(Close + 1), Use);
+}
+
+void unexpandedNames(const Node &N, llvm::function_ref<void(StringRef)> Use) {
+  if (N.K != Node::Parameter)
+    unexpandedNames(N.Text, Use);
+  unexpandedNames(N.Type, Use);
+  for (const auto &C : N.Children)
+    if (!C.Pack)
+      unexpandedNames(C, Use);
+  for (const auto &A : N.TemplateArgs)
+    if (!A.Pack)
+      unexpandedNames(A, Use);
+}
+
+template <typename Operand>
+PackReferences referencedPacks(const Operand &Pattern, const PackLengths &Known,
+                               const PackNames &Deferred) {
+  PackReferences References;
+  unexpandedNames(Pattern, [&](StringRef Name) {
+    if (Deferred.count(Name.str()))
+      References.Deferred = true;
+    else if (Known.count(Name.str()))
+      References.Bound.insert(Name.str());
+  });
+  return References;
+}
+
+PackExpansion establishExpansion(PackNames Names, const PackLengths &Known,
+                                 const Token &At) {
+  if (Names.empty())
+    fail(At, "pack expansion requires an unexpanded pack binding");
+  auto Count = Known.at(*Names.begin());
+  if (llvm::any_of(Names, [&](const std::string &Name) {
+        return Known.at(Name) != Count;
+      }))
+    fail(At, "packs expanded together have different lengths");
+  return {std::move(Names), Count};
 }
 
 std::string
@@ -122,12 +227,12 @@ expandCallableFlags(StringRef Type,
          effectFlags(Effects) + predicateEffectFlags(Predicate);
 }
 
-std::string expandPackLists(StringRef Text, const std::set<std::string> &Names,
-                            size_t Count, std::optional<size_t> Index,
-                            const Token &At,
-                            const std::set<std::string> &Deferred) {
+std::string expandPackLists(StringRef Text, const PackLengths &Known,
+                            const PackNames &Deferred,
+                            const PackExpansion *Expansion, const Token &At) {
   auto Rewrite = [&](StringRef Part) {
-    return Index ? substitute(Part, Names, *Index) : Part.str();
+    return Expansion ? substitute(Part, Expansion->Names, Expansion->Index)
+                     : Part.str();
   };
   auto Open = Text.find('<');
   if (!Text.contains("...") || Open == StringRef::npos)
@@ -140,44 +245,44 @@ std::string expandPackLists(StringRef Text, const std::set<std::string> &Names,
   std::string Out;
   if (Callable)
     Out = "function<" +
-          expandPackLists(Callable->Result, Names, Count, Index, At, Deferred) +
+          expandPackLists(Callable->Result, Known, Deferred, Expansion, At) +
           "(";
   else
     Out = Rewrite(Text.take_front(Open + 1));
   llvm::SmallVector<std::pair<unsigned, unsigned>> Positions;
   unsigned Next = 0;
   bool First = true;
-  auto Append = [&](StringRef Arg, std::optional<size_t> I) {
+  auto Append = [&](StringRef Arg) {
     if (!First)
       Out += ",";
     First = false;
-    Out += expandPackLists(Arg, Names, Count, I, At, Deferred);
+    Out += Arg;
   };
   auto List = Callable ? Callable->Parameters : Text.slice(Open + 1, Close);
   for (const auto &Spelling : splitArguments(List)) {
     StringRef Arg = Spelling;
     if (!Arg.consume_back("...")) {
       Positions.emplace_back(Next++, 1);
-      Append(Arg, Index);
+      Append(expandPackLists(Arg, Known, Deferred, Expansion, At));
       continue;
     }
-    if (substitute(Arg, Deferred, 0) != Arg) {
+    auto References = referencedPacks(Arg, Known, Deferred);
+    if (References.Deferred) {
       Positions.emplace_back(Next++, 1);
-      Append(Spelling, Index);
+      Append(Spelling);
       continue;
     }
-    if (substitute(Arg, Names, 0) == Arg)
-      fail(At, "generic argument expansion requires a pack binding");
-    Positions.emplace_back(Next, Count);
-    Next += Count;
-    for (size_t I = 0; I < Count; ++I)
-      Append(Arg, I);
+    auto Use = establishExpansion(std::move(References.Bound), Known, At);
+    Positions.emplace_back(Next, Use.Count);
+    Next += Use.Count;
+    for (; Use.Index < Use.Count; ++Use.Index)
+      Append(expandPackLists(Arg, Known, Deferred, &Use, At));
   }
   if (Callable)
     Out += ")" + expandCallableFlags(Text.take_front(Close + 1), Positions);
   Out += ">";
-  Out += expandPackLists(Text.drop_front(Close + 1), Names, Count, Index, At,
-                         Deferred);
+  Out += expandPackLists(Text.drop_front(Close + 1), Known, Deferred, Expansion,
+                         At);
   return Out;
 }
 
@@ -901,102 +1006,104 @@ Frame::deduceGenericArgument(const Family &Fam, const Node &Param,
 Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
   Family Result = Source;
   auto &D = Result.Decl;
-  auto P = D.Generics.back();
-  std::set<std::string> Names{P.Text};
-  auto InnerPacks = [&](const Node &N, std::set<std::string> Inherited) {
-    if (&N != &D && !N.Generics.empty() && N.Generics.back().Pack)
-      Inherited.insert(N.Generics.back().Text);
-    for (const auto &Param : N.Params)
-      if (Param.Pack && substitute(Param.Type, Inherited, 0) != Param.Type)
-        Inherited.insert(Param.Text);
-    return Inherited;
+  const auto &Pack = D.Generics.back();
+  Result.Enclosing.PackLengths[Pack.Text] = Count;
+  auto Known = Result.Enclosing.PackLengths;
+  PackNames Deferred;
+
+  std::function<void(Node &, const PackExpansion *)> transform;
+  auto sequence = [&](std::vector<Node> &Nodes, const PackExpansion *Current) {
+    std::vector<Node> Out;
+    for (auto N : Nodes) {
+      if (!N.Pack) {
+        transform(N, Current);
+        Out.push_back(std::move(N));
+        continue;
+      }
+      auto References = referencedPacks(N, Known, Deferred);
+      if (References.Deferred) {
+        // The nested declaration still owns at least one of the operands.
+        // Resolve them together after that declaration binds its pack.
+        Out.push_back(std::move(N));
+        continue;
+      }
+      auto Use = establishExpansion(std::move(References.Bound), Known, N.At);
+      if (N.K == Node::Parameter && !N.Text.empty())
+        Use.Names.insert(N.Text);
+      N.Pack = false;
+      for (; Use.Index < Use.Count; ++Use.Index) {
+        auto Copy = N;
+        transform(Copy, &Use);
+        Out.push_back(std::move(Copy));
+      }
+    }
+    Nodes = std::move(Out);
   };
-  auto collect = [&](auto &&Visit, const Node &N,
-                     const std::set<std::string> &Inherited) -> void {
-    auto Deferred = InnerPacks(N, Inherited);
-    for (auto &Param : N.Params)
-      if (Param.Pack && !Deferred.count(Param.Text))
-        Names.insert(Param.Text);
-    for (auto &Child : N.Children)
-      Visit(Visit, Child, Deferred);
-  };
-  collect(collect, D, {});
-  std::set<std::string> Deferred;
-  auto InvolvesDeferred = [&](auto &&Visit, const Node &N) -> bool {
-    if (substitute(N.Text, Deferred, 0) != N.Text ||
-        substitute(N.Type, Deferred, 0) != N.Type)
-      return true;
-    auto Includes = [&](const Node &C) { return Visit(Visit, C); };
-    return llvm::any_of(N.Children, Includes) ||
-           llvm::any_of(N.TemplateArgs, Includes);
-  };
-  std::function<void(Node &, std::optional<size_t>)> transform;
-  std::function<void(std::vector<Node> &, std::optional<size_t>)> sequence =
-      [&](std::vector<Node> &Nodes, std::optional<size_t> I) {
-        std::vector<Node> Out;
-        for (auto N : Nodes) {
-          if (N.Pack && !InvolvesDeferred(InvolvesDeferred, N)) {
-            N.Pack = false;
-            for (size_t J = 0; J < Count; ++J) {
-              auto Copy = N;
-              transform(Copy, J);
-              Out.push_back(std::move(Copy));
-            }
-          } else {
-            transform(N, I);
-            Out.push_back(std::move(N));
-          }
-        }
-        Nodes = std::move(Out);
-      };
-  transform = [&](Node &N, std::optional<size_t> I) {
+  transform = [&](Node &N, const PackExpansion *Current) {
     llvm::SaveAndRestore Scope(Deferred);
-    Deferred = InnerPacks(N, Deferred);
-    auto Active = Names;
-    for (const auto &Hidden : Deferred)
-      Active.erase(Hidden);
-    if (!I && N.K == Node::Name && Active.count(N.Text))
+    llvm::SaveAndRestore Lengths(Known);
+    if (&N != &D)
+      for (const auto &Parameter : N.Generics) {
+        Known.erase(Parameter.Text);
+        if (Parameter.Pack)
+          Deferred.insert(Parameter.Text);
+      }
+    for (const auto &Param : N.Params) {
+      if (!Param.Pack)
+        continue;
+      auto References = referencedPacks(StringRef(Param.Type), Known, Deferred);
+      if (References.Deferred)
+        Deferred.insert(Param.Text);
+      else
+        Known[Param.Text] =
+            establishExpansion(std::move(References.Bound), Known, Param.At)
+                .Count;
+    }
+
+    if (N.K == Node::Name && Known.count(N.Text) && !Deferred.count(N.Text) &&
+        (!Current || !Current->Names.count(N.Text)))
       fail(N.At, "unexpanded pack in expression");
-    N.Text = expandPackLists(N.Text, Active, Count, I, N.At, Deferred);
-    N.At.Text = expandPackLists(N.At.Text, Active, Count, I, N.At, Deferred);
-    N.Type = expandPackLists(N.Type, Active, Count, I, N.At, Deferred);
+    N.Text = expandPackLists(N.Text, Known, Deferred, Current, N.At);
+    N.At.Text = expandPackLists(N.At.Text, Known, Deferred, Current, N.At);
+    N.Type = expandPackLists(N.Type, Known, Deferred, Current, N.At);
     if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
       std::string Bound;
-      auto Add = [&](llvm::StringRef Effect) {
+      auto Add = [&](StringRef Effect) {
         if (!Bound.empty())
           Bound += ",";
         Bound += Effect;
       };
-      llvm::SmallVector<llvm::StringRef> Items;
-      llvm::StringRef(E->second).split(Items, ',');
+      llvm::SmallVector<StringRef> Items;
+      StringRef(E->second).split(Items, ',');
       for (auto Item : Items) {
         const auto [Kind, Region] = Item.split(':');
-        bool Pack = Kind != "trap" && Region != "any" && Region != "global" &&
-                    Region != "this" &&
-                    llvm::any_of(N.Params, [&](const Node &Param) {
-                      return Param.Pack && Param.Text == Region &&
-                             !Deferred.count(Param.Text);
-                    });
-        if (!Pack)
+        bool Packed = Kind != "trap" && Region != "any" && Region != "global" &&
+                      Region != "this" &&
+                      llvm::any_of(N.Params, [&](const Node &Param) {
+                        return Param.Pack && Param.Text == Region &&
+                               !Deferred.count(Param.Text);
+                      });
+        if (!Packed)
           Add(Item);
         else
-          for (size_t J = 0; J < Count; ++J)
+          for (size_t J = 0; J < Known.at(Region.str()); ++J)
             Add(Item.str() + "$" + std::to_string(J));
       }
       E->second = Bound.empty() ? "none" : std::move(Bound);
     }
     if (&N != &D)
-      sequence(N.Generics, I);
-    sequence(N.Params, I);
-    sequence(N.Children, I);
-    sequence(N.TemplateArgs, I);
-    sequence(N.Pattern, I);
-    sequence(N.Contracts, I);
+      sequence(N.Generics, Current);
+    sequence(N.Params, Current);
+    sequence(N.Children, Current);
+    sequence(N.TemplateArgs, Current);
+    sequence(N.Pattern, Current);
+    sequence(N.Contracts, Current);
   };
-  sequence(D.Generics, {});
-  transform(D, {});
+  sequence(D.Generics, nullptr);
+  transform(D, nullptr);
   return Result;
 }
+
 void Context::chargeInstance(const Token &At) {
   if (Instantiations >= Opt.MaxInstantiations)
     throw ResourceExhausted{{At, "generic instantiation resource exhausted"}};
@@ -1210,6 +1317,7 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
     Frame Probe(U, nullptr, nullptr, Spec.Prefix);
     Probe.Opt = Spec.Site.Configuration;
     Probe.LookupLimit = Spec.Site.Through;
+    Probe.Env = Spec.Enclosing;
     Node Head;
     Head.Generics = Spec.Decl.Generics;
     Head.TemplateArgs = Spec.Decl.Params;
@@ -1258,8 +1366,11 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
         }
       }
     }
-    if (!Fits || Probe.Env.Types.size() + Probe.Env.Values.size() !=
-                     Head.Generics.size())
+    if (!Fits || !llvm::all_of(Head.Generics, [&](const Node &Parameter) {
+          return Parameter.K == Node::TypeParam
+                     ? Probe.Env.Types.count(Parameter.Text)
+                     : Probe.Env.Values.count(Parameter.Text);
+        }))
       continue;
     for (const auto &[Pattern, T] : TypeChecks)
       if (Probe.resolve(Pattern->Type, At) != T) {

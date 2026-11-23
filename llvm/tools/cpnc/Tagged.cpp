@@ -2,6 +2,51 @@
 #include "llvm/Analysis/ConstantFolding.h"
 using namespace cpn;
 
+namespace {
+// A CPN26 bool occupies a full byte on this target. LLVM integer load folding
+// requires byte-sized fields when reading several fields into a storage word.
+llvm::Type *payloadRepresentation(llvm::Type *T) {
+  if (T->isIntegerTy(1))
+    return llvm::Type::getInt8Ty(T->getContext());
+  if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(T))
+    return llvm::ArrayType::get(payloadRepresentation(Array->getElementType()),
+                                Array->getNumElements());
+  if (auto *Record = llvm::dyn_cast<llvm::StructType>(T)) {
+    llvm::SmallVector<llvm::Type *> Fields;
+    for (auto *Field : Record->elements())
+      Fields.push_back(payloadRepresentation(Field));
+    if (Record->elements() != llvm::ArrayRef(Fields))
+      return llvm::StructType::get(T->getContext(), Fields, Record->isPacked());
+  }
+  return T;
+}
+
+llvm::Constant *payloadBytes(llvm::Constant *C, llvm::Type *T) {
+  if (C->getType() == T)
+    return C;
+  if (C->isNullValue())
+    return llvm::Constant::getNullValue(T);
+  if (llvm::isa<llvm::PoisonValue>(C))
+    return llvm::PoisonValue::get(T);
+  if (llvm::isa<llvm::UndefValue>(C))
+    return llvm::UndefValue::get(T);
+  if (auto *Bit = llvm::dyn_cast<llvm::ConstantInt>(C))
+    return llvm::ConstantInt::get(T, Bit->getZExtValue());
+  std::vector<llvm::Constant *> Fields;
+  if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(T)) {
+    for (unsigned I = 0; I < Array->getNumElements(); ++I)
+      Fields.push_back(
+          payloadBytes(C->getAggregateElement(I), Array->getElementType()));
+    return llvm::ConstantArray::get(Array, Fields);
+  }
+  auto *Record = llvm::cast<llvm::StructType>(T);
+  for (unsigned I = 0; I < Record->getNumElements(); ++I)
+    Fields.push_back(
+        payloadBytes(C->getAggregateElement(I), Record->getElementType(I)));
+  return llvm::ConstantStruct::get(Record, Fields);
+}
+} // namespace
+
 void Context::tagged(const Node &D, const std::string &Name,
                      const std::string &P, const Substitution &Env) {
   auto &R = Records[Name];
@@ -161,11 +206,12 @@ llvm::Constant *Frame::packVariant(const Case &C, llvm::Constant *Payload,
   llvm::Constant *Data = llvm::Constant::getNullValue(Storage);
   if (!Payload->isNullValue()) {
     U.chargeConstant(At, Storage->getNumElements());
+    auto *Bytes = payloadBytes(Payload, payloadRepresentation(C.Payload));
     std::vector<llvm::Constant *> Words;
     for (uint64_t I = 0; I < Storage->getNumElements(); ++I) {
       auto *W = I * Stride < Size
                     ? llvm::ConstantFoldLoadFromConst(
-                          Payload, Word, llvm::APInt(64, I * Stride), DL)
+                          Bytes, Word, llvm::APInt(64, I * Stride), DL)
                     : llvm::Constant::getNullValue(Word);
       if (!W || llvm::isa<llvm::UndefValue>(W))
         fail(At, "union payload cannot be represented as a target constant");

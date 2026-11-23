@@ -22,13 +22,16 @@ std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
 struct ConstantPlace;
 struct Value;
-struct ConstantStorage {
-  std::vector<llvm::GlobalVariable *> Designations;
+struct ConstantStorageSlot {
   bool Ended = false;
   bool Constructing = false;
   bool Retiring = false;
   uint64_t Identity = 0;
   std::shared_ptr<Value> Replacement;
+};
+struct ConstantStorage : ConstantStorageSlot {
+  std::vector<llvm::GlobalVariable *> Designations;
+  std::map<std::vector<unsigned>, ConstantStorageSlot> ArrayElements;
   std::shared_ptr<ConstantPlace> OriginalExtent;
 };
 // Each evaluation-local object has its own lifetime. Copying its value creates
@@ -99,6 +102,7 @@ struct ConstantTransfer {
 struct Substitution {
   std::map<std::string, std::string> Types;
   std::map<std::string, Value> Values;
+  std::map<std::string, size_t> PackLengths;
 };
 struct TypeApplication {
   std::string Family;
@@ -218,6 +222,8 @@ struct ConstantPlace {
   std::shared_ptr<Value> SymbolicRoot;
   std::optional<std::weak_ptr<ConstantStorage>> Lifetime;
   void trackLifetime();
+  std::vector<unsigned> indices() const;
+  ConstantStorageSlot &registerExtent() const;
   void checkLifetime(const Token &, bool ExtentOnly = false) const;
   Value read(Frame &, const Token &) const;
   void write(Frame &, Value, const Token &) const;
@@ -560,7 +566,8 @@ public:
   Value floatingConvert(Value, const std::string &, const Token &,
                         bool Explicit = false);
   Value floatingBinary(const Node &, Value, Value,
-                       const std::string &Expected = "");
+                       const std::string &Expected = "",
+                       llvm::Value **LocalFlags = nullptr);
   Value place(const Node &, bool NeedLive = true);
   Value pointedObject(Value, const Token &);
   Value subscript(const Node &);
@@ -568,6 +575,8 @@ public:
   std::string resolve(std::string, const Token &);
   std::string materializationType(const std::string &, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
+  std::optional<Value> resultObserver(const Node &, const std::vector<Node> &,
+                                      Value Receiver);
   std::optional<Value> scalarConversion(const Node &, llvm::StringRef,
                                         const std::vector<Node> &);
   std::optional<Value> memoryCall(const Node &, const std::vector<Node> &,
@@ -727,6 +736,8 @@ public:
                     bool RunOwnDestructor = true);
   void retireConstantCell(Value &, const Token &, bool Explicit = false,
                           bool Destroy = true);
+  void retireConstantExtent(ConstantPlace, const Token &, bool Explicit,
+                            bool Destroy);
   Value constantStorageCall(const Node &, const std::vector<Node> &);
   Value storageViewObserver(Value, llvm::StringRef, const Token &);
   void endConstantField(const std::string &, bool, const Token &);

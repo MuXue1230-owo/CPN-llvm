@@ -39,7 +39,7 @@ class FloatingOperation {
 
 public:
   llvm::RoundingMode Mode;
-  explicit FloatingOperation(Frame &F) : F(F) {
+  explicit FloatingOperation(Frame &F, bool Observed = false) : F(F) {
     const bool Strict = F.Opt.FPProfile == "strict";
     auto Name = F.Opt.FPRounding;
     if (Name.empty())
@@ -54,21 +54,26 @@ public:
     if (!F.IR)
       return;
     bool Preserve = F.Opt.FPSubnormal == "preserve" ||
+                    (Observed && F.Opt.FPSubnormal.empty()) ||
                     ((F.Opt.FPSubnormal == "current" ||
                       (Strict && F.Opt.FPSubnormal.empty())) &&
                      F.Opt.InitialSubnormal == "preserve");
-    if (!Strict && !F.Opt.FPTrapMask && Name == "current" && !Preserve)
+    if (!Observed && !Strict && !F.Opt.FPTrapMask && Name == "current" &&
+        !Preserve)
       return;
     llvm::IRBuilder<> Entry(F.IR->getEntryBlock().begin());
     Cell = Entry.CreateAlloca(F.B.getInt32Ty(), nullptr, "fp.control");
     Saved = read();
     auto *Controls = Saved;
-    if (Strict || F.Opt.FPTrapMask) {
-      if (F.Opt.FPTrapMask || F.Opt.FPInitialTraps)
-        Traps = F.B.getInt32(
-            F.Opt.FPTrapMask.value_or(F.Opt.FPInitialTraps.value_or(0)));
-      else
-        Traps = F.B.CreateAnd(F.B.CreateNot(F.B.CreateLShr(Saved, 7)), Events);
+    if (Observed || Strict || F.Opt.FPTrapMask) {
+      if (!Observed) {
+        if (F.Opt.FPTrapMask || F.Opt.FPInitialTraps)
+          Traps = F.B.getInt32(
+              F.Opt.FPTrapMask.value_or(F.Opt.FPInitialTraps.value_or(0)));
+        else
+          Traps =
+              F.B.CreateAnd(F.B.CreateNot(F.B.CreateLShr(Saved, 7)), Events);
+      }
       Controls = F.B.CreateOr(F.B.CreateAnd(Controls, ~Flags), Masks);
     }
     if (Name != "current") {
@@ -82,20 +87,26 @@ public:
       Controls = F.B.CreateAnd(Controls, ~Subnormal);
     write(Controls);
   }
-  ~FloatingOperation() {
+  llvm::Value *finish() {
     if (!Saved)
-      return;
+      return F.B.getInt32(0);
     auto *Local = F.B.CreateAnd(read(), Flags);
     write(F.B.CreateOr(Saved, Local));
+    Saved = nullptr;
     if (Traps)
       F.guard(F.B.CreateIsNotNull(F.B.CreateAnd(Local, Traps)), "numeric");
+    return F.B.CreateAnd(Local, Events);
   }
-  void check(llvm::APFloat::opStatus Status, const Token &At) const {
-    unsigned IEEE = unsigned(Status);
+  ~FloatingOperation() { finish(); }
+  static unsigned eventBits(llvm::APFloat::opStatus Status) {
+    unsigned IEEE = Status;
     // APFloat has contiguous event bits. MXCSR reserves bit 1 for denormal
     // inputs.
-    unsigned Raised = (IEEE & 1) | ((IEEE & ~1u) << 1);
-    if (Raised & F.Opt.FPTrapMask.value_or(F.Opt.FPInitialTraps.value_or(0)))
+    return (IEEE & 1) | ((IEEE & ~1u) << 1);
+  }
+  void check(llvm::APFloat::opStatus Status, const Token &At) const {
+    if (eventBits(Status) &
+        F.Opt.FPTrapMask.value_or(F.Opt.FPInitialTraps.value_or(0)))
       fail(At, "floating operation traps in constant evaluation");
   }
 };
@@ -250,7 +261,8 @@ Value Frame::floatingConvert(Value V, const std::string &T, const Token &At,
   return {T, Opt.FPProfile == "strict" ? strictCast(B, Out, V.IR) : Out};
 }
 Value Frame::floatingBinary(const Node &N, Value L, Value R,
-                            const std::string &Expected) {
+                            const std::string &Expected,
+                            llvm::Value **LocalFlags) {
   auto T = L.Type == "f64" || R.Type == "f64"   ? std::string("f64")
            : L.Type == "f32" || R.Type == "f32" ? "f32"
            : floating(Expected)                 ? Expected
@@ -262,7 +274,7 @@ Value Frame::floatingBinary(const Node &N, Value L, Value R,
   if (Op == "+" || Op == "-" || Op == "*" || Op == "/") {
     if (InPredicate)
       fail(N.At, "contract predicate cannot perform floating arithmetic");
-    FloatingOperation Policy(*this);
+    FloatingOperation Policy(*this, LocalFlags != nullptr);
     llvm::Value *Out;
     if (!IR) {
       auto Result = llvm::cast<llvm::ConstantFP>(X)->getValueAPF();
@@ -271,7 +283,10 @@ Value Frame::floatingBinary(const Node &N, Value L, Value R,
                     : Op == "-" ? Result.subtract(Right, Policy.Mode)
                     : Op == "*" ? Result.multiply(Right, Policy.Mode)
                                 : Result.divide(Right, Policy.Mode);
-      Policy.check(Status, N.At);
+      if (LocalFlags)
+        *LocalFlags = B.getInt32(FloatingOperation::eventBits(Status));
+      else
+        Policy.check(Status, N.At);
       Out = llvm::ConstantFP::get(U.C, Result);
     } else if (Op == "+")
       Out = B.CreateFAdd(X, Y);
@@ -281,7 +296,11 @@ Value Frame::floatingBinary(const Node &N, Value L, Value R,
       Out = B.CreateFMul(X, Y);
     else
       Out = B.CreateFDiv(X, Y);
-    return {T, Opt.FPProfile == "strict" ? strictBinary(B, Out, X, Y) : Out};
+    if (LocalFlags && IR)
+      *LocalFlags = Policy.finish();
+    return {T, LocalFlags || Opt.FPProfile == "strict"
+                   ? strictBinary(B, Out, X, Y)
+                   : Out};
   }
   llvm::CmpInst::Predicate P;
   if (Op == "==")

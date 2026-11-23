@@ -57,11 +57,17 @@ struct Check {
         builtin(S) || builtinPredicate(S) || U.Aliases.count(S) ||
         U.Cases.count(S))
       return true;
+    if (auto Enclosing =
+            U.Records.find(llvm::StringRef(Prefix).rtrim(':').str());
+        Enclosing != U.Records.end() &&
+        Enclosing->second.Env.PackLengths.count(S))
+      return true;
     if (!Owner.empty() && U.Records.count(Owner)) {
       const auto &R = U.Records.at(Owner);
       Token T{S};
       if (S == R.Decl.Text || R.Env.Types.count(S) || R.Env.Values.count(S) ||
-          U.lookupPath(Owner, T, true) || U.lookupPath(Owner, T, false) ||
+          R.Env.PackLengths.count(S) || U.lookupPath(Owner, T, true) ||
+          U.lookupPath(Owner, T, false) ||
           llvm::any_of(R.Decl.Children,
                        [&](const Node &D) { return D.Text == S; }))
         return true;

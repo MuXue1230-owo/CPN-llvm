@@ -36,6 +36,8 @@ struct Options {
               LiteralRounding = "nearest_ties_even";
   std::string InitialRounding, FPSubnormal, InitialSubnormal;
   std::optional<unsigned> FPTrapMask, FPInitialTraps;
+  unsigned FPResultMask = 1 | 4 | 8;
+  bool FPRequireFinite = false;
   std::set<unsigned> IntegerWidths{8, 16, 32, 64};
   std::set<std::string> FloatFormats{"f32", "f64"};
   std::string Overflow = "checked", DefaultInt = "i32";

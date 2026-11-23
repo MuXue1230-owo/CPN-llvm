@@ -50,13 +50,28 @@ The conformance boundary is [chapter 21 §6.1](https://github.com/MuXue1230-owo/
 
 The executable tests in [tests/test_cpnc.py](tests/test_cpnc.py) compile source, verify the IR with llvm-as, link the object with the host C compiler and check the result. Negative cases test parser rejection, binding rules, numeric domains, lifetime violations and initializer-skipping transfers.
 
+Named `try_add`, `try_sub`, `try_mul`, and `try_div` on f32 and f64 report
+operation-local IEEE flags and classify failures under `numeric.fp.result_mask`
+and `numeric.fp.require_finite`. Their `checked_*` counterparts use the same
+classification for NumericTrap. The explicit operations preserve the selected
+rounding and sticky-state behavior in native execution and produce matching
+result classifications during required constant evaluation. The `report_*`
+forms expose the IEEE default value and local status in a `NumericReport<T>`
+record with `value` and `status` fields.
+
+The minimal `std::Result` binding supports case queries, receiver-qualified
+`value()` and `error()` access, and checked payloadless success for `Result<void,E>`.
+Wrong-case access selects ContractTrap. The fallible accessors and mapping
+adapters remain incomplete.
+
 ### Outstanding Core coverage
 
-* Function-type packs and packs in applied owner paths participate in deduction. Independent inner packs bind in their own scopes. Computed specialization ordering uses structural and constant-expression evidence. Remaining cases include joint expansion of outer and inner packs, more complete computed comparisons, and mixed owner/member binders in out-of-line definitions.
+* Function-type packs and packs in applied owner paths participate in deduction. An expansion can zip captured outer and local inner packs with equal lengths. Independent inner packs bind in their own scopes. Computed specialization ordering uses structural and constant-expression evidence. More complete computed comparisons and mixed owner/member binders in out-of-line definitions remain partial.
 * Contract proof is conservative. Override checking proves supported predicate implications against each inherited declaration and its receiver view. Indirect callable types retain selected predicate-check effects and published borrow origins. Stronger proof rules and opaque foreign lifetime contracts remain partial.
 * Record lifetime support still needs complete access checking, construction-state contracts across aliased receivers and inherited layers, construction rollback on continuing failures and complete lifecycle checking during construction and Cleanup.
 * Complete objects and individually selected member and array-element extents support replacement, including by another fitting type. Pointer provenance after untracked foreign writes or raw storage reinterpretation, whole-program escape checking, storage transfer, and allocator ownership remain incomplete.
-* Constant evaluation supports generation-checked replacement of complete automatic extents, including explicit case replacement of tagged unions. StorageView exposes capacity, alignment and identity in native and constant execution. Constant member and element replacement, stronger shared-base and closure lifetime checks, and authored union replacement contracts remain partial. Floating-point arithmetic covers f32 and f64. Floating and cross-family named numeric operations, floating result/status interfaces, FP context APIs and provider controls need additional implementation.
+* Constant evaluation supports generation-checked replacement of complete automatic objects and elements of automatic arrays. Replacement of a tagged union by an explicit case is supported. StorageView exposes capacity, alignment and identity in native and constant execution. Constant record-member replacement, stronger shared-base and closure lifetime checks, and authored union replacement contracts remain partial.
+* Floating-point arithmetic covers f32 and f64. Cross-family casts, FP context APIs and provider controls need additional implementation.
 * The supported ABI is x86-64 System V for the tested scalar boundary. C++ ABI features, separate compilation, module imports, reflection, exceptions and concurrent execution are unimplemented capabilities.
 
 ### Target and invocation

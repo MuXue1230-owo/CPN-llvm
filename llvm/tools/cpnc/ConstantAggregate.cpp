@@ -121,6 +121,21 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
                           Value *BaseDestination) {
   ConstantActivation Activation(U, At);
   const auto Type = unconst(Source.Type);
+  if (Source.Location && StringRef(Type).ends_with("]")) {
+    const auto &Place = *Source.Location;
+    Place.checkLifetime(At);
+    const auto &Storage = Place.Root->ConstantIdentity.Storage;
+    if (Storage && !Storage->ArrayElements.empty()) {
+      const auto Position = Place.indices();
+      if (llvm::any_of(Storage->ArrayElements, [&](const auto &Entry) {
+            const auto &[Path, Element] = Entry;
+            return Element.Ended && Path.size() > Position.size() &&
+                   llvm::ArrayRef(Path).take_front(Position.size()) ==
+                       llvm::ArrayRef(Position);
+          }))
+        fail(At, "array copy observes an ended element generation");
+    }
+  }
   if (Source.Expiring && Source.Readonly && U.Records.count(Type))
     fail(At, "moving requires a mutable source");
   auto Op = Source.Expiring ? SpecialOperation::MoveConstruct
@@ -631,12 +646,45 @@ void ConstantPlace::trackLifetime() {
   Lifetime = Identity;
 }
 
+std::vector<unsigned> ConstantPlace::indices() const {
+  std::vector<unsigned> Path;
+  Path.reserve(Steps.size());
+  for (const auto &Step : Steps)
+    Path.push_back(Step.Index);
+  return Path;
+}
+
+ConstantStorageSlot &ConstantPlace::registerExtent() const {
+  auto &Storage = *Root->ConstantIdentity.Storage;
+  if (Steps.empty())
+    return Storage;
+  return Storage.ArrayElements[indices()];
+}
+
 void ConstantPlace::checkLifetime(const Token &At, bool ExtentOnly) const {
   if (Lifetime && Lifetime->expired())
     fail(At, "constant reference designates an object whose lifetime ended");
   const auto &Identity = Root->ConstantIdentity.Storage;
-  if (!ExtentOnly && Identity && Identity->Ended)
+  if (!Identity)
+    return;
+  if (Identity->Ended && (!ExtentOnly || !Steps.empty()))
     fail(At, "ended object generation");
+  if (Identity->Retiring && Steps.empty() && !ExtentOnly)
+    fail(At, "object destruction is already in progress");
+  if (Identity->ArrayElements.empty())
+    return;
+  std::vector<unsigned> Path;
+  for (const auto &Step : Steps) {
+    Path.push_back(Step.Index);
+    auto I = Identity->ArrayElements.find(Path);
+    if (I == Identity->ArrayElements.end())
+      continue;
+    bool Exact = Path.size() == Steps.size();
+    if (I->second.Ended && (!ExtentOnly || !Exact))
+      fail(At, "ended object generation");
+    if (I->second.Retiring && Exact && !ExtentOnly)
+      fail(At, "object destruction is already in progress");
+  }
 }
 
 Value ConstantPlace::read(Frame &F, const Token &At) const {

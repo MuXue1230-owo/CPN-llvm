@@ -1277,10 +1277,11 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
   auto Body = *FamilyDecl.Body;
   const auto &Public = F.Decl;
   if (Body.Generics.back().Pack) {
-    Family Expanded{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite};
-    Body = expand(Expanded, Public.Generics.size() - (Body.Generics.size() - 1),
-                  Body.At)
-               .Decl;
+    Family Source{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite, F.Env};
+    auto Expanded = expand(
+        Source, Public.Generics.size() - (Body.Generics.size() - 1), Body.At);
+    Body = std::move(Expanded.Decl);
+    F.Env.PackLengths = std::move(Expanded.Enclosing.PackLengths);
   }
   auto Original = F.Env;
   for (size_t I = 0; I < Body.Generics.size(); ++I) {

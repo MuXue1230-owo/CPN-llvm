@@ -18,12 +18,29 @@ void Context::bindScalarLibrary() {
       generic<type T, type E> union Result {
         case Ok(T value);
         case Err(E error);
+        declare bool has_value() const noexcept [[effects(read(this))]];
+        declare bool has_error() const noexcept [[effects(read(this))]];
+        declare T& value() & noexcept [[effects(read(this), trap(contract))]];
+        declare const<T>& value() const noexcept
+            [[effects(read(this), trap(contract))]];
+        declare T&& value() && noexcept [[effects(read(this), trap(contract))]];
+        declare E& error() & noexcept [[effects(read(this), trap(contract))]];
+        declare const<E>& error() const noexcept
+            [[effects(read(this), trap(contract))]];
+        declare E&& error() && noexcept [[effects(read(this), trap(contract))]];
         Result(const<Result>& other)=default;
         Result(Result&& other)=default;
       };
       generic<type E> specialize union Result<void, E> {
         case Ok;
         case Err(E error);
+        declare bool has_value() const noexcept [[effects(read(this))]];
+        declare bool has_error() const noexcept [[effects(read(this))]];
+        declare void value() const noexcept [[effects(read(this), trap(contract))]];
+        declare E& error() & noexcept [[effects(read(this), trap(contract))]];
+        declare const<E>& error() const noexcept
+            [[effects(read(this), trap(contract))]];
+        declare E&& error() && noexcept [[effects(read(this), trap(contract))]];
         Result(const<Result>& other)=default;
         Result(Result&& other)=default;
       };
@@ -36,6 +53,57 @@ void Context::bindScalarLibrary() {
     Decl.At.Column = Index + 1;
   }
   unit(Library);
+}
+
+std::optional<Value> Frame::resultObserver(const Node &Call,
+                                           const std::vector<Node> &Args,
+                                           Value Receiver) {
+  if (Call.K != Node::Member ||
+      !StringRef(Receiver.Type).starts_with("std::Result<") ||
+      !U.Variants.count(Receiver.Type))
+    return {};
+  const bool Test = Call.Text == "has_value" || Call.Text == "has_error";
+  const bool Error = Call.Text == "error" || Call.Text == "has_error";
+  if (!Test && Call.Text != "value" && Call.Text != "error")
+    return {};
+  if (!Args.empty() || !Call.TemplateArgs.empty())
+    fail(Call.At, "Result observers take no arguments");
+  Receiver = load(Receiver);
+  const auto &Selected = U.Cases.at(Receiver.Type + (Error ? "::Err" : "::Ok"));
+  auto *Tag = B.CreateExtractValue(Receiver.IR, 0);
+  auto *Active = B.CreateICmpEQ(Tag, B.getInt32(Selected.Tag));
+  if (Test)
+    return Value{"bool", Active};
+
+  if (!IR && !llvm::cast<llvm::ConstantInt>(Active)->isOne())
+    fail(Call.At, "Result access selects ContractTrap on inactive case in "
+                  "constant evaluation");
+  guard(B.CreateNot(Active), "contract");
+  if (Selected.Types.empty())
+    return Value{"void"};
+
+  const auto &T = Selected.Types.front();
+  const bool Readonly = Receiver.Readonly || Selected.Decl.Params.front().Const;
+  Value Payload{T, nullptr, nullptr, Readonly};
+  if (IR) {
+    Payload.Address = payloadAddress(Selected, Receiver.Address, 0);
+    Payload = subobject(Receiver, Payload);
+    ensureLive(Payload, Call.At);
+  } else {
+    auto *Image = llvm::cast<llvm::Constant>(Receiver.IR);
+    Payload.IR =
+        unpackVariant(Selected, Image, Call.At)->getAggregateElement(0u);
+    if (Receiver.Location) {
+      auto Place = *Receiver.Location;
+      Place.Type = T;
+      Place.Readonly = Readonly;
+      Place.Steps.push_back({0, &Selected});
+      Payload.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    } else if (Receiver.Address)
+      Payload.Address = payloadAddress(Selected, Receiver.Address, 0);
+  }
+  Payload.Expiring = Receiver.Expiring && !Receiver.Readonly;
+  return load(Payload);
 }
 
 std::optional<Value> Frame::scalarConversion(const Node &Call, StringRef Name,

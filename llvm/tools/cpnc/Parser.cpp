@@ -1845,7 +1845,14 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       O.DefaultReal = V;
       continue;
     }
-    if (K == "numeric.fp.trap_mask" || K == "numeric.fp.initial_trap_mask") {
+    if (K == "numeric.fp.require_finite") {
+      if (V != "true" && V != "false")
+        fail(N.At, "CFG001: expected Boolean floating result setting");
+      O.FPRequireFinite = V == "true";
+      continue;
+    }
+    if (K == "numeric.fp.trap_mask" || K == "numeric.fp.initial_trap_mask" ||
+        K == "numeric.fp.result_mask") {
       if (K == "numeric.fp.trap_mask" && V == "current") {
         O.FPTrapMask.reset();
         continue;
@@ -1867,7 +1874,10 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
           fail(N.At, "CFG001: invalid or duplicate floating event");
         Mask |= It->second;
       }
-      (K == "numeric.fp.trap_mask" ? O.FPTrapMask : O.FPInitialTraps) = Mask;
+      if (K == "numeric.fp.result_mask")
+        O.FPResultMask = Mask;
+      else
+        (K == "numeric.fp.trap_mask" ? O.FPTrapMask : O.FPInitialTraps) = Mask;
       continue;
     }
     if (K == "numeric.fp.subnormal" || K == "numeric.fp.initial_subnormal") {

@@ -267,8 +267,7 @@ void Frame::replaceGeneration(const Value &V, const std::string &T,
 Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
   if (C.Text == "construct_at") {
     auto Extent = constantExtent(*this, eval(Args.front()), C.At);
-    auto &Original = *Extent.Root;
-    auto &Storage = *Original.ConstantIdentity.Storage;
+    auto &Storage = Extent.registerExtent();
     if (Storage.Constructing)
       fail(C.At, "storage has a construction in progress");
     if (Storage.Retiring ||
@@ -281,7 +280,7 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
       fail(C.At, "storage contains a live generation");
     auto Type = resolve(C.TemplateArgs.front().Type, C.At);
     auto *Requested = U.ir(Type, C.At);
-    auto *Existing = U.ir(Original.Type, C.At);
+    auto *Existing = U.ir(Extent.Type, C.At);
     if (!Requested->isSized())
       fail(C.At, "replacement requires a complete object type");
     const auto &Layout = U.M.getDataLayout();
@@ -314,19 +313,26 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
   Place.checkLifetime(C.At, View);
   if (Place.Root->Address)
     fail(C.At, "constant storage operation requires an automatic object");
-  if (!Place.Steps.empty())
-    fail(C.At, "constant storage operation on a subobject is unavailable");
+  auto Type = Place.Root->Type;
+  for (const auto &Step : Place.Steps) {
+    if (!llvm::StringRef(Type).ends_with("]") || Step.Alternative ||
+        !Step.BaseOwner.empty())
+      fail(C.At, "constant storage operation requires an automatic object "
+                 "or array element");
+    Type = element(Type);
+  }
   if (View) {
     auto Storage = Place.Root->ConstantIdentity.Storage;
-    if (Storage->OriginalExtent)
+    if (Storage->OriginalExtent && Place.Steps.empty())
       Place = *Storage->OriginalExtent;
     auto Address = constantAddress(Place, C.At, /*ExtentOnly=*/true);
     Address.Type = StorageViewType;
     return Address;
   }
-  if (ConstantReceiver == Place.Root && F && F->Decl.K == Node::Destructor)
+  if (Place.Steps.empty() && ConstantReceiver == Place.Root && F &&
+      F->Decl.K == Node::Destructor)
     fail(C.At, "destruction is already in progress");
-  retireConstantCell(*Place.Root, C.At, /*Explicit=*/true, C.Text == "destroy");
+  retireConstantExtent(Place, C.At, /*Explicit=*/true, C.Text == "destroy");
   return {"void"};
 }
 
@@ -337,7 +343,7 @@ Value Frame::storageViewObserver(Value View, llvm::StringRef Name,
   if (!IR) {
     auto Extent = constantExtent(*this, View, At);
     if (Name == "identity") {
-      auto &Identity = Extent.Root->ConstantIdentity.Storage->Identity;
+      auto &Identity = Extent.registerExtent().Identity;
       if (!Identity) {
         // Runtime extent birth identifiers are odd.
         if (!U.NextConstantStorageIdentity)

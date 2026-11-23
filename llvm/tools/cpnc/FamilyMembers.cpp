@@ -201,8 +201,10 @@ void Context::bindFamilyMember(const std::string &Name,
   for (auto *R : Instances)
     Count += R->Decl.Generics.size();
   if (!D.Generics.empty() && D.Generics.back().Pack) {
-    Family Source{D, "", Saved.Site};
-    D = expand(Source, Count - (D.Generics.size() - 1), D.At).Decl;
+    Family Source{D, "", Saved.Site, Env};
+    auto Expanded = expand(Source, Count - (D.Generics.size() - 1), D.At);
+    D = std::move(Expanded.Decl);
+    Env.PackLengths = std::move(Expanded.Enclosing.PackLengths);
   }
   if (D.Generics.size() != Count)
     fail(D.At, "owner binder arity mismatch");

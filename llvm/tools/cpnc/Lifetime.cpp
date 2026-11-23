@@ -79,23 +79,55 @@ void Frame::endConstantScope() {
 
 void Frame::retireConstantCell(Value &Cell, const Token &At, bool Explicit,
                                bool Destroy) {
-  auto Storage = Cell.ConstantIdentity.Storage;
-  if (Storage && Storage->Ended) {
-    if (Explicit)
-      fail(At, "ended object generation");
-    if (Storage->Replacement)
-      retireConstantCell(*Storage->Replacement, At);
+  if (!Cell.ConstantIdentity.Storage && !Explicit) {
+    if (Destroy)
+      constantDrop(Cell, At);
+    else
+      checkAbandon(Cell.Type, At);
     return;
   }
-  std::optional<llvm::SaveAndRestore<bool>> Retiring;
-  if (Storage) {
-    Storage->Ended = true;
-    Retiring.emplace(Storage->Retiring, true);
+  retireConstantExtent({&Cell, {}, Cell.Type, Cell.Readonly}, At, Explicit,
+                       Destroy);
+}
+
+void Frame::retireConstantExtent(ConstantPlace Place, const Token &At,
+                                 bool Explicit, bool Destroy) {
+  Place.trackLifetime();
+  auto &Slot = Place.registerExtent();
+  if (Slot.Retiring || Slot.Constructing)
+    fail(At, "object lifetime transition is already in progress");
+  if (Slot.Ended) {
+    if (Explicit)
+      fail(At, "ended object generation");
+    if (Slot.Replacement)
+      retireConstantCell(*Slot.Replacement, At, false, Destroy);
+    return;
   }
+  auto Object = Place.read(*this, At);
+  llvm::SaveAndRestore Retiring(Slot.Retiring, true);
+  const auto &Storage = *Place.Root->ConstantIdentity.Storage;
+  if (llvm::StringRef(Place.Type).ends_with("]") &&
+      !Storage.ArrayElements.empty()) {
+    auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Place.Type, At));
+    auto Count = llvm::StringRef(Place.Type).ends_with("[0]")
+                     ? 0
+                     : Array->getNumElements();
+    const auto Element = unconst(element(Place.Type));
+    for (uint64_t I = Count; I; --I) {
+      U.chargeConstant(At);
+      auto Child = Place;
+      Child.Type = Element;
+      Child.Steps.push_back({unsigned(I - 1)});
+      retireConstantExtent(std::move(Child), At, false, Destroy);
+    }
+    Slot.Ended = true;
+    return;
+  }
+  Slot.Ended = true;
   if (Destroy)
-    constantDrop(Cell, At);
+    constantDrop(Object, At);
   else
-    checkAbandon(Cell.Type, At);
+    checkAbandon(Object.Type, At);
 }
 
 void Frame::endConstantField(const std::string &Slot, bool Run,

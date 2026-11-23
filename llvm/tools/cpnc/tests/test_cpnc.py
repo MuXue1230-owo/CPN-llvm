@@ -935,6 +935,65 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_coexpansion_of_captured_and_local_packs(self):
+        declarations = """
+            generic<type A,type B> struct Pair{};
+            generic<type... Ts> struct Types{};
+            generic<const i32... Ns> struct Values{};
+            i32 add(i32 a,i32 b){return a+b;}
+            generic<type... Outer> struct Layer {
+                generic<type... Inner> struct Nested {
+                    alias Zipped=Types<Pair<Outer,Inner>...>;
+                };
+            };
+            generic<type... Outer> struct SeparateLayer {
+                generic<type... Inner> struct Nested {
+                    alias Separate=Types<Pair<Types<Outer...>,Inner>...>;
+                };
+            };
+            generic<const i32... Outer> struct NumberLayer {
+                generic<const i32... Inner> struct Nested {
+                    alias Zipped=Values<(Outer+Inner)...>;
+                    i32 sum() {return add((Outer+Inner)...);}
+                };
+            };
+        """
+        self.assertEqual(
+            self.program(
+                declarations
+                + """
+            i32 main(){
+                alias First=Layer<i8,i16>::Nested<i32,i64>::Zipped;
+                alias Second=SeparateLayer<i8>::Nested<i32,i64>::Separate;
+                alias Empty=Layer<>::Nested<>::Zipped;
+                alias Numbers=NumberLayer<3,5>::Nested<14,20>::Zipped;
+                NumberLayer<3,5>::Nested<14,20> nums;
+                if constexpr(SameType<First,Types<Pair<i8,i32>,Pair<i16,i64>>>
+                    && SameType<Second,Types<Pair<Types<i8>,i32>,
+                                              Pair<Types<i8>,i64>>>
+                    && SameType<Empty,Types<>>
+                    && SameType<Numbers,Values<17,25>>) {
+                    return nums.sum();
+                } else {return 1;}
+            }
+            """
+            ),
+            42,
+        )
+        for type_name in (
+            "Layer<i8>::Nested<i32,i64>",
+            "NumberLayer<3,5>::Nested<14>",
+        ):
+            with self.subTest(type_name=type_name):
+                result = self.compile(
+                    declarations + f"i32 main(){{{type_name} value;return 0;}}",
+                    "--check",
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(
+                    "packs expanded together have different lengths", result.stderr
+                )
+
     def test_symbolic_computed_specialization_ordering(self):
         self.assertEqual(
             self.program("""
@@ -3523,6 +3582,117 @@ class CompilerTests(unittest.TestCase):
         )
         self.assertEqual(result, 42)
 
+    def test_floating_result_masks_local_flags_and_required_evaluation(self):
+        source = """
+            configuration {numeric.fp.trap_mask=[Invalid,DivideByZero,Overflow,Inexact];};
+            alias Outcome=std::numeric::NumericResult<f32>;
+            alias Code=std::numeric::NumericErrorCode;
+            alias Flag=std::numeric::FPFlag;
+            constexpr bool division(f32 divisor){
+                Outcome outcome(std::numeric::try_div(f32(1.0),divisor));
+                match(outcome){
+                    case Outcome::Ok(value quotient,ref status){
+                        return quotient==0.5 && status.fp_flags.empty();
+                    }
+                    case Outcome::Err(value code,ref status){
+                        return code==Code::DivideByZero &&
+                               status.fp_flags.contains(Flag::DivideByZero) &&
+                               !status.value_inexact;
+                    }
+                }
+            }
+            constexpr bool folded(division(0.0) && division(2.0));
+            extern "C" i32 inspect(f32 maximum){
+                Outcome outcome(configured(numeric.fp.result_mask=[Inexact,Overflow])
+                                (try_mul(maximum, f32(2.0))));
+                match(outcome){
+                    case Outcome::Ok(value product,ref status){return 1;}
+                    case Outcome::Err(value code,ref status){
+                        return folded && division(2.0) && division(0.0) &&
+                            code==Code::Overflow && status.value_inexact &&
+                            status.fp_flags.contains(Flag::Overflow) &&
+                            status.fp_flags.contains(Flag::Inexact) ? 42 : 2;
+                    }
+                }
+            }
+            extern "C" i32 cpn_finite(f32 operand){
+                Outcome outcome(configured(numeric.fp.require_finite=true)
+                                (try_add(operand,f32(0.0))));
+                match(outcome){
+                    case Outcome::Ok(value sum,ref status){return 1;}
+                    case Outcome::Err(value code,ref status){
+                        return code==Code::NonFinite && status.fp_flags.empty() ? 42 : 2;
+                    }
+                }
+            }
+        """
+        host = """
+            #include <float.h>
+            #include <math.h>
+            #include <xmmintrin.h>
+            extern int inspect(float),cpn_finite(float);
+            int main(void){
+                unsigned saved=_mm_getcsr();
+                _mm_setcsr((saved | 0x1f80u) & ~0x3fu);
+                _mm_setcsr(_mm_getcsr() | 0x4u);
+                int ok=inspect(FLT_MAX)==42 && cpn_finite(NAN)==42;
+                unsigned flags=_mm_getcsr() & 0x3du;
+                _mm_setcsr(saved);
+                return ok && flags==0x2cu ? 42 : 3;
+            }
+        """
+        for preset in ("Debug", "Release"):
+            with self.subTest(preset=preset):
+                self.assertEqual(
+                    self.program(source, "--preset=" + preset, host=host), 42
+                )
+
+    def test_checked_floating_uses_result_policy(self):
+        self.assertEqual(
+            self.program("""
+                configuration {numeric.fp.trap_mask=[Inexact];};
+                f32 divide(f32 x){return checked_div(x,f32(3.0));}
+                i32 main(){return divide(1.0)>0.0 ? 42 : 1;}
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                configuration {numeric.fp.trap_mask=[]; numeric.fp.result_mask=[Inexact];};
+                f32 divide(f32 x){return checked_div(x,f32(3.0));}
+                i32 main(){return divide(1.0)>0.0 ? 42 : 1;}
+            """),
+            -signal.SIGILL,
+        )
+        result = self.compile(
+            "constexpr f32 bad(checked_div(f32(1.0), f32(0.0)));", "--check"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("floating operation traps in constant evaluation", result.stderr)
+
+    def test_floating_reports_keep_the_default_value_when_result_would_fail(self):
+        self.assertEqual(
+            self.program("""
+                configuration {numeric.fp.trap_mask=[DivideByZero];};
+                alias Flag=std::numeric::FPFlag;
+                constexpr f64 maximum(f64(0x1.fffffffffffffp1023));
+                constexpr bool folded(){
+                    auto report(report_div(f64(1.0),f64(0.0)));
+                    return report.value > maximum &&
+                           report.status.fp_flags.contains(Flag::DivideByZero);
+                }
+                constexpr bool observed(folded());
+                bool divide(f64 divisor){
+                    auto report(std::numeric::report_div(f64(1.0),divisor));
+                    return report.value > maximum &&
+                           report.status.fp_flags.contains(Flag::DivideByZero) &&
+                           !report.status.value_inexact;
+                }
+                i32 main(){return observed && divide(0.0) ? 42 : 1;}
+            """),
+            42,
+        )
+
     def test_binary_floating_literals_operations_and_native_abi(self):
         self.assertEqual(
             self.program(
@@ -6012,6 +6182,114 @@ class CompilerTests(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(diagnostic, result.stderr)
 
+    def test_result_queries_and_receiver_qualified_references(self):
+        self.assertEqual(
+            self.program("""
+                alias R = std::Result<i32,i16>;
+                alias Empty = std::Result<void,i16>;
+                alias ConstPayload = std::Result<const<i32>,i16>;
+                constexpr i32 answer() {
+                    R r(R::Ok(40));
+                    i32& item(r.value());
+                    item += 2;
+                    return r.has_value() && !r.has_error() ? r.value() : 1;
+                }
+                constexpr i32 constant_answer(answer());
+                [[effects(read(r))]]
+                bool successful(const<R>& r) { return r.has_value(); }
+                [[effects(read(r),trap(contract))]]
+                i32 checked(const<R>& r) { return r.value(); }
+                i32 main() {
+                    R value(R::Ok(1));
+                    const R readonly(R::Ok(2));
+                    R error(R::Err(i16(3)));
+                    const R error_readonly(R::Err(i16(4)));
+                    ConstPayload immutable_payload(ConstPayload::Ok(5));
+                    Empty done(Empty::Ok());
+                    if (!SameType<decltype(value.value()),i32&> ||
+                        !SameType<decltype(std::move(value).value()),i32&&> ||
+                        !SameType<decltype(readonly.value()),const<i32>&> ||
+                        !SameType<decltype(std::move(immutable_payload).value()),const<i32>&&> ||
+                        !SameType<decltype(error.error()),i16&> ||
+                        !SameType<decltype(error_readonly.error()),const<i16>&> ||
+                        !SameType<decltype(done.value()),void>) { return 10; }
+                    value.value() = 20;
+                    error.error() = i16(22);
+                    done.value();
+                    if (!successful(value) || value.has_error() ||
+                        !error.has_error() || error.has_value() ||
+                        checked(value) + error.error() != 42 ||
+                        constant_answer != 42 || readonly.value() != 2) {
+                        return 11;
+                    }
+                    return 42;
+                }
+            """),
+            42,
+        )
+        readonly = self.compile(
+            """
+            alias R=std::Result<i32,i32>;
+            void f(const<R>& r) { r.value() = 1; }
+            """,
+            "--check",
+        )
+        self.assertEqual(readonly.returncode, 1)
+        self.assertIn("writable lvalue", readonly.stderr)
+        pointer = self.compile(
+            "alias R=std::Result<i32,i32>; bool wrong(R* p){return p.has_value();}",
+            "--check",
+        )
+        self.assertEqual(pointer.returncode, 1)
+
+    def test_result_wrong_case_selects_contract_failure(self):
+        alias = """
+            alias R=std::Result<i32,i32>;
+            alias Empty=std::Result<void,i32>;
+        """
+        for body in (
+            "R item(R::Err(7));return item.value();",
+            "R item(R::Ok(7));return item.error();",
+            "Empty item(Empty::Err(7));item.value();return 42;",
+        ):
+            with self.subTest(body=body):
+                self.assertEqual(
+                    self.program(
+                        alias + "i32 main(){" + body + "}", "--preset=Release"
+                    ),
+                    -signal.SIGILL,
+                )
+        wrong = self.compile(
+            alias
+            + """
+                constexpr i32 invalid() { R r(R::Err(7)); return r.value(); }
+                constexpr i32 required(invalid());
+            """,
+            "--check",
+        )
+        self.assertEqual(wrong.returncode, 1)
+        self.assertIn("inactive case in constant evaluation", wrong.stderr)
+
+    def test_result_payload_reference_keeps_the_selected_generation(self):
+        self.assertEqual(
+            self.program(
+                """
+                alias R=std::Result<i32,i32>;
+                i32 main() {
+                    R item(R::Ok(7));
+                    auto extent(storage_of(item));
+                    i32& previous(item.value());
+                    destroy(item);
+                    auto current(construct_at<R>(extent,R::Ok(42)));
+                    if (current->value() != 42) { return 1; }
+                    return previous;
+                }
+                """,
+                "--preset=Release",
+            ),
+            -signal.SIGILL,
+        )
+
     def test_scalar_domain_conversions_use_exact_integer_values(self):
         source = """
             enum Band:i8 {case Below(-2),case Above(2)};
@@ -6549,6 +6827,81 @@ class CompilerTests(unittest.TestCase):
             """),
             42,
         )
+
+    def test_consteval_array_element_replacement_retains_its_cleanup_rank(self):
+        self.assertEqual(
+            self.program("""
+                struct Original {
+                    i32* trace;
+                    i32 digit;
+                    Original(i32* counter,i32 value) {
+                        init trace(counter);
+                        init digit(value);
+                    }
+                    ~Original(){*trace=*trace*10+digit;}
+                };
+                struct Replacement {
+                    i32* trace;
+                    Replacement(i32* counter){init trace(counter);}
+                    ~Replacement(){*trace=*trace*10+9;}
+                };
+                consteval i32 fold(){
+                    i32 trace;
+                    {
+                        Original[3] values(
+                            Original(&trace,1),Original(&trace,2),Original(&trace,3));
+                        auto whole(storage_of(values));
+                        auto middle(storage_of(values[1]));
+                        auto first(storage_of(values[0]));
+                        if(middle.identity()==first.identity()
+                           || whole.identity()==middle.identity()){return 0;}
+                        destroy(values[1]);
+                        auto current(construct_at<Replacement>(middle,&trace));
+                        auto current_extent(storage_of(*current));
+                        if(current_extent.identity()!=middle.identity()
+                           || values[0].digit!=1){return 0;}
+                    }
+                    return trace;
+                }
+                constexpr i32 retired(fold());
+                i32 main(){return retired==2391 ? 42 : 0;}
+            """),
+            42,
+        )
+
+    def test_consteval_array_element_generation_and_extent_bounds(self):
+        for body, message in (
+            (
+                "i32[2] a; i32* old(&a[0]); destroy(a[0]);"
+                "construct_at<i32>(storage_of(a[0]),42); return *old;",
+                "ended object generation",
+            ),
+            (
+                "i32[2][2] a; auto row(storage_of(a[0]));"
+                "auto child(storage_of(a[0][0])); destroy(a[0]);"
+                "construct_at<i32[2]>(row); construct_at<i32>(child,42);return 0;",
+                "ended object generation",
+            ),
+            (
+                "i8[16] a; destroy(a[0]);"
+                "construct_at<i64>(storage_of(a[0]),42);return 0;",
+                "insufficient storage capacity",
+            ),
+            (
+                "i32[2] a; destroy(a[0]);"
+                "construct_at<i32>(storage_of(a[0]),42);"
+                "i32[2] copy(a);return copy[0];",
+                "ended element generation",
+            ),
+        ):
+            with self.subTest(body=body):
+                result = self.compile(
+                    "consteval i32 rejected(){" + body + "}"
+                    "constexpr i32 value(rejected());",
+                    "--check",
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
     def test_consteval_reconstructs_automatic_storage_and_retires_current_type(self):
         self.assertEqual(

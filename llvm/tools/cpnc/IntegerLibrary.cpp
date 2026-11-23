@@ -30,7 +30,7 @@ struct BitInterface {
 struct NumericOperation {
   Operation Op;
   Projection Policy;
-  bool Result = false, Assign = false;
+  bool Result = false, Assign = false, Report = false;
   bool unary() const {
     return Op == Operation::Neg || Op == Operation::Abs ||
            Op == Operation::Magnitude || Op == Operation::Cast;
@@ -44,7 +44,7 @@ struct NumericOperation {
            Op == Operation::EuclideanMod;
   }
   bool destination() const {
-    return !Assign && Policy != Projection::Ordinary &&
+    return !Assign && !Report && Policy != Projection::Ordinary &&
            Op != Operation::LogicalShr && Op != Operation::Magnitude;
   }
 };
@@ -85,6 +85,17 @@ std::optional<NumericOperation> lookupOperation(StringRef Name) {
     return NumericOperation{Operation::Abs, Projection::Ordinary};
   if (Name == "magnitude")
     return NumericOperation{Operation::Magnitude, Projection::Wrapping};
+  if (Name.consume_front("report_")) {
+    auto Op = llvm::StringSwitch<std::optional<Operation>>(Name)
+                  .Case("add", Operation::Add)
+                  .Case("sub", Operation::Sub)
+                  .Case("mul", Operation::Mul)
+                  .Case("div", Operation::Div)
+                  .Default(std::nullopt);
+    if (!Op)
+      return std::nullopt;
+    return NumericOperation{*Op, Projection::Checked, false, false, true};
+  }
   bool Result = Name.consume_front("try_");
   if (Name == "logical_shr")
     return NumericOperation{Operation::LogicalShr, Projection::Checked, Result};
@@ -140,19 +151,32 @@ llvm::Constant *numericError(Context &U, StringRef Code) {
       U.Globals.at(("std::numeric::NumericErrorCode::" + Code).str()).IR);
 }
 
-Value numericResult(Frame &F, const Token &At, const std::string &ResultType,
-                    llvm::Value *Number, llvm::Value *Failed, llvm::Value *Code,
-                    llvm::Value *Inexact, llvm::Value *Clamped,
-                    llvm::Value *Wrapped, llvm::function_ref<void()> Commit) {
-  const auto Type =
-      F.resolve("::std::numeric::NumericResult<" + ResultType + ">", At);
-  const auto &Ok = F.U.Cases.at(Type + "::Ok");
-  const auto &Err = F.U.Cases.at(Type + "::Err");
+llvm::Value *numericStatus(Frame &F, llvm::Value *Inexact, llvm::Value *Clamped,
+                           llvm::Value *Wrapped, llvm::Value *FPFlags) {
   auto *StatusType = F.U.ir("std::numeric::NumericStatus");
   llvm::Value *Status = llvm::Constant::getNullValue(StatusType);
   Status = F.B.CreateInsertValue(Status, Inexact, 0);
   Status = F.B.CreateInsertValue(Status, Clamped, 1);
   Status = F.B.CreateInsertValue(Status, Wrapped, 2);
+  if (FPFlags) {
+    auto *FlagsType = F.U.ir("std::numeric::FPFlagSet");
+    auto *Flags = F.B.CreateInsertValue(llvm::Constant::getNullValue(FlagsType),
+                                        FPFlags, 0);
+    Status = F.B.CreateInsertValue(Status, Flags, 4);
+  }
+  return Status;
+}
+
+Value numericResult(Frame &F, const Token &At, const std::string &ResultType,
+                    llvm::Value *Number, llvm::Value *Failed, llvm::Value *Code,
+                    llvm::Value *Inexact, llvm::Value *Clamped,
+                    llvm::Value *Wrapped, llvm::function_ref<void()> Commit,
+                    llvm::Value *FPFlags = nullptr) {
+  const auto Type =
+      F.resolve("::std::numeric::NumericResult<" + ResultType + ">", At);
+  const auto &Ok = F.U.Cases.at(Type + "::Ok");
+  const auto &Err = F.U.Cases.at(Type + "::Err");
+  auto *Status = numericStatus(F, Inexact, Clamped, Wrapped, FPFlags);
   auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Failed);
   if (!F.IR) {
     if (!Known)
@@ -201,6 +225,88 @@ Value numericResult(Frame &F, const Token &At, const std::string &ResultType,
     F.B.SetInsertPoint(Done);
   }
   return F.callResult(Type, nullptr, At, Storage);
+}
+
+Value floatingResult(Frame &F, const Node &Call, const NumericOperation &Spec,
+                     Value Left, Value Right) {
+  if (Spec.Policy != Projection::Checked || Spec.Assign ||
+      !Call.TemplateArgs.empty())
+    fail(Call.At, "floating operation does not accept these arguments");
+  Node Binary{Node::Binary, Call.At};
+  switch (Spec.Op) {
+  case Operation::Add:
+    Binary.Text = "+";
+    break;
+  case Operation::Sub:
+    Binary.Text = "-";
+    break;
+  case Operation::Mul:
+    Binary.Text = "*";
+    break;
+  case Operation::Div:
+    Binary.Text = "/";
+    break;
+  default:
+    fail(Call.At, "no corresponding floating operation");
+  }
+  llvm::Value *Events = nullptr;
+  auto Number = F.floatingBinary(Binary, Left, Right, "", &Events);
+  auto &B = F.B;
+  auto *Inexact = B.CreateIsNotNull(B.CreateAnd(Events, 32));
+  // FPFlagSet uses five consecutive bits. MXCSR bit 1 is reserved here
+  // because denormal inputs are not a CPN26 IEEE event.
+  auto *DenseFlags = B.CreateOr(B.CreateAnd(Events, 1),
+                                B.CreateLShr(B.CreateAnd(Events, 0x3c), 1));
+  auto *Flags = B.CreateTrunc(DenseFlags, B.getInt8Ty());
+  if (Spec.Report) {
+    const auto Type = F.resolve(
+        "::std::numeric::NumericReport<" + Number.Type + ">", Call.At);
+    auto *Ty = F.U.ir(Type);
+    auto *Status = numericStatus(F, Inexact, B.getFalse(), B.getFalse(), Flags);
+    if (!F.IR) {
+      auto *Image =
+          llvm::ConstantStruct::get(llvm::cast<llvm::StructType>(Ty),
+                                    {llvm::cast<llvm::Constant>(Number.IR),
+                                     llvm::cast<llvm::Constant>(Status)});
+      Value Result{Type, Image};
+      Result.Prvalue = Result.Expiring = true;
+      return Result;
+    }
+    auto *Storage = F.resultAddress(Type, Call.At);
+    B.CreateStore(Number.IR, B.CreateStructGEP(Ty, Storage, 0));
+    B.CreateStore(Status, B.CreateStructGEP(Ty, Storage, 1));
+    return F.callResult(Type, nullptr, Call.At, Storage);
+  }
+  auto *Selected = B.CreateAnd(Events, F.Opt.FPResultMask);
+  auto *Failed = B.CreateIsNotNull(Selected);
+  if (F.Opt.FPRequireFinite) {
+    const bool Single = Number.Type == "f32";
+    const uint64_t Exponent = Single ? 0x7f800000ULL : 0x7ff0000000000000ULL;
+    auto *Bits = B.CreateBitCast(Number.IR, B.getIntNTy(Single ? 32 : 64));
+    auto *Mask = llvm::ConstantInt::get(Bits->getType(), Exponent);
+    auto *NonFinite = B.CreateICmpEQ(B.CreateAnd(Bits, Mask), Mask);
+    Failed = B.CreateOr(Failed, NonFinite);
+  }
+  if (!Spec.Result) {
+    if (!F.IR && !llvm::cast<llvm::ConstantInt>(Failed)->isZero())
+      fail(Call.At, "floating operation traps in constant evaluation");
+    F.guard(Failed, "numeric");
+    return Number;
+  }
+
+  // Check the lowest priority first so the highest selected event wins.
+  llvm::Value *Code = numericError(F.U, "NonFinite");
+  for (const auto &[Bit, Name] :
+       std::array<std::pair<unsigned, StringRef>, 5>{{{32, "Inexact"},
+                                                      {16, "Underflow"},
+                                                      {8, "Overflow"},
+                                                      {4, "DivideByZero"},
+                                                      {1, "Invalid"}}}) {
+    auto *Raised = B.CreateIsNotNull(B.CreateAnd(Selected, Bit));
+    Code = B.CreateSelect(Raised, numericError(F.U, Name), Code);
+  }
+  return numericResult(F, Call.At, Number.Type, Number.IR, Failed, Code,
+                       Inexact, B.getFalse(), B.getFalse(), {}, Flags);
 }
 
 Value numericTarget(Frame &F, const Node &Arg) {
@@ -503,6 +609,10 @@ void Context::bindNumericLibrary() {
           NumericStatus& operator=(const<NumericStatus>& other)=default;
           NumericStatus& operator=(NumericStatus&& other)=default;
         };
+        generic<type T> struct NumericReport {
+          T value;
+          NumericStatus status;
+        };
         generic<type T> union NumericResult {
           case Ok(T value, NumericStatus status);
           case Err(NumericErrorCode code, NumericStatus status);
@@ -540,7 +650,7 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
   auto Spec = lookupOperation(Name);
   if (!Spec)
     return std::nullopt;
-  const auto &[Op, Policy, Fallible, Assign] = *Spec;
+  const auto &[Op, Policy, Fallible, Assign, Report] = *Spec;
   if (Args.size() != (Spec->unary() ? 1u : 2u) ||
       Call.TemplateArgs.size() > (Spec->destination() ? 1u : 0u) ||
       (Op == Operation::Cast && Call.TemplateArgs.empty()))
@@ -551,13 +661,21 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
     Target = numericTarget(*this, Args.front());
   else
     Left = load(eval(Args.front()));
+  if (Left.Type == "never")
+    return Value{"never"};
   Value Right;
   if (!Spec->unary())
     Right = load(eval(Args[1]));
   if (Assign)
     Left = load(Target);
-  if (Left.Type == "never" || Right.Type == "never")
+  if (Right.Type == "never")
     return Value{"never"};
+  if (floating(Left.Type) || Left.Type == "real" || floating(Right.Type) ||
+      Right.Type == "real")
+    return floatingResult(*this, Call, *Spec, std::move(Left),
+                          std::move(Right));
+  if (Report)
+    fail(Call.At, "named floating report requires floating operands");
   if (!integer(Left.Type) || (!Spec->unary() && !integer(Right.Type)))
     fail(Call.At, "CFG002: named numeric operation requires an available "
                   "integer interface");

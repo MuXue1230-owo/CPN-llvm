@@ -1610,6 +1610,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   auto Name = C.Text;
   if (auto Memory = memoryCall(C, Args, Receiver))
     return *Memory;
+  if (auto Result = resultObserver(C, Args, Receiver))
+    return *Result;
   if (auto Scalar = scalarConversion(C, Name, Args))
     return *Scalar;
   if (InPredicate &&
