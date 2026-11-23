@@ -205,6 +205,13 @@ LANGSTANDARD(gnucxx29, "gnu++2d",
              LineComment | CPlusPlus | CPlusPlus11 | CPlusPlus14 | CPlusPlus17 |
              CPlusPlus20 | CPlusPlus23 | CPlusPlus26 | CPlusPlus29 | Digraphs | HexFloat | GNUMode, 202700)
 
+// CPN currently uses the C++26 implementation as its experimental bootstrap.
+LANGSTANDARD(cpn26, "cpn26",
+             CPN, "CPN26 experimental bootstrap",
+             LineComment | CPlusPlus | CPlusPlus11 | CPlusPlus14 | CPlusPlus17 |
+             CPlusPlus20 | CPlusPlus23 | CPlusPlus26 | Digraphs | HexFloat,
+             std::nullopt)
+
 // OpenCL
 LANGSTANDARD(opencl10, "cl1.0",
              OpenCL, "OpenCL 1.0",

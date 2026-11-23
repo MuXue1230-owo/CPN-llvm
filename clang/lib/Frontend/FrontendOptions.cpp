@@ -17,6 +17,8 @@ InputKind FrontendOptions::getInputKindForExtension(StringRef Extension) {
       .Cases({"ast", "pcm"},
              InputKind(Language::Unknown, InputKind::Precompiled))
       .Case("c", Language::C)
+      .Case("cpn", Language::CPN)
+      .Case("cpni", InputKind(Language::CPN).getPreprocessed())
       .Cases({"S", "s"}, Language::Asm)
       .Case("i", InputKind(Language::C).getPreprocessed())
       .Case("ii", InputKind(Language::CXX).getPreprocessed())

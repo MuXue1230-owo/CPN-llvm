@@ -1150,6 +1150,8 @@ bool CompilerInstance::parseLLVMArgs(raw_ostream *Errs) {
 /// Determine the appropriate source input kind based on language
 /// options.
 static Language getLanguageFromOptions(const LangOptions &LangOpts) {
+  if (LangOpts.CPN)
+    return Language::CPN;
   if (LangOpts.OpenCL)
     return Language::OpenCL;
   if (LangOpts.CUDA)

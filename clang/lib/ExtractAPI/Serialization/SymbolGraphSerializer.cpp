@@ -204,6 +204,8 @@ StringRef getLanguageName(Language Lang) {
     return "objective-c";
   case Language::CXX:
     return "c++";
+  case Language::CPN:
+    return "cpn";
   case Language::ObjCXX:
     return "objective-c++";
 

@@ -2486,7 +2486,9 @@ InputKind ASTUnit::getInputKind() const {
   auto &LangOpts = getLangOpts();
 
   Language Lang;
-  if (LangOpts.OpenCL)
+  if (LangOpts.CPN)
+    Lang = Language::CPN;
+  else if (LangOpts.OpenCL)
     Lang = Language::OpenCL;
   else if (LangOpts.CUDA)
     Lang = Language::CUDA;

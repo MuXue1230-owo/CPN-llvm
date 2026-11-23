@@ -6888,11 +6888,10 @@ void Clang::ConstructJob(Compilation &C, const JobAction &JA,
                                   /*Joined=*/true);
       } else
         ImplyVCPPCVer = true;
-    }
-    else if (IsWindowsMSVC)
+    } else if (IsWindowsMSVC && !types::isCPN(InputType))
       ImplyVCPPCXXVer = true;
 
-    if (IsSYCL && types::isCXX(InputType) &&
+    if (IsSYCL && types::isCXX(InputType) && !types::isCPN(InputType) &&
         !Args.hasArg(options::OPT__SLASH_std) && !IsWindowsMSVC)
       // For SYCL, we default to -std=c++17 for all compilations. Use of -std
       // on the command line will override. On Windows MSVC, this is handled

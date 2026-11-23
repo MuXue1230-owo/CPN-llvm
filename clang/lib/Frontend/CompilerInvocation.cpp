@@ -3028,6 +3028,9 @@ static void GenerateFrontendArgs(const FrontendOptions &Opts,
     case Language::CXX:
       Lang = "c++";
       break;
+    case Language::CPN:
+      Lang = "cpn";
+      break;
     case Language::ObjC:
       Lang = "objective-c";
       break;
@@ -3273,6 +3276,7 @@ static bool ParseFrontendArgs(FrontendOptions &Opts, ArgList &Args,
                 .Case("cuda", Language::CUDA)
                 .Case("hip", Language::HIP)
                 .Case("c++", Language::CXX)
+                .Case("cpn", Language::CPN)
                 .Case("objective-c", Language::ObjC)
                 .Case("objective-c++", Language::ObjCXX)
                 .Case("hlsl", Language::HLSL)
@@ -3730,6 +3734,9 @@ static bool IsInputCompatibleWithStandard(InputKind IK,
   case Language::ObjCXX:
     return S.getLanguage() == Language::CXX;
 
+  case Language::CPN:
+    return S.getLanguage() == Language::CPN;
+
   case Language::CUDA:
     // FIXME: What -std= values should be permitted for CUDA compilations?
     return S.getLanguage() == Language::CUDA ||
@@ -3760,6 +3767,8 @@ static StringRef GetInputKindName(InputKind IK) {
     return "Objective-C";
   case Language::CXX:
     return "C++";
+  case Language::CPN:
+    return "CPN";
   case Language::ObjCXX:
     return "Objective-C++";
   case Language::OpenCL:
@@ -4166,7 +4175,10 @@ bool CompilerInvocation::ParseLangArgs(LangOptions &Opts, ArgList &Args,
             .Cases({"clc++2021", "CLC++2021"}, LangStandard::lang_openclcpp2021)
             .Default(LangStandard::lang_unspecified);
 
-    if (OpenCLLangStd == LangStandard::lang_unspecified) {
+    if (IK.getLanguage() == Language::CPN) {
+      Diags.Report(diag::err_drv_argument_not_allowed_with)
+          << A->getAsString(Args) << GetInputKindName(IK);
+    } else if (OpenCLLangStd == LangStandard::lang_unspecified) {
       Diags.Report(diag::err_drv_invalid_value)
         << A->getAsString(Args) << A->getValue();
     }

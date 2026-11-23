@@ -77,8 +77,11 @@ namespace types {
   /// input can be processed by -fminimize-whitespace.
   bool isDerivedFromC(ID Id);
 
-  /// isCXX - Is this a "C++" input (C++ and Obj-C++ sources and headers).
+  /// Uses C++ frontend defaults, including the experimental CPN bootstrap.
   bool isCXX(ID Id);
+
+  /// Is this a CPN source or preprocessed input.
+  bool isCPN(ID Id);
 
   /// Is this LLVM IR.
   bool isLLVMIR(ID Id);
