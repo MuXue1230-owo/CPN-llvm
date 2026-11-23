@@ -273,6 +273,12 @@ struct Checker {
     auto Name = llvm::StringRef(N.Text);
     if (Name == "this")
       return HasReceiver;
+    auto RootName = Name;
+    RootName.consume_front("::");
+    if (RootName == "std::to_underlying" ||
+        RootName == "std::from_underlying" ||
+        RootName == "std::try_from_underlying")
+      return true;
     if (Name == "true" || Name == "false" || Name == "nullptr" ||
         Name == "std::move" || Name == "std::forward" ||
         builtinPredicate(Name) || builtin(Name) || Names.constraint(N.Text) ||

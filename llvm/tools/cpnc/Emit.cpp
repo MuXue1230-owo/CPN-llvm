@@ -186,20 +186,26 @@ void Frame::bindParams() {
       Scopes[0].Names[parameterBinding(F->Decl, J)] = V;
   }
 }
-void Frame::bindInlineParams(const std::vector<Value> &Actual) {
+void Frame::bindInlineParams(const std::vector<Value> &Actual,
+                             const Function *DefaultDeclaration,
+                             Value *DefaultReceiver) {
+  const auto &Declaration = DefaultDeclaration ? *DefaultDeclaration : *F;
   Local Defaults;
   for (size_t I = 0; I < F->Params.size(); ++I) {
     const auto &Type = F->Params[I];
     const auto &Param = F->Decl.Params[I];
-    const auto &Default = F->DefaultParams[I];
+    const auto &Default = Declaration.DefaultParams[I];
     Value V;
     if (I < Actual.size())
       V = Actual[I];
     else {
-      llvm::SaveAndRestore Policy(Opt, F->Defaults.Configuration);
-      llvm::SaveAndRestore Limit(LookupLimit, F->Defaults.Through);
-      llvm::SaveAndRestore Namespace(Prefix, F->DefaultPrefix);
-      llvm::SaveAndRestore Bindings(Env, F->DefaultEnv);
+      llvm::SaveAndRestore Policy(Opt, Declaration.Defaults.Configuration);
+      llvm::SaveAndRestore Limit(LookupLimit, Declaration.Defaults.Through);
+      llvm::SaveAndRestore Namespace(Prefix, Declaration.DefaultPrefix);
+      llvm::SaveAndRestore Bindings(Env, Declaration.DefaultEnv);
+      llvm::SaveAndRestore Receiver(ConstantReceiver, DefaultReceiver
+                                                          ? DefaultReceiver
+                                                          : ConstantReceiver);
       Scopes.push_back(Defaults);
       if (ends(Type, "&") && Default.Children.size() == 1)
         V = bindReference(eval(Default.Children.front()), Type, Default.At);
@@ -399,9 +405,7 @@ std::string Frame::unevaluatedType(const Node &N, bool IncludeCategory) {
   Probe.Self = Self;
   Probe.B.SetInsertPoint(Probe.block("entry"));
   auto V = Probe.eval(N);
-  auto T = V.Type == "integer" ? Opt.DefaultInt
-           : V.Type == "real"  ? Opt.DefaultReal
-                               : V.Type;
+  auto T = Probe.materializationType(V.Type, N.At);
   if (IncludeCategory && V.Readonly)
     T = qualifyConst(T);
   if (IncludeCategory && V.Address && !V.Prvalue)
@@ -585,8 +589,8 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
         if (callableFlag(Source, " whole") && !callableFlag(Target, " whole"))
           fail(N.At, "function pointer must preserve lifecycle_effect(whole)");
         if (!U.compatibleCallable(Source, Target))
-          fail(N.At, "incompatible function-pointer borrow contract");
-        return {Expected, Match->IR};
+          fail(N.At, "incompatible function-pointer effect or borrow contract");
+        return {Expected, U.foreignContractEntry(*Match)};
       }
       auto V = place(A[0]);
       Value P{(V.Readonly ? qualifyConst(V.Type) : V.Type) + "*", V.Address};
@@ -680,7 +684,9 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       return binary(Sub, literal(0), V);
     }
     if (V.Type == "integer")
-      V = convert(V, Expected.empty() ? Opt.DefaultInt : Expected, N.At);
+      V = convert(
+          V, Expected.empty() ? materializationType(V.Type, N.At) : Expected,
+          N.At);
     return {V.Type, B.CreateNot(V.IR)};
   }
   case Node::Conditional:
@@ -776,7 +782,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
               ? Y.Type
               : X.Type;
       if (T == "integer")
-        T = Expected.empty() ? Opt.DefaultInt : Expected;
+        T = Expected.empty() ? materializationType(T, N.At) : Expected;
       bool OwnedResult = U.aggregate(T) && (X.Prvalue || Y.Prvalue);
       auto finishArm = [&](Value V, std::vector<Value> &Owned,
                            llvm::BasicBlock *&Exit) {
@@ -940,8 +946,9 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     }
     if (L.Type == "integer" && R.Type == "integer" &&
         (Op == "&" || Op == "|" || Op == "^" || Op == "<<" || Op == ">>")) {
-      auto T = integer(Expected) && Expected != "integer" ? Expected
-                                                          : Opt.DefaultInt;
+      auto T = integer(Expected) && Expected != "integer"
+                   ? Expected
+                   : materializationType(L.Type, N.At);
       L = convert(L, T, N.At);
       if (Op != "<<" && Op != ">>")
         R = convert(R, T, N.At);
@@ -1286,21 +1293,25 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     return V;
   }
   if (!IR || D.Decl.Settings.count("mode")) {
-    if (!D.Decl.Required || D.Decl.Prototype)
-      fail(T, "constant expression requires a constexpr function");
     ConstantActivation Activation(U, T);
-    Frame CF(U, &D, nullptr);
-    if (!D.Owner.empty() && !D.isStatic()) {
+    auto StaticReceiver = Receiver;
+    auto &Target =
+        !IR && D.Slot >= 0 ? constantVirtualTarget(D, Receiver, T) : D;
+    if (!Target.Decl.Required || Target.Decl.Prototype)
+      fail(T, "constant expression requires a constexpr function");
+    Frame CF(U, &Target, nullptr);
+    if (!Target.Owner.empty() && !Target.isStatic()) {
       if (!llvm::isa_and_nonnull<llvm::Constant>(Receiver.IR))
         fail(T, "constant receiver required");
-      Receiver.Readonly |= D.Decl.Const;
+      Receiver.Readonly |= Target.Decl.Const;
       CF.ConstantReceiver = &Receiver;
     }
-    CF.bindInlineParams(Actual);
+    CF.bindInlineParams(
+        Actual, &D, StaticReceiver.Type.empty() ? nullptr : &StaticReceiver);
     CF.checkMethodInvariant(true);
     CF.checkContracts(true);
     try {
-      CF.stmt(D.Decl.Children.front());
+      CF.stmt(Target.Decl.Children.front());
     } catch (const ConstantTransfer &R) {
       if (R.Kind != Node::Return)
         throw;
@@ -1309,7 +1320,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
       CF.checkMethodInvariant(false);
       return R.Result;
     }
-    if (D.Result == "void") {
+    if (Target.Result == "void") {
       CF.checkContracts(false);
       CF.endConstantScope();
       CF.checkMethodInvariant(false);
@@ -1381,7 +1392,8 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     }
   }
   auto *Before = wholeEpoch();
-  llvm::Value *Target = Receiver.BaseView && D.BaseIR ? D.BaseIR : D.IR;
+  llvm::Value *Target =
+      Receiver.BaseView && D.BaseIR ? D.BaseIR : U.foreignContractEntry(D);
   if (D.Slot >= 0) {
     auto &R = U.Records.at(D.Owner);
     auto *Vptr = B.CreateStructGEP(R.IR, Receiver.Address, R.Fields.size());
@@ -1401,6 +1413,7 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   if (D.Slot >= 0)
     describeEffectCall(*Call, D.Effects, ResultStorage ? 1 : 0, true, D.IR);
   Call->setAttributes(D.IR->getAttributes());
+  Call->setCallingConv(D.IR->getCallingConv());
   if (D.Result == "never")
     return endDivergentCall();
   closePointerCall(Metadata);
@@ -1547,6 +1560,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
   auto Name = C.Text;
+  if (auto Scalar = scalarConversion(C, Name, Args))
+    return *Scalar;
   if (InPredicate &&
       (Name == "destroy" || Name == "abandon" || Name == "construct_at" ||
        Name == "storage_of" || Name == "destroy_base" ||
@@ -2177,7 +2192,9 @@ void Frame::object(const Node &N, bool Global) {
       Init.object(D, true);
       U.Statics.emplace_back(ID, D);
     }
-    Scopes.back().Names[N.Text] = U.Globals.at(ID);
+    auto V = U.Globals.at(ID);
+    V.DeclaredAt = {N.At.Line, N.At.Column};
+    Scopes.back().Names[N.Text] = std::move(V);
     return;
   }
   auto names = [&]() -> std::map<std::string, Value> & {
@@ -2198,8 +2215,10 @@ void Frame::object(const Node &N, bool Global) {
     Tail = &N.Children.back();
     Args.pop_back();
   }
-  if (!Existing)
-    names()[Name] = {};
+  if (!Existing) {
+    auto &Cell = names()[Name];
+    Cell.DeclaredAt = {N.At.Line, N.At.Column};
+  }
   if (Global && ends(Ty, "&")) {
     if (N.Foreign)
       fail(N.At, "no C ABI transport for a reference object");
@@ -2215,11 +2234,7 @@ void Frame::object(const Node &N, bool Global) {
       fail(N.At, "thread-local storage is unavailable on this configuration");
     llvm::GlobalVariable *G = nullptr;
     if (Ty == "auto") {
-      Ty = constantEval(Args.at(0)).Type;
-      if (Ty == "real")
-        Ty = Opt.DefaultReal;
-      if (Ty == "integer")
-        Ty = Opt.DefaultInt;
+      Ty = materializationType(constantEval(Args.at(0)).Type, N.At);
     }
     auto *LT = U.ir(Ty, N.At);
     if (!LT->isSized())
@@ -2262,7 +2277,9 @@ void Frame::object(const Node &N, bool Global) {
       auto V = construct(Ty, Args, N.At, nullptr, Tail);
       endExpression();
       G->setInitializer(llvm::cast<llvm::Constant>(V.IR));
-      G->setConstant(Readonly);
+      // A const source object can still change its hidden dispatch state
+      // between active destructor layers.
+      G->setConstant(Readonly && !containsDispatchState(Ty));
       StaticConstant = N.Required ? V.IR : nullptr;
       if (N.Required)
         U.ConstantObjects.insert(G);
@@ -2350,6 +2367,7 @@ void Frame::object(const Node &N, bool Global) {
     } else
       V = place(Args[0]);
     V = bindReference(V, Ty, N.At);
+    V.DeclaredAt = {N.At.Line, N.At.Column};
     names()[Name] = V;
     return;
   }
@@ -2357,15 +2375,16 @@ void Frame::object(const Node &N, bool Global) {
     auto V = Ty == "auto" ? constantEval(Args.at(0))
                           : construct(Ty, Args, N.At, nullptr, Tail);
     if (V.Type == "real")
-      V = floatingConvert(V, Opt.DefaultReal, N.At);
+      V = floatingConvert(V, materializationType(V.Type, N.At), N.At);
     if (V.Type == "integer")
-      V = convert(V, Opt.DefaultInt, N.At);
+      V = convert(V, materializationType(V.Type, N.At), N.At);
     consume(V);
     V.Readonly = Readonly;
     V.Location.reset();
     V.ConstantTemporary.reset();
     V.Prvalue = V.Expiring = false;
     V.Address = nullptr;
+    V.DeclaredAt = {N.At.Line, N.At.Column};
     names()[Name] = V;
     if (U.aggregate(V.Type))
       Scopes.back().ConstantDrops.push_back(Name);
@@ -2383,9 +2402,7 @@ void Frame::object(const Node &N, bool Global) {
     V = Ty == "auto" ? CF.constantEval(Args.at(0))
                      : CF.construct(Ty, Args, N.At, nullptr, Tail);
     if (Ty == "auto")
-      Ty = V.Type == "integer" ? Opt.DefaultInt
-           : V.Type == "real"  ? Opt.DefaultReal
-                               : V.Type;
+      Ty = materializationType(V.Type, N.At);
     V = CF.convert(V, Ty, N.At);
     if (carriesPointerBounds(Ty) && !Args.empty()) {
       auto Runtime = convert(eval(Args.front(), Ty), Ty, N.At);
@@ -2397,9 +2414,7 @@ void Frame::object(const Node &N, bool Global) {
     B.CreateStore(V.IR, Ptr);
   } else if (Ty == "auto") {
     V = eval(Args.at(0));
-    Ty = V.Type == "integer" ? Opt.DefaultInt
-         : V.Type == "real"  ? Opt.DefaultReal
-                             : V.Type;
+    Ty = materializationType(V.Type, N.At);
     V = convert(V, Ty, N.At);
     if (V.Prvalue && V.Address) {
       Ptr = V.Address;
@@ -2445,15 +2460,115 @@ void Frame::constructorBody(const Node &Body) {
     endConstantScope();
   }
 }
-void Frame::stmt(const Node &N) {
+namespace {
+const Node *enteredLabel(const Node &N, StringRef Label) {
+  if (N.K == Node::Label && N.Text == Label)
+    return &N;
+  // These constructs have separate execution regions or binding scopes that
+  // an incoming goto cannot enter.
+  if (N.K == Node::Lambda || N.K == Node::Match || N.K == Node::Tail ||
+      N.K == Node::Record || N.K == Node::Union || N.K == Node::Enumeration)
+    return nullptr;
+  for (const auto &Child : N.Children)
+    if (auto *Found = enteredLabel(Child, Label))
+      return Found;
+  return nullptr;
+}
+
+bool isLocalTypeDeclaration(const Node &N) {
+  if (N.K == Node::Configured || N.K == Node::Label)
+    return isLocalTypeDeclaration(N.Children.front());
+  return N.K == Node::Alias || N.K == Node::Record || N.K == Node::Union ||
+         N.K == Node::Enumeration;
+}
+} // namespace
+
+void Frame::rewindConstantScope(const ConstantTransfer &Jump,
+                                const Token &Destination) {
+  auto &Scope = Scopes.back();
+  const auto &Exited =
+      F->ExitedLifetimes.Exited.at({Jump.At.Line, Jump.At.Column});
+  // Nested scopes have already been retired while unwinding the jump. The
+  // remaining departed objects in this scope form a suffix in construction
+  // order.
+  while (!Scope.ConstantDrops.empty()) {
+    const auto &V = Scope.Names.at(Scope.ConstantDrops.back());
+    if (!Exited.count(V.DeclaredAt))
+      break;
+    constantDrop(V, Jump.At);
+    Scope.ConstantDrops.pop_back();
+  }
+  for (auto I = Scope.Names.begin(); I != Scope.Names.end();) {
+    if (Exited.count(I->second.DeclaredAt))
+      I = Scope.Names.erase(I);
+    else
+      ++I;
+  }
+  SourcePosition To{Destination.Line, Destination.Column};
+  for (auto I = Scope.ConstantTypeSites.begin();
+       I != Scope.ConstantTypeSites.end();) {
+    if (I->second < To) {
+      ++I;
+      continue;
+    }
+    Scope.Aliases.erase(I->first);
+    Scope.Nominals.erase(I->first);
+    I = Scope.ConstantTypeSites.erase(I);
+  }
+}
+
+void Frame::constantSequence(llvm::ArrayRef<Node> Statements,
+                             StringRef EntryLabel) {
+  auto Find = [&](StringRef Name) -> std::pair<size_t, const Node *> {
+    for (size_t I = 0; I < Statements.size(); ++I)
+      if (auto *Target = enteredLabel(Statements[I], Name))
+        return {I, Target};
+    return {Statements.size(), nullptr};
+  };
+  auto BindTypes = [&](size_t From, size_t To) {
+    for (const auto &Skipped : Statements.slice(From, To - From))
+      if (isLocalTypeDeclaration(Skipped))
+        stmt(Skipped);
+  };
+
+  size_t I = 0;
+  std::string Pending = EntryLabel.str();
+  if (!Pending.empty()) {
+    I = Find(Pending).first;
+    BindTypes(0, I);
+  }
+  while (I < Statements.size()) {
+    try {
+      stmt(Statements[I], Pending);
+      Pending.clear();
+      ++I;
+    } catch (const ConstantTransfer &Jump) {
+      if (Jump.Kind != Node::Goto)
+        throw;
+      auto [Next, Destination] = Find(Jump.Label);
+      if (!Destination)
+        throw;
+      rewindConstantScope(Jump, Destination->At);
+      if (Next > I)
+        BindTypes(I + 1, Next);
+      Pending = Jump.Label;
+      I = Next;
+    }
+  }
+}
+
+void Frame::stmt(const Node &N, StringRef EntryLabel) {
   auto &A = N.Children;
   auto Label = std::move(StatementLabel);
   StatementLabel.clear();
   if (N.K == Node::Block || N.K == Node::Tail) {
     Scopes.emplace_back();
     try {
-      for (auto &S : A)
-        stmt(S);
+      if (!IR)
+        constantSequence(A, EntryLabel);
+      else
+        for (auto &S : A)
+          stmt(S);
     } catch (const ConstantTransfer &) {
       if (!IR)
         endConstantScope();
@@ -2471,6 +2586,9 @@ void Frame::stmt(const Node &N) {
     return;
   if (N.K == Node::Record || N.K == Node::Enumeration || N.K == Node::Union) {
     localType(N);
+    if (!IR)
+      Scopes.back().ConstantTypeSites.try_emplace(
+          N.Text, SourcePosition{N.At.Line, N.At.Column});
     return;
   }
   if (N.K == Node::Alias) {
@@ -2479,6 +2597,9 @@ void Frame::stmt(const Node &N) {
     if (Scope.Names.count(N.Text) ||
         !Scope.Aliases.emplace(N.Text, Type).second)
       fail(N.At, "duplicate declaration '" + N.Text + "'");
+    if (!IR)
+      Scope.ConstantTypeSites.try_emplace(
+          N.Text, SourcePosition{N.At.Line, N.At.Column});
     return;
   }
   if (N.K == Node::Object) {
@@ -2491,12 +2612,11 @@ void Frame::stmt(const Node &N) {
     return;
   }
   if (N.K == Node::Configured) {
-    auto Old = Opt;
+    llvm::SaveAndRestore Policy(Opt);
     configure(Opt, N,
               A[0].K == Node::Block ? ConfigScope::Block
                                     : ConfigScope::Declaration);
-    stmt(A[0]);
-    Opt = Old;
+    stmt(A[0], EntryLabel);
     return;
   }
   if (!IR && U.ConstantDepth)
@@ -2524,8 +2644,15 @@ void Frame::stmt(const Node &N) {
   if (N.K == Node::Return) {
     Value V{"void"};
     auto *Result = IR && F && U.aggregate(F->Result) ? IR->getArg(0) : nullptr;
-    if (!A.empty())
-      V = eval(A[0], F ? unconst(F->Result) : "", Result);
+    if (!A.empty()) {
+      const auto &Expr = A.front();
+      bool Designation = IR && F && ends(F->Result, "&") &&
+                         (Expr.K == Node::Name || Expr.K == Node::Member ||
+                          Expr.K == Node::Index ||
+                          (Expr.K == Node::Unary && Expr.Text == "*"));
+      V = Designation ? place(Expr)
+                      : eval(Expr, F ? unconst(F->Result) : "", Result);
+    }
     if (!F)
       fail(N.At, "return requires a function");
     if (V.Type == "never")
@@ -2592,6 +2719,19 @@ void Frame::stmt(const Node &N) {
     return;
   }
   if (N.K == Node::If) {
+    if (!EntryLabel.empty()) {
+      size_t Arm = enteredLabel(A[1], EntryLabel) ? 1 : 2;
+      if (N.Required) {
+        auto C = constantEval(A[0]);
+        if (C.Type != "bool")
+          fail(N.At, "condition requires bool");
+        endExpression();
+        if (llvm::cast<llvm::ConstantInt>(C.IR)->isZero() != (Arm == 2))
+          fail(N.At, "goto enters a discarded if constexpr branch");
+      }
+      stmt(A[Arm], EntryLabel);
+      return;
+    }
     auto C = N.Required ? constantEval(A[0]) : boolean(A[0]);
     if (C.Type != "bool")
       fail(N.At, "condition requires bool");
@@ -2607,6 +2747,7 @@ void Frame::stmt(const Node &N) {
       return;
     }
     bool Before = Live;
+    auto *Known = llvm::dyn_cast<llvm::ConstantInt>(C.IR);
     auto *Then = block("if.true"), *Else = block("if.false"),
          *End = block("if.end");
     B.CreateCondBr(C.IR, Then, Else);
@@ -2614,6 +2755,7 @@ void Frame::stmt(const Node &N) {
     auto Prior = Active;
     auto EntryPositions =
         Transaction ? Transaction->positions() : Construction::Positions{};
+    Live = Before && (!Known || !Known->isZero());
     stmt(A[1]);
     bool Y = Live;
     branch(End);
@@ -2623,42 +2765,62 @@ void Frame::stmt(const Node &N) {
     if (Transaction)
       Transaction->restore(EntryPositions);
     B.SetInsertPoint(Else);
-    Live = Before;
+    Live = Before && (!Known || Known->isZero());
     Active = Prior;
     if (A.size() > 2)
       stmt(A[2]);
     bool Z = Live;
     if (Transaction) {
       auto NoPositions = Transaction->positions();
-      if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR))
-        Transaction->restore(K->isZero() ? NoPositions : YesPositions);
-      else if (Y && Z) {
+      if (Y && Z) {
         NoPositions.insert(YesPositions.begin(), YesPositions.end());
         Transaction->restore(NoPositions);
       } else if (Y)
         Transaction->restore(YesPositions);
     }
     branch(End);
-    if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(C.IR)) {
-      if (!K->isZero()) {
-        Live = Y;
-        Active = TrueState;
-      } else
-        Live = Z;
-    } else {
-      if (Y && Z)
-        joinStorage(TrueState);
-      else if (Y)
-        Active = std::move(TrueState);
-      Live = Y || Z;
-    }
+    if (Y && Z)
+      joinStorage(TrueState);
+    else if (Y)
+      Active = std::move(TrueState);
+    Live = Y || Z;
     B.SetInsertPoint(End);
     return;
   }
   if (N.K == Node::Switch) {
+    auto RunArms = [&](size_t First, StringRef Start) {
+      for (size_t I = First; I && I < A.size(); ++I) {
+        auto Body = A[I].Children.back();
+        bool Fall = !Body.Children.empty() &&
+                    Body.Children.back().K == Node::Fallthrough;
+        if (Fall) {
+          if (I + 1 == A.size())
+            fail(A[I].At, "invalid final fallthrough");
+          Body.Children.pop_back();
+        }
+        try {
+          stmt(Body, Start);
+        } catch (const ConstantTransfer &T) {
+          if (T.Kind != Node::Break || (!T.Label.empty() && T.Label != Label))
+            throw;
+          break;
+        }
+        if (!Fall)
+          break;
+        Start = {};
+      }
+    };
+    if (!EntryLabel.empty()) {
+      for (size_t I = 1; I < A.size(); ++I)
+        if (enteredLabel(A[I].Children.back(), EntryLabel)) {
+          RunArms(I, EntryLabel);
+          return;
+        }
+      fail(N.At, "unknown statement label");
+    }
     auto S = eval(A[0]);
     if (S.Type == "integer")
-      S = convert(S, Opt.DefaultInt, N.At);
+      S = convert(S, materializationType(S.Type, N.At), N.At);
     endExpression();
     if (!integer(S.Type) && !U.Enums.count(S.Type))
       fail(N.At, "switch requires an integer");
@@ -2711,22 +2873,7 @@ void Frame::stmt(const Node &N) {
     }
     if (!IR) {
       Loops.pop_back();
-      for (size_t I = Selected ? Selected : Fallback; I && I < A.size(); ++I) {
-        auto Body = A[I].Children.back();
-        bool Fall = !Body.Children.empty() &&
-                    Body.Children.back().K == Node::Fallthrough;
-        if (Fall)
-          Body.Children.pop_back();
-        try {
-          stmt(Body);
-        } catch (const ConstantTransfer &T) {
-          if (T.Kind != Node::Break || (!T.Label.empty() && T.Label != Label))
-            throw;
-          break;
-        }
-        if (!Fall)
-          break;
-      }
+      RunArms(Selected ? Selected : Fallback, {});
       return;
     }
     if (Transaction)
@@ -2739,7 +2886,7 @@ void Frame::stmt(const Node &N) {
   if (!IR) {
     if (N.K == Node::Label) {
       StatementLabel = N.Text;
-      stmt(A[0]);
+      stmt(A[0], EntryLabel == N.Text ? StringRef{} : EntryLabel);
       return;
     }
     if (N.K == Node::Match) {
@@ -2749,13 +2896,14 @@ void Frame::stmt(const Node &N) {
     if (N.K == Node::For || N.K == Node::Do || N.K == Node::While) {
       bool For = N.K == Node::For, Do = N.K == Node::Do;
       Scopes.emplace_back();
-      if (For)
-        stmt(A[0]);
       try {
+        if (For && EntryLabel.empty())
+          stmt(A[0]);
         for (bool First = true;; First = false) {
           U.chargeConstant(N.At);
           auto &Test = A[For || Do ? 1 : 0];
-          if (!(Do && First) && Test.K != Node::Empty) {
+          if (!(First && (Do || !EntryLabel.empty())) &&
+              Test.K != Node::Empty) {
             bool Stop =
                 llvm::cast<llvm::ConstantInt>(boolean(Test).IR)->isZero();
             endExpression();
@@ -2763,7 +2911,7 @@ void Frame::stmt(const Node &N) {
               break;
           }
           try {
-            stmt(A[For ? 3 : Do ? 0 : 1]);
+            stmt(A[For ? 3 : Do ? 0 : 1], First ? EntryLabel : StringRef{});
           } catch (const ConstantTransfer &C) {
             if (!C.Label.empty() && C.Label != Label)
               throw;
@@ -2786,8 +2934,10 @@ void Frame::stmt(const Node &N) {
       Scopes.pop_back();
       return;
     }
-    if (N.K == Node::Break || N.K == Node::Continue)
-      throw ConstantTransfer{N.K, {}, N.Text};
+    if (N.K == Node::Goto && !F)
+      fail(N.At, "goto requires a function");
+    if (N.K == Node::Break || N.K == Node::Continue || N.K == Node::Goto)
+      throw ConstantTransfer{N.K, {}, N.Text, N.At};
     fail(N.At, "statement unavailable in constant evaluation");
   }
   if (N.K == Node::For || N.K == Node::While || N.K == Node::Do) {
@@ -2852,7 +3002,10 @@ void Frame::stmt(const Node &N) {
     if (!Target)
       Target = block("label." + N.Text);
     if (N.K == Node::Goto) {
-      const auto &Exited = F->ExitedLifetimes.at({N.At.Line, N.At.Column});
+      if (!F)
+        fail(N.At, "goto requires a function");
+      const auto &Exited =
+          F->ExitedLifetimes.Exited.at({N.At.Line, N.At.Column});
       cleanup(0, &Exited);
       exitInvariantConstructionLifetimes(0, &Exited);
       branch(Target);
@@ -2864,7 +3017,7 @@ void Frame::stmt(const Node &N) {
       fail(N.At, "duplicate statement label");
     branch(Target);
     B.SetInsertPoint(Target);
-    Live = true;
+    Live |= F && F->ExitedLifetimes.Targets.count(N.Text);
     if (Transaction)
       Transaction->restoreFlow(N);
     StatementLabel = N.Text;

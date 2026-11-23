@@ -106,8 +106,11 @@ cpn::Value Frame::convert(cpn::Value V, const std::string &T, const Token &At) {
       if (!Base || llvm::isa<llvm::ConstantPointerNull>(V.IR))
         return V;
       V.BaseView = true;
-      if (!IR)
-        fail(At, "base adjustment requires runtime storage");
+      if (!IR) {
+        adjust(View, Target, At);
+        V.IR = View.Address;
+        return V;
+      }
       // Virtual offsets reside in the object and are readable only on the
       // nonnull path, even when the converted pointer is never dereferenced.
       auto *Entry = B.GetInsertBlock(), *NonNull = block("pointer.base"),
@@ -216,7 +219,7 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
   bool Shift = Op == "<<" || Op == ">>";
   std::string T = A.Type == "integer" ? D.Type : A.Type;
   if (Shift && A.Type == "integer" && !Exact)
-    T = Opt.DefaultInt;
+    T = materializationType(A.Type, At);
   if (!Exact && A.Type != "integer" && D.Type != "integer" &&
       A.Type != D.Type && !Shift) {
     if (Op == "&" || Op == "|" || Op == "^")

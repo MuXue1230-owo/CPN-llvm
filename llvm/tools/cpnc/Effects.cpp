@@ -64,6 +64,7 @@ class Inference {
   std::map<const llvm::Function *, const Function *> Declarations;
   llvm::SmallPtrSet<llvm::Value *, 16> SourceGlobals;
   std::map<llvm::Function *, Summary> Summaries;
+  const llvm::Argument *ProbedResult = nullptr;
 
   llvm::Function *callee(const llvm::CallBase &Call) const {
     return llvm::dyn_cast<llvm::Function>(
@@ -175,7 +176,16 @@ class Inference {
       if (Base != P)
         return regions(Base, Out, Visited, Budget, ReachThrough);
       if (auto *A = llvm::dyn_cast<llvm::Argument>(Base)) {
-        Out.insert(Analysis.argumentRegion(*A, ReachThrough));
+        if (A != Analysis.ProbedResult) {
+          Out.insert(Analysis.argumentRegion(*A, ReachThrough));
+        } else {
+          const auto &Sources =
+              Analysis.Declarations.at(A->getParent())->BorrowedResult;
+          if (Sources.empty())
+            Out.insert("any");
+          for (unsigned I : Sources)
+            Out.insert(position(I));
+        }
       } else if (llvm::isa<llvm::AllocaInst, llvm::ConstantPointerNull,
                            llvm::Function>(Base)) {
         Out.insert("local");
@@ -382,6 +392,7 @@ class Inference {
                    llvm::CallBase &Call, bool Interprocedural) const {
     llvm::Function *F = callee(Call);
     EffectBound Bound;
+    EffectSet Predicate;
     unsigned Headers = 0;
     bool Receiver = false;
     llvm::SmallVector<unsigned> ValueAggregates;
@@ -396,7 +407,7 @@ class Inference {
       Receiver = Number(1);
       if (Number(2)) {
         Bound.emplace();
-        for (unsigned I = 5; I < Descriptor->getNumOperands(); ++I)
+        for (unsigned I = 6; I < Descriptor->getNumOperands(); ++I)
           Bound->insert(llvm::cast<llvm::MDString>(Descriptor->getOperand(I))
                             ->getString()
                             .str());
@@ -408,6 +419,8 @@ class Inference {
            llvm::cast<llvm::MDNode>(Descriptor->getOperand(4))->operands())
         ValueAggregates.push_back(
             llvm::mdconst::extract<llvm::ConstantInt>(I)->getZExtValue());
+      addMetadataEffects(llvm::cast<llvm::MDNode>(Descriptor->getOperand(5)),
+                         Predicate);
     }
 
     const Function *D = nullptr;
@@ -455,10 +468,9 @@ class Inference {
     if (Inferred != Summaries.end())
       Body.remap(Effects, Inferred->second.Boundary, Call, Headers, Receiver,
                  ValueAggregates);
-    else if (D && !D->Decl.Contracts.empty() &&
-             D->Defaults.Configuration.ContractsEnabled &&
-             D->Defaults.Configuration.ContractValidation == "check")
-      Effects.insert("trap:contract");
+    else if (D && (!D->ImportAdapter || F != D->IR))
+      Predicate.insert(D->PredicateEffects.begin(), D->PredicateEffects.end());
+    Body.remap(Effects, Predicate, Call, Headers, Receiver, ValueAggregates);
   }
 
   Summary summarize(llvm::Function &F, const Function *D) const {
@@ -494,12 +506,11 @@ class Inference {
   }
 
 public:
-  explicit Inference(const Context &U) : U(U) {
-    for (const auto &F : U.Functions) {
-      Declarations.emplace(F.IR, &F);
-      if (F.BaseIR)
-        Declarations.emplace(F.BaseIR, &F);
-    }
+  explicit Inference(const Context &U, bool CollectBodies = true) : U(U) {
+    for (const auto &F : U.Functions)
+      for (auto *Entry : {F.IR, F.BaseIR, F.ImportAdapter})
+        if (Entry)
+          Declarations.emplace(Entry, &F);
     for (const auto &[Name, Object] : U.Globals) {
       if (Object.Address)
         SourceGlobals.insert(llvm::getUnderlyingObject(Object.Address));
@@ -509,10 +520,18 @@ public:
     for (const auto &[Name, Object] : U.ExternalObjects)
       if (Object.Address)
         SourceGlobals.insert(llvm::getUnderlyingObject(Object.Address));
-    for (auto &F : U.M)
-      if (!F.isDeclaration() &&
-          (Declarations.count(&F) || !runtimeBookkeeping(F.getName())))
-        Summaries.emplace(&F, Summary{});
+    if (CollectBodies)
+      for (auto &F : U.M)
+        if (!F.isDeclaration() &&
+            (Declarations.count(&F) || !runtimeBookkeeping(F.getName())))
+          Summaries.emplace(&F, Summary{});
+  }
+
+  EffectSet describePredicates(const Function &D, llvm::Function &Probe,
+                               const llvm::Argument *Result) {
+    Declarations.emplace(&Probe, &D);
+    ProbedResult = Result;
+    return summarize(Probe, &D).Effects;
   }
 
   void verify() {
@@ -534,7 +553,7 @@ public:
       if (!D.Effects && !Policy.StrictEffectDiagnostics)
         continue;
       bool Unknown = false;
-      for (auto *F : {D.IR, D.BaseIR}) {
+      for (auto *F : {D.IR, D.BaseIR, D.ImportAdapter}) {
         auto It = Summaries.find(F);
         if (It == Summaries.end())
           continue;
@@ -613,6 +632,21 @@ EffectBound cpn::callableEffects(StringRef Type) {
   return Result;
 }
 
+EffectSet cpn::callablePredicateEffects(StringRef Type) {
+  EffectSet Result;
+  for (auto Flag : callableFlags(Type))
+    if (Flag.consume_front("predicate#"))
+      Result.insert(Flag.str());
+  return Result;
+}
+
+std::string cpn::predicateEffectFlags(const EffectSet &Bound) {
+  std::string Flags;
+  for (const auto &Item : Bound)
+    Flags += " predicate#" + Item;
+  return Flags;
+}
+
 bool cpn::effectsFit(const EffectBound &Source, const EffectBound &Target) {
   return !Target || (Source && llvm::all_of(*Source, [&](StringRef Item) {
                        return covers(*Target, Item);
@@ -622,7 +656,8 @@ bool cpn::effectsFit(const EffectBound &Source, const EffectBound &Target) {
 void cpn::describeEffectCall(llvm::CallBase &Call, const EffectBound &Bound,
                              unsigned Headers, bool Receiver,
                              llvm::Function *Contract,
-                             llvm::ArrayRef<unsigned> ValueAggregates) {
+                             llvm::ArrayRef<unsigned> ValueAggregates,
+                             const EffectSet &Predicate) {
   auto &C = Call.getContext();
   auto Index = [&](unsigned I) {
     return llvm::ConstantAsMetadata::get(
@@ -631,14 +666,26 @@ void cpn::describeEffectCall(llvm::CallBase &Call, const EffectBound &Bound,
   llvm::SmallVector<llvm::Metadata *> Aggregates;
   for (auto I : ValueAggregates)
     Aggregates.push_back(Index(I));
+  llvm::SmallVector<llvm::Metadata *> Predicates;
+  for (const auto &Item : Predicate)
+    Predicates.push_back(llvm::MDString::get(C, Item));
   llvm::SmallVector<llvm::Metadata *> Fields{
-      Index(Headers), Index(Receiver), Index(Bound.has_value()),
+      Index(Headers),
+      Index(Receiver),
+      Index(Bound.has_value()),
       Contract ? llvm::ValueAsMetadata::get(Contract) : nullptr,
-      llvm::MDNode::get(C, Aggregates)};
+      llvm::MDNode::get(C, Aggregates),
+      llvm::MDNode::get(C, Predicates)};
   if (Bound)
     for (const auto &Item : *Bound)
       Fields.push_back(llvm::MDString::get(C, Item));
   Call.setMetadata(CallEffects, llvm::MDNode::get(C, Fields));
+}
+
+EffectSet Context::bindPredicateEffects(const Function &D,
+                                        llvm::Function &Probe,
+                                        const llvm::Argument *Result) {
+  return Inference(*this, false).describePredicates(D, Probe, Result);
 }
 
 void Context::checkEffects() {

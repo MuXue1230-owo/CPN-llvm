@@ -42,9 +42,11 @@ struct Options {
   bool ContractsEnabled = true, TrustedAssumptions = false;
   std::string ContractValidation = "check", InvariantValidation = "check";
   bool ASCII = false, Check = false, IR = false;
+  bool CustomPreset = false;
   bool InterproceduralConstruction = true, InterproceduralEffects = true;
   bool StrictEffectDiagnostics = false;
   Severity Minimum = Severity::Warning;
+  std::set<std::string> ExplicitConfiguration;
   std::set<std::string> Promote, Suppress;
   void diagnose(const Token &, Severity, llvm::StringRef Code,
                 llvm::StringRef Message) const;

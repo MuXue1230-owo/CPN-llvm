@@ -1583,7 +1583,13 @@ class Parser {
   }
 
 public:
-  explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {}
+  explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {
+    Types.insert({"std::ScalarError", "std::Result"});
+    Node TypeParam(Node::TypeParam, {});
+    Families["std::Result"] = {TypeParam, TypeParam};
+    Families["std::from_underlying"] = {TypeParam};
+    Families["std::try_from_underlying"] = {TypeParam};
+  }
   std::vector<Node> unit() {
     std::vector<Node> V;
     while (!is(""))
@@ -1607,28 +1613,51 @@ Node cpn::parseExpression(StringRef S, const Options &O) {
   return Parser(lex(S, O)).expression();
 }
 void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
+  auto requireFloatFormat = [&](StringRef Format) {
+    if (floating(Format))
+      return;
+    if (Format == "f16" || Format == "bf16" || Format == "f128" ||
+        Format == "dec32" || Format == "dec64" || Format == "dec128")
+      fail(N.At, "CFG002: unavailable floating format '" + Format.str() + "'");
+    fail(N.At, "CFG001: invalid floating format '" + Format.str() + "'");
+  };
   auto P = N.Settings.find("preset");
   if (P != N.Settings.end()) {
     auto V = P->second;
     if (V != "Debug" && V != "Release" && V != "MinimalDebug" &&
-        V != "MinimalRelease")
-      fail(N.At, "unknown preset");
-    O.ContractsEnabled = !StringRef(V).starts_with("Minimal");
-    O.ContractValidation = V == "Debug" ? "check" : "document";
-    O.InvariantValidation =
-        !O.ContractsEnabled ? "disabled" : O.ContractValidation;
-    O.TrustedAssumptions = false;
-    O.InterproceduralConstruction = O.InterproceduralEffects =
-        StringRef(V).ends_with("Debug");
-    O.StrictEffectDiagnostics = false;
-    O.FPProfile = StringRef(V).ends_with("Debug") ? "strict" : "native";
-    O.Overflow = StringRef(V).ends_with("Debug") ? "checked" : "native";
+        V != "MinimalRelease" && V != "Custom")
+      fail(N.At, "CFG001: unknown preset");
+    if (Scope > ConfigScope::File)
+      fail(N.At, "CFG001: preset must be bound before declarations");
+    O.CustomPreset = V == "Custom";
+    const bool Minimal = StringRef(V).starts_with("Minimal");
+    const bool Debug = O.CustomPreset || StringRef(V).ends_with("Debug");
+    const bool CheckContracts = Debug && !Minimal;
+    auto Default = [&](const char *Key, auto &Field, const auto &Value) {
+      if (!O.ExplicitConfiguration.count(Key))
+        Field = Value;
+    };
+    Default("contracts.enabled", O.ContractsEnabled, !Minimal);
+    Default("contracts.validation", O.ContractValidation,
+            CheckContracts ? "check" : "document");
+    Default("contracts.invariants", O.InvariantValidation,
+            Minimal          ? "disabled"
+            : CheckContracts ? "check"
+                             : "document");
+    Default("contracts.trusted_assumptions", O.TrustedAssumptions, false);
+    Default("construction.analysis", O.InterproceduralConstruction, Debug);
+    Default("effects.inference", O.InterproceduralEffects, Debug);
+    Default("effects.diagnostics", O.StrictEffectDiagnostics, false);
+    Default("numeric.fp.profile", O.FPProfile, Debug ? "strict" : "native");
+    Default("numeric.integer.overflow", O.Overflow,
+            Debug ? "checked" : "native");
   }
   for (auto &KV : N.Settings) {
     auto &K = KV.first;
     auto &V = KV.second;
     if (K == "preset")
       continue;
+    O.ExplicitConfiguration.insert(K);
     if (K == "compilation.modules" || K == "compilation.separate" ||
         K == "tooling.contract_export") {
       if (V == "true")
@@ -1711,8 +1740,7 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       continue;
     }
     if (K == "numeric.literal.real_default") {
-      if (!floating(V))
-        fail(N.At, "unsupported real default");
+      requireFloatFormat(V);
       O.DefaultReal = V;
       continue;
     }
@@ -1767,22 +1795,25 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       continue;
     }
     if (K == "numeric.fp.profile") {
+      if (V == "reproducible" || V == "fast")
+        fail(N.At, "CFG002: unavailable floating profile '" + V + "'");
       if (V != "strict" && V != "native")
-        fail(N.At, "unavailable floating profile");
+        fail(N.At, "CFG001: unknown floating profile '" + V + "'");
       O.FPProfile = V;
       continue;
     }
     if (K == "numeric.float.formats") {
-      if (V == "[]")
-        O.FloatFormats.clear();
-      else if (V == "[f32]")
-        O.FloatFormats = {"f32"};
-      else if (V == "[f64]")
-        O.FloatFormats = {"f64"};
-      else if (V == "[f32,f64]" || V == "[f64,f32]")
-        O.FloatFormats = {"f32", "f64"};
-      else
-        fail(N.At, "unsupported floating format list");
+      StringRef List(V);
+      if (!List.consume_front("[") || !List.consume_back("]"))
+        fail(N.At, "CFG001: expected a list of floating formats");
+      llvm::SmallVector<StringRef> Members;
+      List.split(Members, ',', -1, false);
+      O.FloatFormats.clear();
+      for (auto Member : Members) {
+        requireFloatFormat(Member);
+        if (!O.FloatFormats.insert(Member.str()).second)
+          fail(N.At, "CFG001: duplicate floating format");
+      }
       continue;
     }
     if (K == "numeric.fp.relaxations") {
@@ -1794,7 +1825,7 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     if (K == "numeric.integer.overflow") {
       if (V != "checked" && V != "native" && V != "wrapping" &&
           V != "saturating")
-        fail(N.At, "unknown overflow policy");
+        fail(N.At, "CFG001: unknown overflow policy");
       O.Overflow = V;
     } else if (K == "source.identifiers") {
       if (V != "ascii" && V != "unicode")
@@ -1855,11 +1886,13 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
     } else
       fail(N.At, "CFG001: unknown configuration key '" + K + "'");
   }
-  unsigned DefaultWidth = 0;
-  StringRef(O.DefaultInt).drop_front().getAsInteger(10, DefaultWidth);
-  if (!O.IntegerWidths.count(DefaultWidth))
-    fail(N.At, "CFG002: literal default " + O.DefaultInt + " is disabled");
-  if (N.Settings.count("numeric.literal.real_default") &&
-      !O.FloatFormats.count(O.DefaultReal))
-    fail(N.At, "CFG002: literal default " + O.DefaultReal + " is disabled");
+  if (!O.CustomPreset) {
+    unsigned DefaultWidth = 0;
+    StringRef(O.DefaultInt).drop_front().getAsInteger(10, DefaultWidth);
+    if (!O.IntegerWidths.count(DefaultWidth))
+      fail(N.At, "CFG002: literal default " + O.DefaultInt + " is disabled");
+    if (N.Settings.count("numeric.literal.real_default") &&
+        !O.FloatFormats.count(O.DefaultReal))
+      fail(N.At, "CFG002: literal default " + O.DefaultReal + " is disabled");
+  }
 }

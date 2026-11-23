@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/IR/ConstantFold.h"
 using namespace cpn;
 namespace {
 bool same(Function *A, Function *B) {
@@ -164,6 +165,7 @@ void Context::buildTables(const std::string &Name,
         fail(R.Decl.At, "missing final overrider");
       Entries.push_back(Final->IR);
       Table.Receivers.push_back(Target);
+      Table.Targets.push_back(Final);
     }
     if (Entries.empty())
       Entries.push_back(
@@ -174,6 +176,8 @@ void Context::buildTables(const std::string &Name,
         M, AT, true, llvm::GlobalValue::InternalLinkage,
         llvm::ConstantArray::get(AT, Entries),
         "cpn.vtable." + Name + "." + ViewType);
+    DispatchTables.emplace(Table.Entries,
+                           std::make_pair(Name, R.Tables.size()));
     R.Tables.push_back(std::move(Table));
   }
 }
@@ -194,6 +198,8 @@ llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
   return B.CreateGEP(B.getInt8Ty(), Obj.Address, Offset);
 }
 Value Frame::baseView(Value Obj, const BasePath &Path) {
+  if (!IR && !Path.empty() && !Obj.Address && !Obj.Location)
+    Obj = constantTemporary(Obj);
   for (auto I : Path) {
     if (!IR && !Obj.Address && llvm::isa_and_nonnull<llvm::Constant>(Obj.IR)) {
       Obj.IR = llvm::cast<llvm::Constant>(Obj.IR)->getAggregateElement(I);
@@ -203,6 +209,12 @@ Value Frame::baseView(Value Obj, const BasePath &Path) {
     }
     Obj.Type = U.Records.at(Obj.Type).Bases[I];
     Obj.BaseView = true;
+    if (!IR && Obj.Location) {
+      auto Place = *Obj.Location;
+      Place.Steps.push_back({I});
+      Place.Type = Obj.Type;
+      Obj.Location = std::make_shared<ConstantPlace>(std::move(Place));
+    }
   }
   return Obj;
 }
@@ -331,12 +343,106 @@ void Frame::installTables(Value Obj) {
     }
   }
 }
+
+void Frame::installConstantTables(Value &Obj, const Token &At) {
+  const auto &Root = U.Records.at(Obj.Type);
+  if (Root.Tables.empty())
+    return;
+  auto *Image = llvm::cast<llvm::Constant>(Obj.IR);
+  const auto &DL = U.M.getDataLayout();
+  auto offset = [&](const BasePath &Path) {
+    const auto *R = &Root;
+    uint64_t Bytes = 0;
+    for (unsigned I : Path) {
+      Bytes += DL.getStructLayout(R->IR)->getElementOffset(I);
+      R = &U.Records.at(R->Bases[I]);
+    }
+    return Bytes;
+  };
+  for (const auto &Table : Root.Tables) {
+    U.chargeConstant(At, 1 + Table.Targets.size());
+    const auto &R = U.Records.at(Root.Views.at(Table.View));
+    unsigned Vptr = R.Fields.size();
+    auto *DeltaType =
+        llvm::cast<llvm::ArrayType>(R.IR->getElementType(Vptr + 1));
+    std::vector<llvm::Constant *> Deltas(DeltaType->getNumElements(),
+                                         B.getInt64(0));
+    uint64_t Start = offset(Table.View);
+    for (size_t I = 0; I < Table.Receivers.size(); ++I)
+      Deltas[I] = B.getInt64(offset(Table.Receivers[I]) - Start);
+    auto Path = Table.View;
+    Path.push_back(Vptr);
+    Image =
+        llvm::ConstantFoldInsertValueInstruction(Image, Table.Entries, Path);
+    Path.back() = Vptr + 1;
+    Image = llvm::ConstantFoldInsertValueInstruction(
+        Image, llvm::ConstantArray::get(DeltaType, Deltas), Path);
+  }
+  Obj.IR = Image;
+}
+
+Function &Frame::constantVirtualTarget(Function &D, Value &Receiver,
+                                       const Token &At) {
+  Receiver = load(Receiver);
+  if (D.Slot < 0)
+    return D;
+  const auto &Static = U.Records.at(Receiver.Type);
+  auto *Image = llvm::dyn_cast_or_null<llvm::Constant>(Receiver.IR);
+  auto *Entries = Image ? llvm::dyn_cast_or_null<llvm::GlobalVariable>(
+                              Image->getAggregateElement(Static.Fields.size()))
+                        : nullptr;
+  auto It = U.DispatchTables.find(Entries);
+  if (It == U.DispatchTables.end())
+    fail(At, "constant virtual call requires an active object layer");
+  const auto &[Type, Index] = It->second;
+  const auto &Table = U.Records.at(Type).Tables[Index];
+  auto Slot = unsigned(D.Slot);
+  if (Slot >= Table.Targets.size())
+    fail(At, "constant virtual slot is unavailable");
+  const auto &Path = Table.Receivers[Slot];
+  auto &Target = *Table.Targets[Slot];
+  if (Path == Table.View)
+    return Target;
+  if (auto *Address =
+          llvm::dyn_cast_or_null<llvm::Constant>(Receiver.Address)) {
+    auto *Deltas = Image->getAggregateElement(Static.Fields.size() + 1);
+    llvm::Constant *Offset = Deltas->getAggregateElement(Slot);
+    auto *Adjusted = llvm::ConstantExpr::getGetElementPtr(
+        U.M.getDataLayout(), B.getInt8Ty(), Address, {Offset});
+    Receiver = load({Target.Owner, nullptr, Adjusted, Receiver.Readonly});
+  } else if (Receiver.Location) {
+    auto Place = *Receiver.Location;
+    if (Place.Steps.size() < Table.View.size() ||
+        !std::equal(Table.View.rbegin(), Table.View.rend(),
+                    Place.Steps.rbegin(),
+                    [](unsigned Slot, const ConstantPlace::Step &Step) {
+                      return Slot == Step.Index && !Step.Alternative;
+                    }))
+      fail(At, "constant virtual receiver has no complete-object designation");
+    Place.Steps.resize(Place.Steps.size() - Table.View.size());
+    for (unsigned I : Path)
+      Place.Steps.push_back({I});
+    Place.Type = Target.Owner;
+    Place.Readonly |= Receiver.Readonly;
+    Receiver = Place.read(*this, At);
+    Receiver.Location = std::make_shared<ConstantPlace>(std::move(Place));
+  } else
+    fail(At, "constant virtual receiver has no complete-object designation");
+  return Target;
+}
 Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
                       const Token &At) {
   auto T = element(Ptr.Type);
   if (!U.Signatures.count(T))
     fail(At, "function-pointer contract required");
-  requireObserver(callableEffects(T), At);
+  auto Effects = callableEffects(T);
+  auto Predicate = callablePredicateEffects(T);
+  if (InPredicate) {
+    auto All = Effects;
+    if (All)
+      All->insert(Predicate.begin(), Predicate.end());
+    requireObserver(All, At);
+  }
   if (F && callableFlag(T, " whole"))
     F->MayWhole = true;
   if (RequireNoexcept && !callableFlag(T, " noexcept"))
@@ -390,12 +496,14 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto Metadata = openPointerCall(Ptr.IR, Sig.front(),
                                   llvm::ArrayRef(Sig).drop_front(), Actual);
   auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  Call->setAttributes(U.scalarCallABI(
+      Sig.front(), llvm::ArrayRef(Sig).drop_front(), !!Storage));
   llvm::SmallVector<unsigned> ValueAggregates;
   for (unsigned I = 0; I < Args.size(); ++I)
     if (U.aggregate(Sig[I + 1]))
       ValueAggregates.push_back(I);
-  describeEffectCall(*Call, callableEffects(T), Storage ? 1 : 0, false, nullptr,
-                     ValueAggregates);
+  describeEffectCall(*Call, Effects, Storage ? 1 : 0, false, nullptr,
+                     ValueAggregates, Predicate);
   if (Sig[0] == "never") {
     Call->setDoesNotReturn();
     return endDivergentCall();

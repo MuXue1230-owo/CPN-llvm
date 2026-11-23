@@ -159,9 +159,20 @@ cpn::Value Frame::load(cpn::Value V) {
       if (auto *Address = llvm::dyn_cast<llvm::Constant>(V.Address)) {
         auto *Object = llvm::dyn_cast<llvm::GlobalVariable>(
             llvm::getUnderlyingObject(Address));
-        if (Object && U.ConstantObjects.count(Object))
-          V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
-                                                    U.M.getDataLayout());
+        if (Object && U.ConstantObjects.count(Object)) {
+          const auto &Layout = U.M.getDataLayout();
+          if (Object->isConstant())
+            V.IR = llvm::ConstantFoldLoadFromConstPtr(Address, U.ir(V.Type),
+                                                      Layout);
+          else {
+            llvm::APInt Offset(
+                Layout.getIndexTypeSizeInBits(Address->getType()), 0);
+            if (Address->stripAndAccumulateConstantOffsets(Layout, Offset,
+                                                           true) == Object)
+              V.IR = llvm::ConstantFoldLoadFromConst(
+                  Object->getInitializer(), U.ir(V.Type), Offset, Layout);
+          }
+        }
       }
       if (!V.IR || llvm::isa<llvm::UndefValue>(V.IR))
         fail({}, "constant expression required");
@@ -249,6 +260,30 @@ std::string cpn::parameterEffects(const std::set<unsigned> &NoEscape,
   append("consumes", Consumes);
   return Effects;
 }
+llvm::AttributeList Context::scalarCallABI(const std::string &Result,
+                                           llvm::ArrayRef<std::string> Params,
+                                           unsigned HiddenPrefix) const {
+  // Both native entries and their C transports use the target's same narrow
+  // scalar extension rule. An indirect caller cannot distinguish their source
+  // linkage, and LLVM requires the ABI attributes on both sides of a call.
+  auto extension = [&](const std::string &T) {
+    auto Enum = Enums.find(T);
+    const auto &Representation = Enum == Enums.end() ? T : Enum->second;
+    if ((!integer(Representation) && Representation != "bool") ||
+        width(Representation) >= 32)
+      return llvm::Attribute::None;
+    return signedType(Representation) ? llvm::Attribute::SExt
+                                      : llvm::Attribute::ZExt;
+  };
+  llvm::AttributeList Attrs;
+  if (auto Ext = extension(Result); Ext != llvm::Attribute::None)
+    Attrs = Attrs.addRetAttribute(C, Ext);
+  for (unsigned I = 0; I < Params.size(); ++I)
+    if (auto Ext = extension(Params[I]); Ext != llvm::Attribute::None)
+      Attrs = Attrs.addParamAttribute(C, HiddenPrefix + I, Ext);
+  return Attrs;
+}
+
 std::string Context::callableType(const Function &D) {
   std::string T = "function<" + D.Result + "(";
   for (size_t I = 0; I < D.Params.size(); ++I) {
@@ -262,7 +297,7 @@ std::string Context::callableType(const Function &D) {
   if (D.MayWhole)
     T += " whole";
   T += parameterEffects(D.NoEscape, D.BorrowedResult, D.Consumes) +
-       effectFlags(D.Effects) + ">";
+       effectFlags(D.Effects) + predicateEffectFlags(D.PredicateEffects) + ">";
   if (!Signatures.count(T)) {
     std::vector<std::string> Sig{D.Result};
     Sig.insert(Sig.end(), D.Params.begin(), D.Params.end());
@@ -283,6 +318,13 @@ bool Context::compatibleCallable(const std::string &From,
   if ((callableFlag(To, " noexcept") && !callableFlag(From, " noexcept")) ||
       (callableFlag(From, " whole") && !callableFlag(To, " whole")) ||
       !effectsFit(callableEffects(From), callableEffects(To)))
+    return false;
+  auto PredicateLimit = callablePredicateEffects(To);
+  // An explicitly written effect bound on a pointer bounds the invocation.
+  // An inferred type can carry a separate bound for its selected checks.
+  auto UseLimit = PredicateLimit.empty() ? callableEffects(To)
+                                         : EffectBound(PredicateLimit);
+  if (!effectsFit(callablePredicateEffects(From), UseLimit))
     return false;
   auto Source = callableFlags(From), Target = callableFlags(To);
   for (auto Flag : Target)
@@ -344,6 +386,14 @@ std::optional<std::string> Frame::memberQualifier(const std::string &S,
   }
   return {};
 }
+std::string Frame::materializationType(const std::string &T, const Token &At) {
+  if (T == "integer")
+    return resolve(Opt.DefaultInt, At);
+  if (T == "real")
+    return resolve(Opt.DefaultReal, At);
+  return T;
+}
+
 std::string Frame::resolve(std::string S, const Token &At) {
   if (auto Q = U.TypeQueries.find(S); Q != U.TypeQueries.end())
     return unevaluatedType(Q->second.Children.front(), true);
@@ -540,10 +590,11 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
             Ty.pop_back();
           }
           if (Formal == P.Text) {
-            if (Ty == "real")
-              Ty = Opt.DefaultReal;
-            if (Ty == "integer")
-              Ty = Opt.DefaultInt;
+            try {
+              Ty = materializationType(Ty, At);
+            } catch (const Diagnostic &D) {
+              throw DeductionFailure{D};
+            }
             if (S.Types.count(P.Text) && S.Types[P.Text] != Ty)
               Reject("conflicting deduction");
             S.Types[P.Text] = Ty;
@@ -810,19 +861,13 @@ Function *Context::declare(const Node &N, const std::string &Name,
                                   Export ? llvm::GlobalValue::ExternalLinkage
                                          : llvm::GlobalValue::InternalLinkage,
                                   Symbol, M);
+  unsigned HiddenPrefix =
+      unsigned(aggregate(D.Result)) + unsigned(!Owner.empty() && !D.isStatic());
+  D.IR->setAttributes(llvm::AttributeList::get(
+      C, {D.IR->getAttributes(),
+          scalarCallABI(D.Result, D.Params, HiddenPrefix)}));
   if (D.Result == "never")
     D.IR->addFnAttr(llvm::Attribute::NoReturn);
-  if (N.Foreign) {
-    auto ext = [&](const std::string &Ty) {
-      return signedType(Ty) ? llvm::Attribute::SExt : llvm::Attribute::ZExt;
-    };
-    if ((integer(D.Result) || D.Result == "bool") && width(D.Result) < 32)
-      D.IR->addRetAttr(ext(D.Result));
-    for (size_t I = 0; I < D.Params.size(); ++I)
-      if ((integer(D.Params[I]) || D.Params[I] == "bool") &&
-          width(D.Params[I]) < 32)
-        D.IR->addParamAttr(I, ext(D.Params[I]));
-  }
   Functions.push_back(std::move(D));
   Group.push_back(&Functions.back());
   if (N.Foreign)
@@ -878,9 +923,10 @@ void Context::enumeration(Frame &F, const Node &D, const std::string &Name) {
     if (Case.Children.empty())
       fail(Case.At, "enum case requires an explicit value");
     auto V = F.convert(F.constantEval(Case.Children[0]), Ty, Case.At);
-    auto K = llvm::cast<llvm::ConstantInt>(V.IR)->getZExtValue();
-    if (!Values.insert(K).second)
+    auto *K = llvm::cast<llvm::ConstantInt>(V.IR);
+    if (!Values.insert(K->getZExtValue()).second)
       fail(Case.At, "duplicate enum value");
+    EnumValues[Name].push_back(K);
     V.Type = Name;
     if (!Globals.emplace(Name + "::" + Case.Text, V).second)
       fail(Case.At, "duplicate enumerator '" + Case.Text + "'");
@@ -1108,10 +1154,13 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   if (R.VirtualCount)
     for (auto *F : Members)
       if ((F->Decl.K == Node::Constructor || F->Decl.K == Node::Destructor) &&
-          !F->Decl.Settings.count("control"))
+          !F->Decl.Settings.count("control")) {
         F->BaseIR = llvm::Function::Create(F->IR->getFunctionType(),
                                            llvm::GlobalValue::InternalLinkage,
                                            F->IR->getName() + ".base", M);
+        F->BaseIR->setAttributes(F->IR->getAttributes());
+        F->BaseIR->setCallingConv(F->IR->getCallingConv());
+      }
   for (auto D : N.Children) {
     if (D.K != Node::Field || !D.Settings.count("storage"))
       continue;
@@ -1460,8 +1509,11 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   U.Whole = llvm::any_of(AST, Frame::usesWhole);
   if (U.Whole || llvm::any_of(AST, Frame::usesStorage))
     U.enableStorage();
+  U.bindScalarLibrary();
   U.unit(AST);
+  U.emitForeignContractAdapters();
   U.checkWholeContracts();
+  U.verifyProvenContracts();
   U.checkEffects();
   U.checkBorrowEscapes();
   for (auto &F : U.Functions)

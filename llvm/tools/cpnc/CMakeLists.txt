@@ -1,5 +1,5 @@
 if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
-  set(LLVM_LINK_COMPONENTS Analysis AsmParser Core Support Target MC CodeGen X86)
+  set(LLVM_LINK_COMPONENTS Analysis AsmParser Core Support Target MC CodeGen ScalarOpts TransformUtils X86)
   set(LLVM_REQUIRES_EH ON)
   set(LLVM_REQUIRES_RTTI ON)
   add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/UnicodeData.inc
@@ -19,6 +19,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Closure.cpp
     ConstantAggregate.cpp
     Construction.cpp
+    ContractProof.cpp
     Contracts.cpp
     Dispatch.cpp
     Effects.cpp
@@ -27,6 +28,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Emit.cpp
     FamilyMembers.cpp
     Floating.cpp
+    ForeignContracts.cpp
     Generic.cpp
     Integer.cpp
     Invariants.cpp
@@ -37,6 +39,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     PointerCalls.cpp
     PointerStorage.cpp
     Reservations.cpp
+    Scalars.cpp
     Sema.cpp
     SpecialMembers.cpp
     StaticReference.cpp

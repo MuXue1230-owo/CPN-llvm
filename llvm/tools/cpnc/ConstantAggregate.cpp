@@ -4,6 +4,15 @@
 using namespace cpn;
 using llvm::StringRef;
 
+namespace {
+llvm::Constant *recordImage(llvm::StructType *Layout,
+                            std::vector<llvm::Constant *> Fields) {
+  for (auto *Field : llvm::drop_begin(Layout->elements(), Fields.size()))
+    Fields.push_back(llvm::Constant::getNullValue(Field));
+  return llvm::ConstantStruct::get(Layout, Fields);
+}
+} // namespace
+
 void Context::chargeConstant(const Token &At, uint64_t Steps) {
   constexpr unsigned Limit = 100000;
   if (Steps > Limit - ConstantSteps)
@@ -60,6 +69,24 @@ bool Frame::containsPointerField(const std::string &Type) const {
          llvm::any_of(It->second.Fields, [&](const Field &F) {
            return carriesPointerBounds(F.Type) || containsPointerField(F.Type);
          });
+}
+
+bool Frame::containsDispatchState(const std::string &Type) const {
+  auto T = unconst(Type);
+  if (StringRef(T).ends_with("]"))
+    return !StringRef(T).ends_with("[0]") && containsDispatchState(element(T));
+  if (auto Cases = U.Variants.find(T); Cases != U.Variants.end())
+    return llvm::any_of(Cases->second, [&](const auto &Key) {
+      return llvm::any_of(U.Cases.at(Key).Types, [&](const auto &Field) {
+        return containsDispatchState(Field);
+      });
+    });
+  auto It = U.Records.find(T);
+  return It != U.Records.end() &&
+         (It->second.Polymorphic || It->second.VirtualCount ||
+          llvm::any_of(It->second.Fields, [&](const Field &F) {
+            return containsDispatchState(F.Type);
+          }));
 }
 Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
                                  const Token &At, const Node *Tail) {
@@ -119,8 +146,8 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
     return llvm::cast<llvm::Constant>(constantCopy(V, At).IR);
   };
   if (auto R = U.Records.find(Type); R != U.Records.end()) {
-    if (R->second.Polymorphic || R->second.VirtualCount)
-      fail(At, "constant evaluation of virtual object layout is unavailable");
+    if (R->second.VirtualCount)
+      fail(At, "constant evaluation of shared virtual bases is unavailable");
     auto S = R->second.Special.find(Op);
     if (S != R->second.Special.end() && S->second.Body &&
         !U.Variants.count(Type))
@@ -152,7 +179,7 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
       std::vector<llvm::Constant *> Fields;
       for (unsigned I = 0; I < R->second.Fields.size(); ++I)
         Fields.push_back(subobject(R->second.Fields[I].Type, I));
-      C = llvm::ConstantStruct::get(R->second.IR, Fields);
+      C = recordImage(R->second.IR, std::move(Fields));
     }
   } else if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType());
              Array && U.aggregate(unconst(element(Type))) &&
@@ -169,6 +196,8 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant) {
   Source.ConstantTemporary.reset();
   Source.Prvalue = Source.Expiring = true;
   Source.Readonly = false;
+  if (U.Records.count(Type))
+    installConstantTables(Source, At);
   if (CheckInvariant)
     checkInvariants(Source);
   return Source;
@@ -181,9 +210,11 @@ Value Frame::constantAggregate(const std::string &T,
   auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty);
 
   auto *Record = Array ? nullptr : &U.Records.at(T);
-  if (Record && (Record->VirtualCount || Record->Polymorphic))
-    fail(At, "constant evaluation of virtual object layout is unavailable");
+  if (Record && Record->VirtualCount)
+    fail(At, "constant evaluation of shared virtual bases is unavailable");
   auto finishTail = [&](Value V) {
+    if (Record)
+      installConstantTables(V, At);
     if (Tail) {
       llvm::SaveAndRestore<Construction *> Outer(Transaction, nullptr);
       llvm::SaveAndRestore Receiver(ConstantReceiver, &V);
@@ -317,7 +348,7 @@ Value Frame::constantAggregate(const std::string &T,
       Init.Scopes[0].Names[Record->Fields[I].Decl.Text] = V;
   }
   Result.IR = Array ? llvm::ConstantArray::get(Array, Fields)
-                    : llvm::ConstantStruct::get(Record->IR, Fields);
+                    : recordImage(Record->IR, std::move(Fields));
   if (!Producers.empty())
     fail(At, "unknown initialization target");
   return finishTail(Result);

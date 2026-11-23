@@ -111,6 +111,7 @@ void Frame::constantDrop(Value Object, const Token &At) {
     return;
   }
   auto &R = U.Records.at(Type);
+  installConstantTables(Object, At);
   auto D = U.Overloads.find(Type + "::$drop");
   Function *Destructor = D == U.Overloads.end() ? nullptr : D->second.front();
   Frame Body(U, Destructor, nullptr, Type + "::");

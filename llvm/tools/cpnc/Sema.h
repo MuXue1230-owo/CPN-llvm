@@ -8,7 +8,10 @@
 #include <optional>
 namespace cpn {
 using SourcePosition = std::pair<unsigned, unsigned>;
-using JumpCleanups = std::map<SourcePosition, std::set<SourcePosition>>;
+struct JumpCleanups {
+  std::map<SourcePosition, std::set<SourcePosition>> Exited;
+  std::set<std::string> Targets;
+};
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
 struct ConstantPlace;
@@ -53,6 +56,7 @@ struct ConstantTransfer {
   Node::Kind Kind;
   Value Result;
   std::string Label;
+  Token At;
 };
 struct Substitution {
   std::map<std::string, std::string> Types;
@@ -67,6 +71,7 @@ struct Family;
 struct Function {
   Node Decl;
   EffectBound Effects;
+  EffectSet PredicateEffects;
   std::string Name, Result, Owner, Prefix, DefaultPrefix;
   std::vector<std::string> Params;
   std::vector<Node> DefaultParams;
@@ -74,7 +79,7 @@ struct Function {
   DefinitionSite Definition, Defaults;
   size_t DeclaredAt = 0;
   const Family *Origin = nullptr;
-  llvm::Function *IR = nullptr, *BaseIR = nullptr;
+  llvm::Function *IR = nullptr, *BaseIR = nullptr, *ImportAdapter = nullptr;
   bool Emitting = false, Emitted = false;
   bool ContractsBound = false;
   int Slot = -1;
@@ -105,6 +110,7 @@ struct DispatchTable {
   BasePath View;
   llvm::GlobalVariable *Entries;
   std::vector<BasePath> Receivers;
+  std::vector<Function *> Targets;
 };
 struct Record {
   Node Decl;
@@ -176,8 +182,11 @@ struct Context {
   std::map<std::string, std::string> Aliases, Enums;
   std::map<std::string, Node::Kind> Declarations;
   std::set<std::string> DefinedEnums;
+  std::map<std::string, std::vector<llvm::ConstantInt *>> EnumValues;
   std::set<std::pair<std::string, SourcePosition>> LocalTypeSites;
   std::map<std::string, Record> Records;
+  std::map<llvm::GlobalVariable *, std::pair<std::string, size_t>>
+      DispatchTables;
   std::map<std::string, std::pair<std::string, Node>> StaticMembers,
       MemberTypes;
   std::map<std::string, Value> Globals, ExternalObjects;
@@ -250,6 +259,16 @@ struct Context {
   std::vector<std::pair<Function *, Token>> RestrictedPointers;
   void checkWholeContracts();
   void checkEffects();
+  EffectSet bindPredicateEffects(const Function &, llvm::Function &Probe,
+                                 const llvm::Argument *Result);
+  struct ContractProof {
+    llvm::BasicBlock *Before, *Success, *Failure;
+    Token At;
+    std::string Label;
+  };
+  std::vector<ContractProof> ContractProofs;
+  void verifyProvenContracts();
+  void bindScalarLibrary();
   void checkBorrowEscapes();
   std::map<std::string, llvm::Function *> Coordinators, BaseCleanups;
   llvm::Function *coordinator(const std::string &);
@@ -269,11 +288,16 @@ struct Context {
   void record(const Node &, const std::string &, const std::string &,
               const Substitution &);
   std::string callableType(const Function &);
+  llvm::AttributeList scalarCallABI(const std::string &Result,
+                                    llvm::ArrayRef<std::string> Params,
+                                    unsigned HiddenPrefix = 0) const;
   bool compatibleCallable(const std::string &From, const std::string &To) const;
   void unit(const std::vector<Node> &, std::string Prefix = "");
   void emit(Function &);
   void emitBody(Function &, llvm::Function *, bool);
   void bindContracts(Function &);
+  llvm::Function *foreignContractEntry(Function &);
+  void emitForeignContractAdapters();
   JumpCleanups validate(const Node &, const std::string &,
                         const std::string &Owner = "",
                         const Node *FamilyOwner = nullptr);
@@ -298,10 +322,13 @@ bool sameGenericValueContracts(const Node &, const Node &);
 EffectBound genericEffectBound(const Node &, bool HasReceiver);
 std::set<llvm::StringRef> callableFlags(llvm::StringRef);
 EffectBound callableEffects(llvm::StringRef);
+EffectSet callablePredicateEffects(llvm::StringRef);
+std::string predicateEffectFlags(const EffectSet &);
 void describeEffectCall(llvm::CallBase &, const EffectBound &, unsigned Headers,
                         bool Receiver = false,
                         llvm::Function *Contract = nullptr,
-                        llvm::ArrayRef<unsigned> ValueAggregates = {});
+                        llvm::ArrayRef<unsigned> ValueAggregates = {},
+                        const EffectSet &Predicate = {});
 std::string parameterBinding(const Node &, size_t);
 void normalizeContracts(Node &);
 bool sameContracts(const Node &, const Node &);
@@ -321,6 +348,7 @@ struct Local {
   std::map<std::string, Value> Names;
   std::vector<Value> Drops;
   std::vector<std::string> ConstantDrops;
+  std::map<std::string, SourcePosition> ConstantTypeSites;
 };
 struct Loop {
   llvm::BasicBlock *Break, *Continue;
@@ -431,10 +459,11 @@ public:
                           const Token &);
   Value binary(const Node &, Value, Value);
   Value boolean(const Node &);
-  void evaluatePredicate(const Node &, llvm::StringRef Declaration,
-                         unsigned Ordinal, llvm::StringRef Mode,
-                         bool ValidateOnly, bool OwnBoundary = true);
-  void checkContracts(bool Entry, Value Result = {}, bool ValidateOnly = false);
+  llvm::Value *evaluatePredicate(const Node &, llvm::StringRef Declaration,
+                                 unsigned Ordinal, llvm::StringRef Mode,
+                                 bool ValidateOnly, bool OwnBoundary = true);
+  void checkContracts(bool Entry, Value Result = {}, bool ValidateOnly = false,
+                      bool *MayTrap = nullptr);
   void requireObserver(const EffectBound &, const Token &,
                        const Function * = nullptr);
   void requirePredicateCleanup(const std::string &Type, const Token &);
@@ -450,7 +479,10 @@ public:
   Value subscript(const Node &);
   Value lookup(const Token &);
   std::string resolve(std::string, const Token &);
+  std::string materializationType(const std::string &, const Token &);
   Value call(const Node &, const std::vector<Node> &, Value Receiver = {});
+  std::optional<Value> scalarConversion(const Node &, llvm::StringRef,
+                                        const std::vector<Node> &);
   CallArguments evaluateArguments(const std::vector<Node> &,
                                   Function *Context = nullptr,
                                   Value SingleDestination = {});
@@ -499,7 +531,9 @@ public:
       size_t Depth = 0, const std::set<SourcePosition> *Exited = nullptr);
   Function *checkSelected(Function *, const Token &);
   Value member(Value, const Token &);
-  void stmt(const Node &);
+  void stmt(const Node &, llvm::StringRef EntryLabel = {});
+  void constantSequence(llvm::ArrayRef<Node>, llvm::StringRef EntryLabel);
+  void rewindConstantScope(const ConstantTransfer &, const Token &Destination);
   void object(const Node &, bool Global = false);
   void drop(Value, bool AsBase = false);
   void dropLayer(Value, bool AsBase);
@@ -559,6 +593,7 @@ public:
   llvm::Value *ownerRecord(Value, unsigned);
   void enterOwnerLayer(Value);
   bool containsPointerField(const std::string &) const;
+  bool containsDispatchState(const std::string &) const;
   Value constantAssignment(const Node &);
   Value constantCall(Function &, const std::vector<Node> &, const Token &,
                      Value Receiver = {});
@@ -575,13 +610,17 @@ public:
   void bindVirtualLayout(Value);
   llvm::Value *snapshot(Value);
   void installTables(Value);
+  void installConstantTables(Value &, const Token &);
+  Function &constantVirtualTarget(Function &, Value &, const Token &);
   std::string methodOwner(const std::string &, const Token &);
   void bindParams();
   void endConstantScope();
   void constantDrop(Value, const Token &);
   void endConstantField(const std::string &, bool, const Token &);
   void constructorBody(const Node &);
-  void bindInlineParams(const std::vector<Value> &);
+  void bindInlineParams(const std::vector<Value> &,
+                        const Function *DefaultDeclaration = nullptr,
+                        Value *DefaultReceiver = nullptr);
 };
 class Construction {
   Value Object;

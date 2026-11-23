@@ -100,8 +100,14 @@ bool Construction::needsDelegate(const Frame &F) const {
 }
 void Construction::advance(Frame &Current) {
   auto &R = Current.U.Records.at(Object.Type);
-  if (Current.IR && Frontier == R.Bases.size())
-    Current.installTables(Object);
+  auto enterLayer = [&] {
+    if (Current.IR)
+      Current.installTables(Object);
+    else
+      Current.installConstantTables(Object, Current.F->Decl.At);
+  };
+  if (Frontier == R.Bases.size())
+    enterLayer();
   while (Frontier < Order.size()) {
     auto &F = R.Fields[Frontier];
     if (Reserved.count(F.Decl.Text))
@@ -168,8 +174,8 @@ void Construction::advance(Frame &Current) {
     }
     ++Frontier;
     publish(Current);
-    if (Current.IR && Frontier == R.Bases.size())
-      Current.installTables(Object);
+    if (Frontier == R.Bases.size())
+      enterLayer();
   }
 }
 void Construction::enter(Frame &Em, size_t Depth) {

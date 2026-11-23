@@ -25,13 +25,19 @@ Value Frame::closure(const Node &N) {
       if (!F || F->Owner.empty())
         fail(C.At, "this capture requires an enclosing receiver");
       V = load(lookup(C.At));
+      if (TracksStorage && !V.Slot) {
+        Value Receiver{unconst(element(V.Type)), nullptr, V.IR};
+        V.Slot = slotFor(Receiver);
+        V.Generation = B.CreateCall(U.M.getFunction("cpn.generation"),
+                                    {V.Slot, B.getFalse()});
+      }
     } else {
       V = C.Type == "initializer" ? eval(C.Children[0], "", Slot)
                                   : load(lookup(C.At));
       if (V.Type == "integer")
-        V = convert(V, Opt.DefaultInt, C.At);
+        V = convert(V, materializationType(V.Type, C.At), C.At);
       if (V.Type == "real")
-        V = floatingConvert(V, Opt.DefaultReal, C.At);
+        V = floatingConvert(V, materializationType(V.Type, C.At), C.At);
     }
     materialize(V, C.At, Slot);
     Values.push_back(V);
@@ -153,6 +159,9 @@ Value Frame::closurePointer(const Value &Source, const std::string &T,
     auto *FT = llvm::FunctionType::get(Method->getReturnType(), Params, false);
     R.ClosureEntry = llvm::Function::Create(
         FT, llvm::GlobalValue::InternalLinkage, Op.Name + ".entry", U.M);
+    R.ClosureEntry->setAttributes(
+        U.scalarCallABI(Op.Result, Op.Params, Receiver));
+    R.ClosureEntry->setCallingConv(Op.IR->getCallingConv());
     llvm::IRBuilder<> Entry(
         llvm::BasicBlock::Create(U.C, "entry", R.ClosureEntry));
     std::vector<llvm::Value *> Args;
@@ -162,6 +171,8 @@ Value Frame::closurePointer(const Value &Source, const std::string &T,
     if (carriesBorrow(Op.Result) || llvm::any_of(Op.Params, carriesBorrow))
       forwardPointerCall(Entry, R.ClosureEntry, Op.IR);
     auto *Result = Entry.CreateCall(Op.IR, Args);
+    Result->setAttributes(Op.IR->getAttributes());
+    Result->setCallingConv(Op.IR->getCallingConv());
     if (FT->getReturnType()->isVoidTy())
       Entry.CreateRetVoid();
     else

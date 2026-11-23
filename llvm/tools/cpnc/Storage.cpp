@@ -28,6 +28,11 @@ llvm::Constant *Context::typeID(const std::string &T) {
   return ID;
 }
 bool Frame::usesStorage(const Node &N) {
+  if (N.K == Node::Lambda &&
+      llvm::any_of(N.TemplateArgs, [](const Node &Capture) {
+        return Capture.Type == "borrow" || Capture.Type == "this";
+      }))
+    return true;
   if (N.K == Node::Call && !N.Children.empty() &&
       N.Children[0].K == Node::Name) {
     auto &S = N.Children[0].Text;

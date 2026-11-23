@@ -116,13 +116,20 @@ void Frame::requirePredicateCleanup(const std::string &Type, const Token &At) {
         requirePredicateCleanup(Member, At);
 }
 
-void Frame::evaluatePredicate(const Node &Clause, StringRef Declaration,
-                              unsigned Ordinal, StringRef Mode,
-                              bool ValidateOnly, bool OwnBoundary) {
+llvm::Value *Frame::evaluatePredicate(const Node &Clause, StringRef Declaration,
+                                      unsigned Ordinal, StringRef Mode,
+                                      bool ValidateOnly, bool OwnBoundary) {
   if (!ValidateOnly && Mode != "check" && Mode != "prove")
-    return;
+    return nullptr;
+  llvm::BasicBlock *Before = nullptr;
+  if (IR && !ValidateOnly && Mode == "prove") {
+    Before = B.GetInsertBlock();
+    auto *Proof = block("contract.prove");
+    B.CreateBr(Proof);
+    B.SetInsertPoint(Proof);
+  }
   llvm::SmallPtrSet<const llvm::Instruction *, 32> Existing;
-  if (IR && !ValidateOnly && OwnBoundary)
+  if (IR && !ValidateOnly && OwnBoundary && !Before)
     for (auto &Block : *IR)
       for (const auto &Inst : Block)
         Existing.insert(&Inst);
@@ -136,34 +143,42 @@ void Frame::evaluatePredicate(const Node &Clause, StringRef Declaration,
     auto *Known = llvm::dyn_cast_or_null<llvm::ConstantInt>(Condition);
     auto Label =
         Declaration.str() + " " + Clause.Text + " #" + std::to_string(Ordinal);
-    if ((!IR || Mode == "prove") && (!Known || Known->isZero()))
+    if (!IR && (!Known || Known->isZero()))
       fail(Clause.At, "cannot establish " + Label);
-    if (IR && (!Known || Known->isZero())) {
+    if (IR && (Before || !Known || Known->isZero())) {
       auto *Check = B.CreateCondBr(Condition, block("contract.pass"),
                                    block("contract.fail"));
       B.SetInsertPoint(Check->getSuccessor(1));
       auto *Trap = B.CreateCall(
           llvm::Intrinsic::getOrInsertDeclaration(&U.M, llvm::Intrinsic::trap));
-      Trap->setMetadata(
-          OwnBoundary ? "cpn.boundary.effects" : "cpn.effect",
-          llvm::MDNode::get(U.C, llvm::MDString::get(U.C, "trap:contract")));
-      Trap->setMetadata(
-          "cpn.contract",
-          llvm::MDNode::get(U.C, llvm::MDString::get(U.C, Label)));
+      if (Before)
+        U.ContractProofs.push_back({Before, Check->getSuccessor(0),
+                                    Check->getSuccessor(1), Clause.At,
+                                    std::move(Label)});
+      else {
+        Trap->setMetadata(
+            OwnBoundary ? "cpn.boundary.effects" : "cpn.effect",
+            llvm::MDNode::get(U.C, llvm::MDString::get(U.C, "trap:contract")));
+        Trap->setMetadata(
+            "cpn.contract",
+            llvm::MDNode::get(U.C, llvm::MDString::get(U.C, Label)));
+      }
       B.CreateUnreachable();
       B.SetInsertPoint(Check->getSuccessor(0));
     }
   }
-  if (IR && !ValidateOnly && OwnBoundary) {
+  if (IR && !ValidateOnly && OwnBoundary && !Before) {
     auto *Marker = llvm::MDNode::get(U.C, {});
     for (auto &Block : *IR)
       for (auto &Inst : Block)
         if (!Existing.contains(&Inst))
           Inst.setMetadata("cpn.boundary", Marker);
   }
+  return Condition;
 }
 
-void Frame::checkContracts(bool Entry, Value Result, bool ValidateOnly) {
+void Frame::checkContracts(bool Entry, Value Result, bool ValidateOnly,
+                           bool *MayTrap) {
   if (F->Decl.Contracts.empty())
     return;
   const auto &Policy = F->Defaults.Configuration;
@@ -211,12 +226,18 @@ void Frame::checkContracts(bool Entry, Value Result, bool ValidateOnly) {
     Names["return_value"] = std::move(Result);
   }
   unsigned I = 0;
-  bool OwnBoundary = IR == F->IR || IR == F->BaseIR;
+  bool OwnBoundary = IR == F->IR || IR == F->BaseIR || IR == F->ImportAdapter;
   for (const auto &Clause : F->Decl.Contracts) {
     ++I;
-    if (Entry == (Clause.Text == "requires"))
-      Check.evaluatePredicate(Clause, F->Name, I, Mode, ValidateOnly,
-                              OwnBoundary);
+    if (Entry == (Clause.Text == "requires")) {
+      auto *Condition = Check.evaluatePredicate(Clause, F->Name, I, Mode,
+                                                ValidateOnly, OwnBoundary);
+      if (MayTrap) {
+        const auto *Known =
+            llvm::dyn_cast_or_null<llvm::ConstantInt>(Condition);
+        *MayTrap |= !Known || !Known->isOne();
+      }
+    }
   }
   if (IR)
     B.SetInsertPoint(Check.B.GetInsertBlock());
@@ -230,24 +251,48 @@ void Context::bindContracts(Function &D) {
     fail(D.Decl.At,
          "trusted contract validation requires contracts.trusted_assumptions");
   D.ContractsBound = true;
+  auto *ProbeType = D.IR->getFunctionType();
+  // Probe the prepared designation through its declared borrow origins.
+  // Unattributed results remain unknown regions in a checked predicate.
+  bool BorrowedResult = carriesBorrow(D.Result);
+  if (BorrowedResult) {
+    llvm::SmallVector<llvm::Type *> Types(ProbeType->params());
+    Types.push_back(llvm::PointerType::getUnqual(C));
+    ProbeType =
+        llvm::FunctionType::get(ProbeType->getReturnType(), Types, false);
+  }
   auto *Scratch = llvm::Function::Create(
-      D.IR->getFunctionType(), llvm::GlobalValue::PrivateLinkage, "", M);
+      ProbeType, llvm::GlobalValue::PrivateLinkage, "", M);
+  auto *ProbedResult =
+      BorrowedResult ? Scratch->getArg(Scratch->arg_size() - 1) : nullptr;
   Frame Probe(*this, &D, Scratch);
   Probe.TypeQuery = true;
   Probe.B.SetInsertPoint(Probe.block("entry"));
   Probe.bindParams();
   if (D.Decl.Settings.count("closure"))
     Probe.bindCaptures();
-  Probe.checkContracts(true, {}, true);
+  bool MayTrap = false;
+  Probe.checkContracts(true, {}, true, &MayTrap);
   Value Result{D.Result};
   if (D.Result != "void" && D.Result != "never") {
     auto ResultType = StringRef(D.Result);
     if (ResultType.consume_back("&")) {
       ResultType.consume_back("&");
       Result.Type = unconst(ResultType.str());
+      Result.Address = ProbedResult;
+    } else {
+      Result.Address = Probe.allocate(Result.Type, D.Decl.At);
+      if (ProbedResult)
+        Probe.B.CreateStore(ProbedResult, Result.Address);
     }
-    Result.Address = Probe.allocate(Result.Type, D.Decl.At);
   }
-  Probe.checkContracts(false, Result, true);
+  Probe.checkContracts(false, Result, true, &MayTrap);
+  const auto &Policy = D.Defaults.Configuration;
+  if (Policy.ContractsEnabled && Policy.ContractValidation == "check") {
+    Probe.B.CreateUnreachable();
+    D.PredicateEffects = bindPredicateEffects(D, *Scratch, ProbedResult);
+    if (MayTrap)
+      D.PredicateEffects.insert("trap:contract");
+  }
   Scratch->eraseFromParent();
 }

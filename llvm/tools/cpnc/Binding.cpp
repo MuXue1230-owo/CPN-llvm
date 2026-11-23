@@ -204,42 +204,53 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
       collect(C);
   }
   Check Flow{*this, P, Owner, {}, {}, {}, {}};
-  std::function<void(const Node &, Path &)> walk = [&](const Node &S,
-                                                       Path &Live) {
-    if (S.K == Node::Lambda)
-      return;
-    if (S.K == Node::Object)
-      Live.push_back(&S);
-    if (S.K == Node::Label && !Flow.Labels.emplace(S.Text, Live).second)
-      fail(S.At, "duplicate statement label");
-    if (S.K == Node::Goto)
-      Flow.Jumps.emplace_back(&S, Live);
-    if (S.K == Node::Block || S.K == Node::For || S.K == Node::Match ||
-        S.K == Node::Arm || S.K == Node::Tail) {
-      auto Nested = Live;
-      if (S.K == Node::Match || S.K == Node::Arm || S.K == Node::Tail)
-        Nested.push_back(&S);
-      for (auto &C : S.Children)
-        walk(C, Nested);
-      return;
-    }
-    for (auto &C : S.Children)
-      walk(C, Live);
-  };
-  for (auto &C : N.Children)
-    walk(C, Scope);
-  JumpCleanups Exited;
+  std::function<void(const Node &, Path &, bool)> walk =
+      [&](const Node &S, Path &Live, bool MatchArm) {
+        if (S.K == Node::Lambda || S.K == Node::Record || S.K == Node::Union ||
+            S.K == Node::Enumeration)
+          return;
+        if (S.K == Node::Object)
+          Live.push_back(&S);
+        if (S.K == Node::Label && !Flow.Labels.emplace(S.Text, Live).second)
+          fail(S.At, "duplicate statement label");
+        if (S.K == Node::Goto)
+          Flow.Jumps.emplace_back(&S, Live);
+        if (S.K == Node::Block || S.K == Node::For || S.K == Node::Match ||
+            S.K == Node::Arm || S.K == Node::Tail) {
+          auto Nested = Live;
+          if (MatchArm || S.K == Node::Tail)
+            Nested.push_back(&S);
+          for (auto &C : S.Children)
+            walk(C, Nested, S.K == Node::Match && C.K == Node::Arm);
+          return;
+        }
+        for (auto &C : S.Children)
+          walk(C, Live, false);
+      };
+  const bool HasCleanup = N.K == Node::Destructor && N.Children.size() > 1;
+  for (auto &C : N.Children) {
+    auto Phase = Scope;
+    // Body and Cleanup have distinct entries separated by the required
+    // automatic subobject retirement.
+    if (HasCleanup)
+      Phase.push_back(&C);
+    walk(C, Phase, false);
+  }
+  JumpCleanups Result;
   for (auto &[Jump, From] : Flow.Jumps) {
     auto It = Flow.Labels.find(Jump->Text);
     if (It == Flow.Labels.end())
       fail(Jump->At, "unknown statement label");
     auto &To = It->second;
+    if (HasCleanup && From[Scope.size()] != To[Scope.size()])
+      fail(Jump->At, "goto crosses a destructor phase boundary");
     if (To.size() > From.size() ||
         !std::equal(To.begin(), To.end(), From.begin()))
       fail(Jump->At, "goto enters an unexecuted initializer");
-    auto &Ended = Exited[{Jump->At.Line, Jump->At.Column}];
+    Result.Targets.insert(Jump->Text);
+    auto &Ended = Result.Exited[{Jump->At.Line, Jump->At.Column}];
     for (const auto *Object : llvm::ArrayRef(From).drop_front(To.size()))
       Ended.emplace(Object->At.Line, Object->At.Column);
   }
-  return Exited;
+  return Result;
 }
