@@ -216,6 +216,35 @@ struct Checker {
         visit(N.Children[2], refine(N.Children[0], false, Alts));
       return "";
     }
+    if (N.K == Node::Call && N.Children.front().K == Node::Name) {
+      auto Callee = operand(N.Children.front(), Variables);
+      auto Function = llvm::StringRef(Callee);
+      if (Function.consume_back("*"))
+        if (auto Signature = splitCallableType(Function)) {
+          auto ParamTypes = splitArguments(Signature->Parameters);
+          auto Arguments = llvm::ArrayRef(N.Children).drop_front();
+          if (ParamTypes.size() != Arguments.size())
+            fail(N.At, "function pointer argument arity is not established");
+          for (size_t I = 0; I < Arguments.size(); ++I) {
+            auto Parameter = llvm::StringRef(ParamTypes[I]);
+            if (Parameter.consume_back("...") != Arguments[I].Pack)
+              fail(Arguments[I].At,
+                   "function pointer pack shape is not established");
+            auto Actual = visit(Arguments[I], Alts);
+            auto Expected = valueType(Parameter.str());
+            if (Actual.empty())
+              continue;
+            for (const auto &Facts : Alts) {
+              auto A = representative(Actual, Facts);
+              auto E = representative(Expected, Facts);
+              if (A != E && (Parameters.count(A) || Parameters.count(E)))
+                fail(Arguments[I].At,
+                     "function pointer argument type is not established");
+            }
+          }
+          return valueType(Signature->Result.str());
+        }
+    }
     auto Op =
         operation(N, Variables, [&](const Node &C) { return visit(C, Alts); });
     if (!Op) {

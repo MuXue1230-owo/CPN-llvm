@@ -21,6 +21,12 @@ enum class Operation {
   Cast
 };
 enum class Projection { Checked, Wrapping, Saturating, Ordinary };
+enum class BitOperation { Reinterpret, Extract, Insert };
+enum class Extension { Source, Zero, Sign };
+struct BitInterface {
+  BitOperation Op;
+  bool Result = false, Assign = false, Truncate = false;
+};
 struct NumericOperation {
   Operation Op;
   Projection Policy;
@@ -43,9 +49,38 @@ struct NumericOperation {
   }
 };
 
-std::optional<NumericOperation> lookupOperation(StringRef Name) {
+StringRef numericName(StringRef Name) {
   Name.consume_front("::");
   Name.consume_front("std::numeric::");
+  return Name;
+}
+
+std::optional<BitInterface> lookupBits(StringRef Name) {
+  Name = numericName(Name);
+  if (Name == "reinterpret_bits")
+    return BitInterface{BitOperation::Reinterpret};
+  bool Result = Name.consume_front("checked_");
+  if (Name == "extract_bits")
+    return BitInterface{BitOperation::Extract, Result};
+  bool Assign = Name.consume_back("_assign");
+  if (Name == "insert_bits" || Name == "insert_bits_trunc")
+    return BitInterface{BitOperation::Insert, Result, Assign,
+                        Name == "insert_bits_trunc"};
+  return std::nullopt;
+}
+
+std::optional<Extension> extensionArgument(const Node &N) {
+  if (N.K != Node::Name)
+    return std::nullopt;
+  return llvm::StringSwitch<std::optional<Extension>>(N.Text)
+      .Case("Source", Extension::Source)
+      .Case("Zero", Extension::Zero)
+      .Case("Sign", Extension::Sign)
+      .Default(std::nullopt);
+}
+
+std::optional<NumericOperation> lookupOperation(StringRef Name) {
+  Name = numericName(Name);
   if (Name == "abs")
     return NumericOperation{Operation::Abs, Projection::Ordinary};
   if (Name == "magnitude")
@@ -167,11 +202,215 @@ Value numericResult(Frame &F, const Token &At, const std::string &ResultType,
   }
   return F.callResult(Type, nullptr, At, Storage);
 }
+
+Value numericTarget(Frame &F, const Node &Arg) {
+  if (F.InPredicate)
+    fail(Arg.At, "contract predicate cannot perform numeric assignment");
+  Value Target;
+  if (F.IR)
+    Target = F.place(Arg);
+  else if (auto Location = F.constantPlace(Arg)) {
+    Target.Type = Location->Type;
+    Target.Readonly = Location->Readonly;
+    Target.Location = std::make_shared<ConstantPlace>(std::move(*Location));
+  } else
+    fail(Arg.At, "numeric assignment requires a mutable target");
+  if (Target.Readonly || Target.Expiring || Target.Prvalue)
+    fail(Arg.At, "numeric assignment requires a mutable lvalue");
+  return Target;
+}
+
+Value deliverInteger(Frame &F, const Token &At, Value Number,
+                     const Value &Target, llvm::Value *Failed,
+                     llvm::Value *Code, llvm::Value *Changed,
+                     llvm::Value *Clamped, llvm::Value *Wrapped) {
+  bool Assign = !Target.Type.empty();
+  auto Commit = [&] {
+    if (F.IR)
+      F.B.CreateStore(Number.IR, Target.Address);
+    else
+      Target.Location->write(F, Number, At);
+  };
+  if (Code)
+    return numericResult(F, At, Assign ? "void" : Number.Type,
+                         Assign ? nullptr : Number.IR, Failed, Code, Changed,
+                         Clamped, Wrapped,
+                         Assign ? llvm::function_ref<void()>(Commit)
+                                : llvm::function_ref<void()>());
+  if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Failed);
+      Known && !Known->isZero()) {
+    if (!F.IR)
+      fail(At, "numeric operation fails in required constant evaluation");
+    F.Opt.diagnose(At, Severity::Anomaly, {},
+                   "named operation selects NumericTrap");
+  }
+  F.guard(Failed, "numeric");
+  if (Assign)
+    Commit();
+  return Assign ? Value{"void"} : Number;
+}
+
+Value representationSource(Frame &F, Value Input, const Token &At) {
+  if (!integer(Input.Type))
+    fail(At, "bit operation requires a representation-width integer");
+  return F.convert(Input, F.materializationType(Input.Type, At), At);
+}
+
+Value reinterpretBits(Frame &F, const Node &Call,
+                      const std::vector<Node> &Args) {
+  if (Call.TemplateArgs.size() != 1 || Args.empty() || Args.size() > 2)
+    fail(Call.At, "reinterpret_bits requires a destination and a source");
+  auto T = F.resolve(Call.TemplateArgs.front().Type, Call.At);
+  if (!integer(T) || T == "integer")
+    fail(Call.At,
+         "bit reinterpretation requires an enabled integer destination");
+  auto Source = F.load(F.eval(Args.front()));
+  if (Source.Type == "never")
+    return Source;
+  Source = representationSource(F, std::move(Source), Call.At);
+  auto ExtensionMode =
+      Args.size() == 2 ? extensionArgument(Args.back()) : Extension::Source;
+  if (!ExtensionMode)
+    fail(Args.back().At, "bit extension must be Source, Zero or Sign");
+  if (width(T) < width(Source.Type))
+    F.Opt.diagnose(Call.At, Severity::Warning, "NUM002",
+                   "bit reinterpretation discards high representation bits");
+  return {T, F.B.CreateIntCast(Source.IR, F.U.ir(T),
+                               *ExtensionMode == Extension::Sign ||
+                                   (*ExtensionMode == Extension::Source &&
+                                    signedType(Source.Type)))};
+}
+
+Value bitField(Frame &F, const Node &Call, const std::vector<Node> &Args,
+               BitInterface Interface) {
+  const bool Extract = Interface.Op == BitOperation::Extract;
+  const bool Static = Extract && Call.TemplateArgs.size() == 2;
+  if ((Extract && ((!Static && Call.TemplateArgs.size() != 1) ||
+                   Args.size() != (Static ? 1u : 3u))) ||
+      (!Extract && (!Call.TemplateArgs.empty() || Args.size() != 4)))
+    fail(Call.At, "invalid bit field operation arguments");
+  Value Target;
+  Value Source;
+  if (Interface.Assign)
+    Target = numericTarget(F, Args.front());
+  else
+    Source = F.load(F.eval(Args.front()));
+  auto Index = [&](unsigned I) {
+    return Static ? F.load(F.constantEval(Call.TemplateArgs[I]))
+                  : F.load(F.eval(Args[I + 1]));
+  };
+  auto Start = Index(0);
+  auto Length = Index(1);
+  Value Field;
+  if (!Extract)
+    Field = F.load(F.eval(Args[3]));
+  if (Interface.Assign)
+    Source = F.load(Target);
+  if (Source.Type == "never" || Start.Type == "never" ||
+      Length.Type == "never" || Field.Type == "never")
+    return {"never"};
+  Source = representationSource(F, std::move(Source), Call.At);
+  if (!integer(Start.Type) || !integer(Length.Type))
+    fail(Call.At, "bit range requires integer start and width");
+  if (!Extract && !integer(Field.Type))
+    fail(Call.At, "bit insertion requires an integer value");
+
+  const unsigned N = width(Source.Type);
+  auto &B = F.B;
+  auto Bits = [](const Value &V) {
+    return V.IR->getType()->getIntegerBitWidth();
+  };
+  auto *RangeType = B.getIntNTy(std::max({Bits(Start), Bits(Length), 8u}) + 1);
+  auto *Zero = llvm::ConstantInt::get(RangeType, 0);
+  auto *End = llvm::ConstantInt::get(RangeType, N);
+  auto *S = B.CreateIntCast(Start.IR, RangeType, signedType(Start.Type));
+  auto *W = B.CreateIntCast(Length.IR, RangeType, signedType(Length.Type));
+  auto *BadStart = B.CreateICmpUGE(S, End);
+  auto *BadWidth =
+      B.CreateOr(B.CreateICmpSLE(W, Zero), B.CreateICmpUGT(W, End));
+  auto *Remaining = B.CreateSub(End, B.CreateSelect(BadStart, Zero, S));
+  auto *BadRange =
+      B.CreateOr(B.CreateOr(BadStart, BadWidth), B.CreateICmpUGT(W, Remaining));
+  auto KnownTrue = [](llvm::Value *Test) {
+    auto *C = llvm::dyn_cast<llvm::ConstantInt>(Test);
+    return C && C->isOne();
+  };
+  if (KnownTrue(BadStart) || KnownTrue(BadWidth) || KnownTrue(BadRange))
+    fail(Call.At, "NUM001: statically invalid bit range");
+
+  auto T = Source.Type;
+  if (Static) {
+    auto Width = llvm::cast<llvm::ConstantInt>(W)->getZExtValue();
+    T = "u" + std::to_string(Width);
+    if (!F.Opt.IntegerWidths.count(Width))
+      fail(Call.At,
+           "CFG002: bit extraction result type " + T + " is unavailable");
+  } else if (Extract) {
+    T = F.resolve(Call.TemplateArgs.front().Type, Call.At);
+    if (T != "u8" && T != "u16" && T != "u32" && T != "u64")
+      fail(Call.At,
+           "bit extraction destination must be an unsigned fixed integer");
+    BadRange = B.CreateOr(
+        BadRange,
+        B.CreateICmpUGT(W, llvm::ConstantInt::get(RangeType, width(T))));
+  }
+  // Keep the shifts defined even on a failing Result path. A one-bit wider
+  // work type also handles an admitted full-width mask.
+  auto *Work = B.getIntNTy(N + 1);
+  auto *SafeStart =
+      B.CreateIntCast(B.CreateSelect(BadRange, Zero, S), Work, false);
+  auto *SafeWidth =
+      B.CreateIntCast(B.CreateSelect(BadRange, Zero, W), Work, false);
+  auto *One = llvm::ConstantInt::get(Work, 1);
+  auto *Mask = B.CreateSub(B.CreateShl(One, SafeWidth), One);
+  auto *Input = B.CreateZExt(Source.IR, Work);
+  llvm::Value *Failure = BadRange;
+  llvm::Value *Changed = B.getFalse();
+  llvm::Value *Output;
+  if (Extract)
+    Output = B.CreateAnd(B.CreateLShr(Input, SafeStart), Mask);
+  else {
+    auto *FieldType = B.getIntNTy(std::max(N, Bits(Field)) + 1);
+    auto *Exact = B.CreateIntCast(Field.IR, FieldType, signedType(Field.Type));
+    auto *Bound = B.CreateIntCast(Mask, FieldType, false);
+    auto *DoesNotFit =
+        B.CreateOr(B.CreateIsNeg(Exact), B.CreateICmpUGT(Exact, Bound));
+    auto *Selected = B.CreateAnd(B.CreateIntCast(Exact, Work, false), Mask);
+    auto *Cleared =
+        B.CreateAnd(Input, B.CreateNot(B.CreateShl(Mask, SafeStart)));
+    Output = B.CreateOr(Cleared, B.CreateShl(Selected, SafeStart));
+    if (Interface.Truncate)
+      Changed = B.CreateAnd(DoesNotFit, B.CreateNot(BadRange));
+    else
+      Failure = B.CreateOr(BadRange, DoesNotFit);
+  }
+  llvm::Value *Code = nullptr;
+  if (Interface.Result)
+    Code = B.CreateSelect(BadRange, numericError(F.U, "InvalidBitRange"),
+                          numericError(F.U, "OutOfRange"));
+  return deliverInteger(F, Call.At,
+                        {T, B.CreateIntCast(Output, F.U.ir(T), false)}, Target,
+                        Failure, Code, Changed, B.getFalse(), Changed);
+}
 } // namespace
 
 bool cpn::integerLibraryName(StringRef Name, bool ExplicitDestination) {
+  if (auto Bits = lookupBits(Name))
+    return !ExplicitDestination || Bits->Op != BitOperation::Insert;
   auto Op = lookupOperation(Name);
   return Op && (!ExplicitDestination || Op->destination());
+}
+
+bool cpn::bitExtractionName(StringRef Name) {
+  Name = numericName(Name);
+  return Name == "extract_bits" || Name == "checked_extract_bits";
+}
+
+bool cpn::bitExtensionArgument(const Node &Call) {
+  auto &A = Call.Children;
+  return Call.K == Node::Call && A.size() == 3 && A.front().K == Node::Name &&
+         numericName(A.front().Text) == "reinterpret_bits" &&
+         extensionArgument(A.back()).has_value();
 }
 
 bool cpn::usesNumericLibrary(const Node &D) {
@@ -294,6 +533,10 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
                                          const std::vector<Node> &Args) {
   if (Call.K != Node::Name)
     return std::nullopt;
+  if (auto Bits = lookupBits(Name))
+    return Bits->Op == BitOperation::Reinterpret
+               ? reinterpretBits(*this, Call, Args)
+               : bitField(*this, Call, Args, *Bits);
   auto Spec = lookupOperation(Name);
   if (!Spec)
     return std::nullopt;
@@ -302,23 +545,11 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
       Call.TemplateArgs.size() > (Spec->destination() ? 1u : 0u) ||
       (Op == Operation::Cast && Call.TemplateArgs.empty()))
     fail(Call.At, "invalid named numeric operation arguments");
-  if (InPredicate && Assign)
-    fail(Call.At, "contract predicate cannot perform numeric assignment");
-
   Value Target;
   Value Left;
-  if (Assign) {
-    if (IR)
-      Target = place(Args.front());
-    else if (auto Location = constantPlace(Args.front())) {
-      Target.Type = Location->Type;
-      Target.Readonly = Location->Readonly;
-      Target.Location = std::make_shared<ConstantPlace>(std::move(*Location));
-    } else
-      fail(Args.front().At, "numeric assignment requires a mutable target");
-    if (Target.Readonly)
-      fail(Args.front().At, "numeric assignment to a read-only target");
-  } else
+  if (Assign)
+    Target = numericTarget(*this, Args.front());
+  else
     Left = load(eval(Args.front()));
   Value Right;
   if (!Spec->unary())
@@ -453,35 +684,15 @@ std::optional<Value> Frame::namedInteger(const Node &Call, StringRef Name,
           ? B.CreateSelect(Low, Minimum, B.CreateSelect(High, Maximum, Exact))
           : Exact,
       U.ir(T, Call.At));
-  auto Commit = [&] {
-    if (IR)
-      B.CreateStore(Number, Target.Address);
-    else
-      Target.Location->write(*this, {T, Number}, Call.At);
-  };
-  if (!Fallible) {
-    if (auto *Known = llvm::dyn_cast<llvm::ConstantInt>(Failed);
-        Known && !Known->isZero()) {
-      if (!IR)
-        fail(Call.At,
-             "numeric operation fails in required constant evaluation");
-      Opt.diagnose(Call.At, Severity::Anomaly, "NUM002",
-                   "named operation selects NumericTrap");
-    }
-    guard(Failed, "numeric");
-    if (Assign)
-      Commit();
-    return Assign ? Value{"void"} : Value{T, Number};
-  }
   auto *Changed =
       Checked ? B.getFalse() : B.CreateAnd(Outside, B.CreateNot(BadDomain));
-  llvm::Value *Code = numericError(U, "OutOfRange");
-  if (!DomainCode.empty())
-    Code = B.CreateSelect(BadDomain, numericError(U, DomainCode), Code);
-  return numericResult(*this, Call.At, Assign ? "void" : T,
-                       Assign ? nullptr : Number, Failed, Code, Changed,
-                       Saturating ? Changed : B.getFalse(),
-                       Saturating ? B.getFalse() : Changed,
-                       Assign ? llvm::function_ref<void()>(Commit)
-                              : llvm::function_ref<void()>());
+  llvm::Value *Code = nullptr;
+  if (Fallible) {
+    Code = numericError(U, "OutOfRange");
+    if (!DomainCode.empty())
+      Code = B.CreateSelect(BadDomain, numericError(U, DomainCode), Code);
+  }
+  return deliverInteger(*this, Call.At, {T, Number}, Target, Failed, Code,
+                        Changed, Saturating ? Changed : B.getFalse(),
+                        Saturating ? B.getFalse() : Changed);
 }

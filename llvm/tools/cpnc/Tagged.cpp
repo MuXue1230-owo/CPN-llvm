@@ -247,8 +247,7 @@ void Frame::constantMatch(const Node &N) {
         V = constantCopy(V, P.At);
         V.Prvalue = V.Expiring = false;
         V.Readonly = false;
-        if (U.aggregate(V.Type))
-          Bindings.ConstantDrops.push_back(P.Text);
+        Bindings.ConstantDrops.push_back(P.Text);
       }
       Bindings.Names.emplace(P.Text, V);
     }
@@ -352,8 +351,11 @@ void Frame::match(const Node &N) {
   auto *End = block("match.end"), *Invalid = block("match.invalid");
   auto *SW = B.CreateSwitch(B.CreateExtractValue(Subject.IR, 0), Invalid);
   std::set<std::string> Seen;
+  const auto IncomingStorage = Active;
+  std::optional<std::map<std::string, int>> CompletedStorage;
   bool Any = false, Wild = false;
   for (size_t I = 1; I < N.Children.size(); ++I) {
+    Active = IncomingStorage;
     auto &Arm = N.Children[I];
     auto *BB = block("match.case");
     B.SetInsertPoint(BB);
@@ -403,8 +405,12 @@ void Frame::match(const Node &N) {
       Transaction->restoreFlow(Arm.Children[0]);
     stmt(Arm.Children[0]);
     Any |= Live;
-    if (Live)
+    if (Live) {
       cleanup(Scopes.size() - 1);
+      if (CompletedStorage)
+        joinStorage(*CompletedStorage);
+      CompletedStorage = Active;
+    }
     branch(End);
     Scopes.pop_back();
   }
@@ -413,6 +419,7 @@ void Frame::match(const Node &N) {
   B.SetInsertPoint(Invalid);
   B.CreateUnreachable();
   B.SetInsertPoint(End);
+  Active = CompletedStorage.value_or(IncomingStorage);
   if (Transaction)
     Transaction->restoreFlow(N, true);
   Live = Any;

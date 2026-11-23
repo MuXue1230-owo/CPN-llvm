@@ -98,6 +98,16 @@ llvm::Constant *destructor(Frame &F, const std::string &T) {
   return llvm::ConstantPointerNull::get(F.B.getPtrTy());
 }
 
+ConstantPlace constantExtent(Frame &F, const Value &View, const Token &At) {
+  auto *Identity = llvm::dyn_cast_or_null<llvm::GlobalVariable>(View.IR);
+  auto Saved = F.U.LocalConstantAddresses.find(Identity);
+  if (View.Type != StorageViewType || Saved == F.U.LocalConstantAddresses.end())
+    fail(At, "constant storage view required");
+  auto Place = Saved->second.Place;
+  Place.checkLifetime(At, /*ExtentOnly=*/true);
+  return Place;
+}
+
 void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
                           bool Destroy, bool MayRunCleanup, bool Explicit) {
   auto CompleteType =
@@ -253,6 +263,109 @@ void Frame::replaceGeneration(const Value &V, const std::string &T,
   if (!V.Subobject && !V.Storage.empty())
     Active[V.Storage] = 1;
 }
+
+Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
+  if (C.Text == "construct_at") {
+    auto Extent = constantExtent(*this, eval(Args.front()), C.At);
+    auto &Original = *Extent.Root;
+    auto &Storage = *Original.ConstantIdentity.Storage;
+    if (Storage.Constructing)
+      fail(C.At, "storage has a construction in progress");
+    if (Storage.Retiring ||
+        (Storage.Replacement &&
+         Storage.Replacement->ConstantIdentity.Storage->Retiring))
+      fail(C.At, "storage has a destruction in progress");
+    if (!Storage.Ended ||
+        (Storage.Replacement &&
+         !Storage.Replacement->ConstantIdentity.Storage->Ended))
+      fail(C.At, "storage contains a live generation");
+    auto Type = resolve(C.TemplateArgs.front().Type, C.At);
+    auto *Requested = U.ir(Type, C.At);
+    auto *Existing = U.ir(Original.Type, C.At);
+    if (!Requested->isSized())
+      fail(C.At, "replacement requires a complete object type");
+    const auto &Layout = U.M.getDataLayout();
+    if (Layout.getTypeAllocSize(Requested).getFixedValue() >
+        Layout.getTypeAllocSize(Existing).getFixedValue())
+      fail(C.At, "insufficient storage capacity");
+    if (Layout.getABITypeAlign(Requested) > Layout.getABITypeAlign(Existing))
+      fail(C.At, "insufficient storage alignment");
+    llvm::SaveAndRestore Construction(Storage.Constructing, true);
+    auto Built = construct(Type, {Args.begin() + 1, Args.end()}, C.At);
+    consume(Built);
+    Built.Location.reset();
+    Built.ConstantTemporary.reset();
+    Built.Prvalue = Built.Expiring = false;
+    auto Replacement = std::make_shared<Value>(std::move(Built));
+    ConstantPlace New{
+        Replacement.get(), {}, Replacement->Type, Replacement->Readonly};
+    New.trackLifetime();
+    Replacement->ConstantIdentity.Storage->OriginalExtent =
+        std::make_shared<ConstantPlace>(Extent);
+    Storage.Replacement = std::move(Replacement);
+    return constantAddress(New, C.At);
+  }
+
+  auto Designation = constantPlace(Args.front());
+  bool View = C.Text == "storage_of";
+  if (!Designation)
+    fail(C.At, "constant storage operation requires an automatic object");
+  auto Place = *Designation;
+  Place.checkLifetime(C.At, View);
+  if (Place.Root->Address)
+    fail(C.At, "constant storage operation requires an automatic object");
+  if (!Place.Steps.empty())
+    fail(C.At, "constant storage operation on a subobject is unavailable");
+  if (View) {
+    auto Storage = Place.Root->ConstantIdentity.Storage;
+    if (Storage->OriginalExtent)
+      Place = *Storage->OriginalExtent;
+    auto Address = constantAddress(Place, C.At, /*ExtentOnly=*/true);
+    Address.Type = StorageViewType;
+    return Address;
+  }
+  if (ConstantReceiver == Place.Root && F && F->Decl.K == Node::Destructor)
+    fail(C.At, "destruction is already in progress");
+  retireConstantCell(*Place.Root, C.At, /*Explicit=*/true, C.Text == "destroy");
+  return {"void"};
+}
+
+Value Frame::storageViewObserver(Value View, llvm::StringRef Name,
+                                 const Token &At) {
+  if (Name != "capacity_bytes" && Name != "alignment" && Name != "identity")
+    fail(At, "unknown StorageView observer '" + Name.str() + "'");
+  if (!IR) {
+    auto Extent = constantExtent(*this, View, At);
+    if (Name == "identity") {
+      auto &Identity = Extent.Root->ConstantIdentity.Storage->Identity;
+      if (!Identity) {
+        // Runtime extent birth identifiers are odd.
+        if (!U.NextConstantStorageIdentity)
+          fail(At, "constant storage identity budget exhausted");
+        Identity = U.NextConstantStorageIdentity;
+        U.NextConstantStorageIdentity += 2;
+      }
+      return {StorageIdentityType, B.getInt64(Identity)};
+    }
+    auto *Type = U.ir(Extent.Type, At);
+    const auto &Layout = U.M.getDataLayout();
+    auto Value = Name == "capacity_bytes"
+                     ? Layout.getTypeAllocSize(Type).getFixedValue()
+                     : Layout.getABITypeAlign(Type).value();
+    return {"usize", B.getInt64(Value)};
+  }
+  if (!TracksStorage || !View.Slot || !View.Generation)
+    fail(At, "StorageView has no authorized extent");
+  guard(B.CreateNot(B.CreateCall(U.M.getFunction("cpn.extent.valid"),
+                                 {View.Slot, View.Generation})));
+  if (Name == "identity")
+    return {StorageIdentityType, View.Generation};
+  auto Field = Name == "capacity_bytes" ? Capacity : Alignment;
+  return {"usize",
+          B.CreateLoad(B.getInt64Ty(),
+                       B.CreateStructGEP(U.SlotType, View.Slot, Field))};
+}
+
 Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
   if (!TracksStorage)
     fail(C.At, "storage operation requires runtime object storage");

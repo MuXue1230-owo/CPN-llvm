@@ -89,6 +89,8 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     return llvm::Type::getVoidTy(C);
   if (T == "nullptr_t")
     return llvm::Type::getInt8Ty(C);
+  if (memoryIdentity(T))
+    return llvm::Type::getInt64Ty(C);
   if (T == StorageViewType || StringRef(T).ends_with("*") ||
       StringRef(T).ends_with("&"))
     return llvm::PointerType::getUnqual(C);
@@ -442,20 +444,11 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (auto Q = U.TypeQueries.find(S); Q != U.TypeQueries.end())
     return unevaluatedType(Q->second.Children.front(), true);
   if (StringRef(S).starts_with("function<") && StringRef(S).ends_with(">")) {
-    size_t Open = 9, Close = S.rfind(')');
-    unsigned Depth = 0;
-    for (; Open < S.size(); ++Open) {
-      if (S[Open] == '(' && !Depth)
-        break;
-      if (S[Open] == '<')
-        ++Depth;
-      if (S[Open] == '>' && Depth)
-        --Depth;
-    }
-    if (Open >= S.size() || Close == std::string::npos || Close < Open)
+    auto Parts = splitCallableType(S);
+    if (!Parts)
       fail(At, "invalid function type");
-    std::vector<std::string> Sig = {resolve(S.substr(9, Open - 9), At)};
-    for (auto &P : splitArguments(StringRef(S).slice(Open + 1, Close)))
+    std::vector<std::string> Sig = {resolve(Parts->Result.str(), At)};
+    for (auto &P : splitArguments(Parts->Parameters))
       Sig.push_back(unconst(resolve(P, At)));
     auto Canonical = "function<" + Sig.front() + "(";
     for (size_t I = 1; I < Sig.size(); ++I) {
@@ -463,7 +456,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
         Canonical += ",";
       Canonical += Sig[I];
     }
-    Canonical += S.substr(Close);
+    Canonical += ")" + Parts->Flags.str() + ">";
     for (auto Flag : callableFlags(Canonical)) {
       bool Result = Flag.consume_front("borrow#");
       bool Consuming = Flag.consume_front("consumes#");
@@ -489,7 +482,7 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (integer(S) && S != "integer" && !StringRef(S).ends_with("size") &&
       !Opt.IntegerWidths.count(width(S)))
     fail(At, "CFG002: integer type " + S + " is disabled");
-  if (builtin(S) || S == "auto" || S == StorageViewType)
+  if (builtin(S) || S == "auto" || S == StorageViewType || memoryIdentity(S))
     return S;
   for (auto I = Scopes.rbegin(); I != Scopes.rend(); ++I) {
     if (auto Alias = I->Aliases.find(S); Alias != I->Aliases.end())
@@ -1209,6 +1202,7 @@ void Context::declareMembers(const std::string &Name, const std::string &P) {
   buildTables(Name, Members);
   for (auto *F : Members)
     bindContracts(*F);
+  validateOverrides(Name, Members);
   validateInvariants(Name);
   if (auto Bodies = OwnerBodies.find({N.At.Line, N.At.Column});
       Bodies != OwnerBodies.end())
@@ -1546,9 +1540,11 @@ void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
     if (N.K == Node::TypeQuery)
       U.TypeQueries.emplace(N.Text, N);
   U.Whole = llvm::any_of(AST, Frame::usesWhole);
-  if (U.Whole || llvm::any_of(AST, Frame::usesStorage))
+  const bool Memory = llvm::any_of(AST, usesMemoryLibrary);
+  if (U.Whole || Memory || llvm::any_of(AST, Frame::usesStorage))
     U.enableStorage();
   U.bindScalarLibrary();
+  U.bindMemoryLibrary(Memory);
   if (llvm::any_of(AST, usesNumericLibrary))
     U.bindNumericLibrary();
   U.unit(AST);

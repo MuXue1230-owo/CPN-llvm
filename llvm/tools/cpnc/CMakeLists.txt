@@ -35,6 +35,7 @@ if("X86" IN_LIST LLVM_TARGETS_TO_BUILD)
     Invariants.cpp
     Lexer.cpp
     Lifetime.cpp
+    MemoryLibrary.cpp
     Whole.cpp
     Parser.cpp
     PointerCalls.cpp

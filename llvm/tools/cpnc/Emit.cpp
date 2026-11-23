@@ -183,8 +183,7 @@ void Frame::bindParams() {
       readReferent(V, incomingPointerCell(J + 1));
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
-    if (!P.Text.empty() || !F->Decl.Contracts.empty())
-      Scopes[0].Names[parameterBinding(F->Decl, J)] = V;
+    Scopes[0].Names[parameterBinding(F->Decl, J)] = V;
   }
 }
 void Frame::bindInlineParams(const std::vector<Value> &Actual,
@@ -241,7 +240,7 @@ void Frame::bindInlineParams(const std::vector<Value> &Actual,
         trackLocal(V, "parameter.");
       if (IR)
         Scopes.front().Drops.push_back(V);
-      else if (U.aggregate(V.Type)) {
+      else {
         auto Name =
             Param.Text.empty() ? "$arg." + std::to_string(I) : Param.Text;
         Scopes.front().Names[Name] = V;
@@ -1435,6 +1434,14 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   }
   auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
   auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values);
+  unsigned ABIHeaders =
+      (ResultStorage != nullptr) + (!D.Owner.empty() && !D.isStatic());
+  bool MayWriteCallStorage =
+      ResultStorage || D.MayWhole || !D.Consumes.empty() ||
+      llvm::any_of(D.Params,
+                   [&](const auto &Type) { return U.aggregate(Type); });
+  describeBorrowCall(*Call, T, Opt, D.Params, ABIHeaders, D.NoEscape,
+                     D.BorrowedResult, D.Effects, MayWriteCallStorage);
   if (D.Slot >= 0)
     describeEffectCall(*Call, D.Effects, ResultStorage ? 1 : 0, true, D.IR);
   Call->setAttributes(D.IR->getAttributes());
@@ -1601,6 +1608,8 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
   auto Name = C.Text;
+  if (auto Memory = memoryCall(C, Args, Receiver))
+    return *Memory;
   if (auto Scalar = scalarConversion(C, Name, Args))
     return *Scalar;
   if (InPredicate &&
@@ -1649,7 +1658,7 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
        Args.size() == 1) ||
       (Name == "construct_at" && !Args.empty() && C.TemplateArgs.size() == 1)) {
     if (!IR)
-      fail(C.At, "storage operation requires runtime storage");
+      return constantStorageCall(C, Args);
     return storageCall(C, Args);
   }
   if (C.K == Node::Name && typeCallee(Name, C.At)) {
@@ -1809,6 +1818,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        bool AsBase) {
   if (InPredicate && U.aggregate(T))
     fail(At, "contract predicates cannot construct aggregate temporaries");
+  if ((T == StorageViewType || memoryIdentity(T)) && Args.empty())
+    fail(At, "memory capability requires an authorized source");
   if (!Args.empty() && Args.back().K == Node::Tail)
     return construct(T, {Args.begin(), Args.end() - 1}, At, Dest, &Args.back(),
                      AsBase);
@@ -2500,8 +2511,7 @@ void Frame::object(const Node &N, bool Global) {
     V.Address = nullptr;
     V.DeclaredAt = {N.At.Line, N.At.Column};
     names()[Name] = V;
-    if (U.aggregate(V.Type))
-      Scopes.back().ConstantDrops.push_back(Name);
+    Scopes.back().ConstantDrops.push_back(Name);
     endExpression();
     return;
   }
@@ -2601,10 +2611,10 @@ void Frame::rewindConstantScope(const ConstantTransfer &Jump,
   // remaining departed objects in this scope form a suffix in construction
   // order.
   while (!Scope.ConstantDrops.empty()) {
-    const auto &V = Scope.Names.at(Scope.ConstantDrops.back());
+    auto &V = Scope.Names.at(Scope.ConstantDrops.back());
     if (!Exited.count(V.DeclaredAt))
       break;
-    constantDrop(V, Jump.At);
+    retireConstantCell(V, Jump.At);
     Scope.ConstantDrops.pop_back();
   }
   for (auto I = Scope.Names.begin(); I != Scope.Names.end();) {

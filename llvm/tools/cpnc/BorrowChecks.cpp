@@ -1,10 +1,38 @@
 #include "Sema.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/Support/MathExtras.h"
 
 using namespace cpn;
 namespace {
+constexpr llvm::StringRef BorrowMetadata = "cpn.borrow.call";
+enum CallField {
+  Line,
+  Column,
+  Disposition,
+  ReadOnly,
+  Retainable,
+  ResultSources
+};
+enum Mode { Suppressed, Anomaly, Error };
+
+unsigned callSetting(const llvm::MDNode &Descriptor, unsigned Field) {
+  return llvm::mdconst::extract<llvm::ConstantInt>(Descriptor.getOperand(Field))
+      ->getZExtValue();
+}
+
+llvm::SmallVector<unsigned> positions(const llvm::MDNode *Descriptor,
+                                      unsigned Field) {
+  llvm::SmallVector<unsigned> Result;
+  if (Descriptor)
+    for (const auto &Operand :
+         llvm::cast<llvm::MDNode>(Descriptor->getOperand(Field))->operands())
+      Result.push_back(
+          llvm::mdconst::extract<llvm::ConstantInt>(Operand)->getZExtValue());
+  return Result;
+}
+
 struct Slot {
   llvm::Value *Base;
   int64_t Offset;
@@ -18,6 +46,8 @@ struct Invocation {
 // slot establishes its source. An intervening possible alias makes it unknown.
 class EscapeCheck {
   const llvm::DataLayout &DL;
+  llvm::Function &Root;
+  llvm::StringRef Input;
   llvm::SmallPtrSet<llvm::Value *, 8> Automatic;
   llvm::SmallPtrSet<llvm::Value *, 8> NoRetention, NoPublication;
   llvm::Value *Result;
@@ -25,6 +55,7 @@ class EscapeCheck {
   const std::map<llvm::Value *, llvm::Type *> &Globals;
   const llvm::SmallPtrSetImpl<llvm::Function *> &Definitions;
   const llvm::SmallPtrSetImpl<llvm::Function *> &TrivialDrops;
+  bool StableRegistrations;
   llvm::SmallPtrSet<llvm::BasicBlock *, 32> Reachable;
 
   Slot slot(llvm::Value *P) const {
@@ -66,7 +97,10 @@ class EscapeCheck {
       return !disjoint(Target, Dest,
                        DL.getTypeStoreSize(S->getValueOperand()->getType()));
     }
-    if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I))
+    if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+      if (auto *Descriptor = Call->getMetadata(BorrowMetadata);
+          Descriptor && callSetting(*Descriptor, ReadOnly))
+        return false;
       if (auto *F = Call->getCalledFunction()) {
         const auto Name = F->getName();
         if (Name == "cpn.static.read" || Name == "cpn.pointer.field" ||
@@ -78,18 +112,28 @@ class EscapeCheck {
         if (F->getIntrinsicID() == llvm::Intrinsic::lifetime_start ||
             F->getIntrinsicID() == llvm::Intrinsic::lifetime_end)
           return false;
-        if (Name == "cpn.slot.retire" && !TrivialDrops.empty())
+        if (Name == "cpn.slot.retire") {
+          if (auto *Destroy =
+                  llvm::dyn_cast<llvm::ConstantInt>(Call->getArgOperand(1));
+              Destroy && Destroy->isZero())
+            return false;
           if (auto *Registration =
-                  llvm::dyn_cast<llvm::AllocaInst>(Call->getArgOperand(0)))
+                  llvm::dyn_cast<llvm::AllocaInst>(Call->getArgOperand(0));
+              StableRegistrations && Registration)
             for (auto *Use : Registration->users())
               if (auto *Begin = llvm::dyn_cast<llvm::CallBase>(Use))
                 if (auto *Callee = Begin->getCalledFunction();
                     Callee && Callee->getName() == "cpn.slot.begin" &&
-                    Begin->getArgOperand(0) == Registration &&
-                    TrivialDrops.contains(llvm::dyn_cast<llvm::Function>(
-                        Begin->getArgOperand(3))))
-                  return false;
+                    Begin->getArgOperand(0) == Registration) {
+                  auto *Drop = Begin->getArgOperand(3);
+                  if (llvm::isa<llvm::ConstantPointerNull>(Drop) ||
+                      TrivialDrops.contains(
+                          llvm::dyn_cast<llvm::Function>(Drop)))
+                    return false;
+                }
+        }
       }
+    }
     return true;
   }
   using Prohibited = llvm::function_ref<bool(llvm::Value *)>;
@@ -106,9 +150,15 @@ class EscapeCheck {
       return originatesFrom(Activation->Call.getArgOperand(A->getArgNo()),
                             Budget, Denied, Activation->Caller);
     if (auto *Call = llvm::dyn_cast<llvm::CallBase>(Base)) {
-      auto *Callee = Call->getCalledFunction();
-      if (!Callee || !Definitions.contains(Callee))
+      auto *Callee = knownTarget(*Call, Budget, Activation);
+      if (!Callee || !Definitions.contains(Callee)) {
+        for (auto I :
+             positions(Call->getMetadata(BorrowMetadata), ResultSources))
+          if (originatesFrom(Call->getArgOperand(I), Budget, Denied,
+                             Activation))
+            return true;
         return false;
+      }
       Invocation Nested{*Call, Activation};
       llvm::SmallPtrSet<llvm::BasicBlock *, 8> Visited;
       llvm::SmallVector<llvm::BasicBlock *> Work{&Callee->getEntryBlock()};
@@ -138,16 +188,31 @@ class EscapeCheck {
              originatesFrom(Select->getFalseValue(), Budget, Denied,
                             Activation);
     }
+    if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(Base))
+      for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I) {
+        if (Phi->getIncomingValue(I) == Phi)
+          continue;
+        if (!Activation && !Reachable.contains(Phi->getIncomingBlock(I)))
+          continue;
+        if (originatesFrom(Phi->getIncomingValue(I), Budget, Denied,
+                           Activation))
+          return true;
+      }
     auto *L = llvm::dyn_cast<llvm::LoadInst>(Base);
     if (!L || !L->getType()->isPointerTy() || L->isVolatile())
       return false;
-    return reachingOrigin(slot(L->getPointerOperand()), L->getParent(),
-                          L->getIterator(), Budget, Denied, Activation);
+    if (auto Stored =
+            reachingStore(slot(L->getPointerOperand()), L->getParent(),
+                          L->getIterator(), Budget, Activation))
+      return originatesFrom(Stored->first->getValueOperand(), Budget, Denied,
+                            Stored->second);
+    return false;
   }
 
-  bool reachingOrigin(Slot Target, llvm::BasicBlock *BB,
-                      llvm::BasicBlock::iterator It, unsigned &Budget,
-                      Prohibited Denied, const Invocation *Activation) const {
+  std::optional<std::pair<llvm::StoreInst *, const Invocation *>>
+  reachingStore(Slot Target, llvm::BasicBlock *BB,
+                llvm::BasicBlock::iterator It, unsigned &Budget,
+                const Invocation *Activation) const {
     while (Budget) {
       --Budget;
       if (It == BB->begin()) {
@@ -156,13 +221,13 @@ class EscapeCheck {
         if (Activation && BB == &BB->getParent()->getEntryBlock()) {
           auto *A = llvm::dyn_cast<llvm::Argument>(Target.Base);
           if (!A)
-            return false;
+            return std::nullopt;
           auto &Call = Activation->Call;
           auto Actual = slot(Call.getArgOperand(A->getArgNo()));
           if (llvm::AddOverflow(Actual.Offset, Target.Offset, Actual.Offset))
-            return false;
-          return reachingOrigin(Actual, Call.getParent(), Call.getIterator(),
-                                Budget, Denied, Activation->Caller);
+            return std::nullopt;
+          return reachingStore(Actual, Call.getParent(), Call.getIterator(),
+                               Budget, Activation->Caller);
         }
         BB = BB->getSinglePredecessor();
         if (!BB)
@@ -175,14 +240,41 @@ class EscapeCheck {
         auto Dest = slot(S->getPointerOperand());
         if (Dest.Base == Target.Base && Dest.Offset == Target.Offset &&
             S->getValueOperand()->getType()->isPointerTy())
-          return originatesFrom(S->getValueOperand(), Budget, Denied,
-                                Activation);
+          return std::make_pair(S, Activation);
       }
       if (mayChange(I, Target))
         break;
     }
-    return false;
+    return std::nullopt;
   }
+
+  llvm::Function *knownTarget(const llvm::CallBase &Call, unsigned &Budget,
+                              const Invocation *Activation) const {
+    auto *V = Call.getCalledOperand();
+    while (Budget) {
+      --Budget;
+      V = V->stripPointerCasts();
+      if (auto *F = llvm::dyn_cast<llvm::Function>(V))
+        return F;
+      if (auto *A = llvm::dyn_cast<llvm::Argument>(V); A && Activation) {
+        V = Activation->Call.getArgOperand(A->getArgNo());
+        Activation = Activation->Caller;
+        continue;
+      }
+      auto *Load = llvm::dyn_cast<llvm::LoadInst>(V);
+      if (!Load || Load->isVolatile() || Load->isAtomic())
+        return nullptr;
+      auto Stored =
+          reachingStore(slot(Load->getPointerOperand()), Load->getParent(),
+                        Load->getIterator(), Budget, Activation);
+      if (!Stored)
+        return nullptr;
+      V = Stored->first->getValueOperand();
+      Activation = Stored->second;
+    }
+    return nullptr;
+  }
+
   bool pointerAt(llvm::Type *T, uint64_t Offset) const {
     while (Offset < DL.getTypeAllocSize(T)) {
       if (T->isPointerTy())
@@ -208,7 +300,8 @@ class EscapeCheck {
         return B->getSuccessor(C->isZero() ? 1 : 0);
     return nullptr;
   }
-  bool survivesReturn(llvm::StoreInst &S, Slot Target, unsigned &Budget) const {
+  bool survivesReturn(llvm::Instruction &S, Slot Target,
+                      unsigned &Budget) const {
     llvm::SmallPtrSet<llvm::BasicBlock *, 8> Visited;
     llvm::SmallVector<llvm::Instruction *, 8> Work{S.getNextNode()};
     while (Budget && !Work.empty()) {
@@ -235,13 +328,130 @@ class EscapeCheck {
     return false;
   }
 
+  Token callSite(const llvm::CallBase &Call, const Token &Fallback) const {
+    auto *Descriptor = Call.getMetadata(BorrowMetadata);
+    if (!Descriptor)
+      return Fallback;
+    return {"", callSetting(*Descriptor, Line),
+            callSetting(*Descriptor, Column)};
+  }
+
+  bool publishedAtReturn(llvm::StoreInst &S, Slot Dest, unsigned &Budget,
+                         const Invocation *Activation) const {
+    if (!survivesReturn(S, Dest, Budget))
+      return false;
+    for (; Activation; Activation = Activation->Caller)
+      if (!survivesReturn(Activation->Call, Dest, Budget))
+        return false;
+    return true;
+  }
+
+  void verifyCallBoundaries(llvm::Function &Current, const Token &At,
+                            const Invocation *Activation, unsigned &Budget,
+                            llvm::SmallPtrSetImpl<llvm::Function *> &Active,
+                            std::set<SourcePosition> &Reported) const {
+    if (!Active.insert(&Current).second)
+      return;
+    auto AutomaticHere = [&](llvm::Value *V) {
+      if (auto *Local = llvm::dyn_cast<llvm::AllocaInst>(V))
+        return Local->getFunction() == &Root;
+      return Automatic.contains(V);
+    };
+    auto Restricted = [&](llvm::Value *V) { return NoRetention.contains(V); };
+    auto HasLifetimeObligation = [&](llvm::Value *V) {
+      return AutomaticHere(V) || Restricted(V);
+    };
+    llvm::SmallVector<llvm::BasicBlock *> Work{&Current.getEntryBlock()};
+    llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    while (Budget && !Work.empty()) {
+      auto *Block = Work.pop_back_val();
+      if (!Visited.insert(Block).second)
+        continue;
+      for (auto &I : *Block) {
+        if (!Budget)
+          break;
+        --Budget;
+        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+          unsigned Trace = 256;
+          auto *Target = knownTarget(*Call, Trace, Activation);
+          if (Target && Definitions.contains(Target)) {
+            if (llvm::any_of(Call->args(), [](const llvm::Use &Arg) {
+                  return Arg->getType()->isPointerTy();
+                })) {
+              Invocation Nested{*Call, Activation};
+              verifyCallBoundaries(*Target, At, &Nested, Budget, Active,
+                                   Reported);
+            }
+            continue;
+          }
+          auto *Descriptor = Call->getMetadata(BorrowMetadata);
+          if (!Descriptor || !callSetting(*Descriptor, Disposition))
+            continue;
+          for (auto Index : positions(Descriptor, Retainable)) {
+            Trace = 256;
+            if (!originatesFrom(Call->getArgOperand(Index), Trace,
+                                HasLifetimeObligation, Activation))
+              continue;
+            auto Site = callSite(*Call, At);
+            if (Reported.emplace(Site.Line, Site.Column).second) {
+              constexpr llvm::StringRef Message =
+                  "MEM002: opaque callable may retain a borrow beyond its "
+                  "admitted lifetime";
+              if (callSetting(*Descriptor, Disposition) == Error)
+                fail(Site, Message.str());
+              llvm::errs() << Input << ":" << Site.Line << ":" << Site.Column
+                           << ": ANOMALY: " << Message << "\n";
+            }
+            break;
+          }
+          continue;
+        }
+        // A known callee can retain a caller's borrow by storing it in a
+        // static cell. Check the value surviving all the enclosing calls.
+        auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I);
+        if (!Activation || !Store ||
+            !Store->getValueOperand()->getType()->isPointerTy())
+          continue;
+        auto Dest = slot(Store->getPointerOperand());
+        auto Global = Globals.find(Dest.Base);
+        if (Global == Globals.end() || Dest.Offset < 0 ||
+            !pointerAt(Global->second, Dest.Offset))
+          continue;
+        auto *Stored = Store->getValueOperand();
+        unsigned Trace = 256;
+        if (!originatesFrom(Stored, Trace, HasLifetimeObligation, Activation))
+          continue;
+        Trace = 256;
+        if (!publishedAtReturn(*Store, Dest, Trace, Activation))
+          continue;
+        auto *Outermost = Activation;
+        while (Outermost->Caller)
+          Outermost = Outermost->Caller;
+        auto Site = callSite(Outermost->Call, At);
+        Trace = 256;
+        if (originatesFrom(Stored, Trace, Restricted, Activation))
+          fail(Site,
+               "escaping borrow violates the declared parameter contract");
+        fail(Site, "borrow of automatic storage escapes through a call");
+      }
+      if (auto *Next = successor(Block))
+        Work.push_back(Next);
+      else
+        llvm::append_range(Work, llvm::successors(Block));
+    }
+    Active.erase(&Current);
+  }
+
 public:
   EscapeCheck(Context &U, Function &D, llvm::Function &F,
               const std::map<llvm::Value *, llvm::Type *> &Globals,
               const llvm::SmallPtrSetImpl<llvm::Function *> &Definitions,
-              const llvm::SmallPtrSetImpl<llvm::Function *> &TrivialDrops)
-      : DL(U.M.getDataLayout()), Result(nullptr), ResultType(nullptr),
-        Globals(Globals), Definitions(Definitions), TrivialDrops(TrivialDrops) {
+              const llvm::SmallPtrSetImpl<llvm::Function *> &TrivialDrops,
+              bool StableRegistrations)
+      : DL(U.M.getDataLayout()), Root(F),
+        Input(D.Definition.Configuration.Input), Result(nullptr),
+        ResultType(nullptr), Globals(Globals), Definitions(Definitions),
+        TrivialDrops(TrivialDrops), StableRegistrations(StableRegistrations) {
     unsigned I = 0;
     if (U.aggregate(D.Result)) {
       Result = F.getArg(I++);
@@ -308,9 +518,49 @@ public:
             survivesReturn(*S, Dest, Budget))
           Check(S->getValueOperand(), Dest.Base == Result, false);
       }
+    unsigned Budget = 4096;
+    llvm::SmallPtrSet<llvm::Function *, 16> Active;
+    std::set<SourcePosition> Reported;
+    verifyCallBoundaries(Root, At, nullptr, Budget, Active, Reported);
   }
 };
 } // namespace
+
+void cpn::describeBorrowCall(
+    llvm::CallBase &Call, const Token &At, const Options &Policy,
+    llvm::ArrayRef<std::string> Params, unsigned Headers,
+    const std::set<unsigned> &NoEscape, const std::set<unsigned> &Returned,
+    const EffectBound &Effects, bool MayWriteCallStorage) {
+  auto &C = Call.getContext();
+  auto Number = [&](unsigned Value) {
+    return llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(llvm::Type::getInt32Ty(C), Value));
+  };
+  llvm::SmallVector<llvm::Metadata *> Inputs, Outputs;
+  for (unsigned I = 0; I < Params.size(); ++I)
+    if (carriesBorrow(Params[I]) && !NoEscape.count(I))
+      Inputs.push_back(Number(Headers + I));
+  for (unsigned I : Returned)
+    Outputs.push_back(Number(Headers + I));
+  bool ReadOnlyCall =
+      !MayWriteCallStorage && Effects &&
+      llvm::all_of(*Effects, [](llvm::StringRef Item) {
+        return Item.starts_with("read:") || Item.starts_with("trap:");
+      });
+  if (Inputs.empty() && Outputs.empty() && !ReadOnlyCall)
+    return;
+  Mode Checking = Suppressed;
+  if (Policy.Promote.count("MEM002") || Policy.Promote.count("ANOMALY"))
+    Checking = Error;
+  else if (Policy.Minimum <= Severity::Anomaly &&
+           !Policy.Suppress.count("MEM002"))
+    Checking = Anomaly;
+  Call.setMetadata(BorrowMetadata,
+                   llvm::MDNode::get(C, {Number(At.Line), Number(At.Column),
+                                         Number(Checking), Number(ReadOnlyCall),
+                                         llvm::MDNode::get(C, Inputs),
+                                         llvm::MDNode::get(C, Outputs)}));
+}
 
 void Context::checkBorrowEscapes() {
   std::map<llvm::Value *, llvm::Type *> StaticObjects;
@@ -322,11 +572,15 @@ void Context::checkBorrowEscapes() {
     for (auto *F : {D.IR, D.BaseIR})
       if (F && !F->empty())
         Definitions.insert(F);
+  for (const auto &[Name, R] : Records)
+    if (R.ClosureEntry && !R.ClosureEntry->empty())
+      Definitions.insert(R.ClosureEntry);
   // When no extent can be replaced, an implicit closure drop with scalar
   // captures only updates the compiler's lifetime sidecars.
   llvm::SmallPtrSet<llvm::Function *, 8> TrivialDrops;
   auto *ExtentCheck = M.getFunction("cpn.extent.valid");
-  if (!ExtentCheck || ExtentCheck->use_empty())
+  bool StableRegistrations = !ExtentCheck || ExtentCheck->use_empty();
+  if (StableRegistrations)
     for (const auto &[Type, Drop] : CleanupEntries)
       if (auto R = Records.find(Type);
           R != Records.end() && R->second.Decl.K == Node::Lambda &&
@@ -336,6 +590,10 @@ void Context::checkBorrowEscapes() {
   for (auto &D : Functions)
     for (auto *F : {D.IR, D.BaseIR})
       if (Definitions.contains(F))
-        EscapeCheck(*this, D, *F, StaticObjects, Definitions, TrivialDrops)
+        EscapeCheck(*this, D, *F, StaticObjects, Definitions, TrivialDrops,
+                    StableRegistrations)
             .verify(D.Decl.At);
+  for (auto &F : M)
+    for (auto &I : llvm::instructions(F))
+      I.setMetadata(BorrowMetadata, nullptr);
 }

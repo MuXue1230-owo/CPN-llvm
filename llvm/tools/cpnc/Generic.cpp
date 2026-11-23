@@ -2,12 +2,39 @@
 #include "llvm/ADT/StringExtras.h"
 using namespace cpn;
 using llvm::StringRef;
+
+std::optional<CallableTypeParts> cpn::splitCallableType(StringRef Type) {
+  if (!Type.consume_front("function<") || !Type.consume_back(">"))
+    return {};
+  unsigned Angles = 0, Brackets = 0;
+  for (size_t I = 0; I < Type.size(); ++I) {
+    char C = Type[I];
+    if (C == '[')
+      ++Brackets;
+    else if (C == ']' && Brackets)
+      --Brackets;
+    else if (!Brackets && C == '<')
+      ++Angles;
+    else if (!Brackets && C == '>' && Angles)
+      --Angles;
+    else if (!Brackets && !Angles && C == '(') {
+      auto Close = Type.rfind(')');
+      if (!I || Close == StringRef::npos || Close < I)
+        return {};
+      return CallableTypeParts{Type.take_front(I), Type.slice(I + 1, Close),
+                               Type.drop_front(Close + 1)};
+    }
+  }
+  return {};
+}
+
 namespace {
 std::string substitute(StringRef S, const std::set<std::string> &Names,
                        size_t Index) {
   std::string R;
   auto IdentifierByte = [](char C) {
-    return llvm::isAlnum(C) || C == '_' || static_cast<unsigned char>(C) >= 128;
+    return llvm::isAlnum(C) || C == '_' || C == '$' ||
+           static_cast<unsigned char>(C) >= 128;
   };
   while (!S.empty()) {
     if (IdentifierByte(S[0])) {
@@ -48,9 +75,57 @@ size_t angleEnd(StringRef S, size_t Open) {
   return StringRef::npos;
 }
 
+std::string
+expandCallableFlags(StringRef Type,
+                    llvm::ArrayRef<std::pair<unsigned, unsigned>> Positions) {
+  auto Remap = [&](StringRef Digits, auto Add) {
+    unsigned Old;
+    if (Digits.getAsInteger(10, Old) || Old >= Positions.size())
+      return;
+    auto [Start, Count] = Positions[Old];
+    for (unsigned I = Start; I < Start + Count; ++I)
+      Add(I);
+  };
+  std::string Flags;
+  if (callableFlag(Type, " noexcept"))
+    Flags += " noexcept";
+  if (callableFlag(Type, " whole"))
+    Flags += " whole";
+  std::set<unsigned> NoEscape, Borrowed, Consumes;
+  for (auto Flag : callableFlags(Type)) {
+    if (Flag.consume_front("noescape#"))
+      Remap(Flag, [&](unsigned I) { NoEscape.insert(I); });
+    else if (Flag.consume_front("borrow#"))
+      Remap(Flag, [&](unsigned I) { Borrowed.insert(I); });
+    else if (Flag.consume_front("consumes#"))
+      Remap(Flag, [&](unsigned I) { Consumes.insert(I); });
+  }
+  auto RemapEffects = [&](EffectSet &Set) {
+    EffectSet Mapped;
+    for (const auto &Item : Set) {
+      auto [Kind, Region] = StringRef(Item).split(':');
+      if (Region.consume_front("#"))
+        Remap(Region, [&](unsigned I) {
+          Mapped.insert((Kind + ":#").str() + std::to_string(I));
+        });
+      else
+        Mapped.insert(Item);
+    }
+    Set = std::move(Mapped);
+  };
+  auto Effects = callableEffects(Type);
+  auto Predicate = callablePredicateEffects(Type);
+  if (Effects)
+    RemapEffects(*Effects);
+  RemapEffects(Predicate);
+  return Flags + parameterEffects(NoEscape, Borrowed, Consumes) +
+         effectFlags(Effects) + predicateEffectFlags(Predicate);
+}
+
 std::string expandPackLists(StringRef Text, const std::set<std::string> &Names,
                             size_t Count, std::optional<size_t> Index,
-                            const Token &At) {
+                            const Token &At,
+                            const std::set<std::string> &Deferred) {
   auto Rewrite = [&](StringRef Part) {
     return Index ? substitute(Part, Names, *Index) : Part.str();
   };
@@ -61,27 +136,48 @@ std::string expandPackLists(StringRef Text, const std::set<std::string> &Names,
   if (Close == StringRef::npos)
     return Rewrite(Text);
 
-  std::string Out = Rewrite(Text.take_front(Open + 1));
+  auto Callable = splitCallableType(Text.take_front(Close + 1));
+  std::string Out;
+  if (Callable)
+    Out = "function<" +
+          expandPackLists(Callable->Result, Names, Count, Index, At, Deferred) +
+          "(";
+  else
+    Out = Rewrite(Text.take_front(Open + 1));
+  llvm::SmallVector<std::pair<unsigned, unsigned>> Positions;
+  unsigned Next = 0;
   bool First = true;
   auto Append = [&](StringRef Arg, std::optional<size_t> I) {
     if (!First)
       Out += ",";
     First = false;
-    Out += expandPackLists(Arg, Names, Count, I, At);
+    Out += expandPackLists(Arg, Names, Count, I, At, Deferred);
   };
-  for (const auto &Spelling : splitArguments(Text.slice(Open + 1, Close))) {
+  auto List = Callable ? Callable->Parameters : Text.slice(Open + 1, Close);
+  for (const auto &Spelling : splitArguments(List)) {
     StringRef Arg = Spelling;
     if (!Arg.consume_back("...")) {
+      Positions.emplace_back(Next++, 1);
       Append(Arg, Index);
+      continue;
+    }
+    if (substitute(Arg, Deferred, 0) != Arg) {
+      Positions.emplace_back(Next++, 1);
+      Append(Spelling, Index);
       continue;
     }
     if (substitute(Arg, Names, 0) == Arg)
       fail(At, "generic argument expansion requires a pack binding");
+    Positions.emplace_back(Next, Count);
+    Next += Count;
     for (size_t I = 0; I < Count; ++I)
       Append(Arg, I);
   }
+  if (Callable)
+    Out += ")" + expandCallableFlags(Text.take_front(Close + 1), Positions);
   Out += ">";
-  Out += expandPackLists(Text.drop_front(Close + 1), Names, Count, Index, At);
+  Out += expandPackLists(Text.drop_front(Close + 1), Names, Count, Index, At,
+                         Deferred);
   return Out;
 }
 
@@ -101,6 +197,61 @@ const TypeApplication *matchingApplication(const Context &U, const Family &Fam,
                                I->second.Site.Through <= Fam.Site.Through;
                       });
   return Key == Instance->second.Family ? &Instance->second : nullptr;
+}
+
+struct OwnerPattern {
+  StringRef FormalOwner, ActualOwner, Member;
+};
+
+std::optional<OwnerPattern> matchOwnerPattern(const Context &U,
+                                              const Family &Fam,
+                                              StringRef Formal,
+                                              StringRef Actual) {
+  auto Instance = U.Records.find(Actual.str());
+  if (Instance == U.Records.end() ||
+      !U.Records.count(Instance->second.EnclosingScope))
+    return {};
+  size_t Member = StringRef::npos;
+  for (size_t I = 0; I + 1 < Formal.size(); ++I) {
+    if (Formal[I] == '<') {
+      I = angleEnd(Formal, I);
+      if (I == StringRef::npos)
+        return {};
+    } else if (I && Formal[I] == ':' && Formal[I + 1] == ':') {
+      Member = I;
+      ++I;
+    }
+  }
+  if (Member == StringRef::npos)
+    return {};
+  const auto Owner = Formal.take_front(Member);
+  const auto Tail = Formal.drop_front(Member + 2);
+  if (Tail.split('<').first != Instance->second.Decl.Text)
+    return {};
+  StringRef ActualOwner = Instance->second.EnclosingScope;
+  size_t Open;
+  if (matchingApplication(U, Fam, Owner, ActualOwner, Open) ||
+      matchOwnerPattern(U, Fam, Owner, ActualOwner))
+    return OwnerPattern{Owner, ActualOwner, Tail};
+  // A projection such as T::Member cannot independently deduce T.
+  if (llvm::any_of(Fam.Decl.Generics, [&](const Node &Parameter) {
+        return Parameter.K == Node::TypeParam && Parameter.Text == Owner;
+      }))
+    return {};
+  if (auto Binding = Fam.Enclosing.Types.find(Owner.str());
+      Binding != Fam.Enclosing.Types.end()) {
+    if (Binding->second == ActualOwner)
+      return OwnerPattern{Owner, ActualOwner, Tail};
+    return {};
+  }
+  auto Key = scopeKey(Fam.Prefix, Owner, [&](const std::string &Name) {
+    return U.Records.count(Name) || U.Aliases.count(Name);
+  });
+  if (auto Alias = U.Aliases.find(Key); Alias != U.Aliases.end())
+    Key = Alias->second;
+  if (Key == ActualOwner)
+    return OwnerPattern{Owner, ActualOwner, Tail};
+  return {};
 }
 
 std::string deductionType(StringRef Formal, const Value &Actual,
@@ -145,8 +296,29 @@ void visitTypeArguments(Frame &F, const Family &Fam, StringRef Formal,
     }
     return;
   }
+  if (auto P = splitCallableType(Formal)) {
+    if (auto A = splitCallableType(Actual)) {
+      auto Parameters = splitArguments(P->Parameters);
+      auto Arguments = splitArguments(A->Parameters);
+      if (Parameters.size() != Arguments.size())
+        return;
+      visitTypeArguments(F, Fam, P->Result, A->Result, Deduce);
+      for (size_t I = 0; I < Parameters.size(); ++I)
+        visitTypeArguments(F, Fam, Parameters[I], Arguments[I], Deduce);
+    }
+    return;
+  }
+  const TypeApplication *App = nullptr;
   size_t Open;
-  auto *App = matchingApplication(F.U, Fam, Formal, Actual, Open);
+  if (auto Owner = matchOwnerPattern(F.U, Fam, Formal, Actual)) {
+    visitTypeArguments(F, Fam, Owner->FormalOwner, Owner->ActualOwner, Deduce);
+    Formal = Owner->Member;
+    Open = Formal.find('<');
+    auto It = F.U.TypeApplications.find(Actual.str());
+    if (Open != StringRef::npos && It != F.U.TypeApplications.end())
+      App = &It->second;
+  } else
+    App = matchingApplication(F.U, Fam, Formal, Actual, Open);
   if (!App)
     return;
   const auto Params = splitArguments(Formal.slice(Open + 1, Formal.size() - 1));
@@ -184,50 +356,108 @@ void inferNestedPack(Frame &F, const Family &Fam, StringRef Formal,
                     At);
     return;
   }
-  size_t Open;
-  auto *App = matchingApplication(F.U, Fam, Formal, Actual, Open);
-  if (!App)
-    return;
-  const auto Patterns =
-      splitArguments(Formal.slice(Open + 1, Formal.size() - 1));
-  const size_t Expansions = llvm::count_if(Patterns, [&](StringRef P) {
-    return P.consume_back("...") && substitute(P, Pack, 0) != P;
-  });
-  const size_t Fixed = Patterns.size() - Expansions;
-  if (App->Arguments.size() < Fixed ||
-      (!Expansions && App->Arguments.size() != Fixed))
-    return;
-  size_t Count = 0;
-  if (Expansions) {
-    size_t Remaining = App->Arguments.size() - Fixed;
-    if (Remaining % Expansions)
-      throw DeductionFailure{{At, "inconsistent nested pack pattern arity"}};
-    Count = Remaining / Expansions;
-    DeduceCount(Count);
-  }
-  size_t I = 0;
-  for (StringRef P : Patterns) {
-    if (P.consume_back("...") && substitute(P, Pack, 0) != P)
-      I += Count;
-    else {
-      const auto &Arg = App->Arguments[I++];
-      if (!Arg.IR)
-        inferNestedPack(F, Fam, P, Arg.Type, Pack, DeduceCount, At);
+  auto InferList = [&](StringRef List, llvm::ArrayRef<Value> Arguments) {
+    const auto Patterns = splitArguments(List);
+    const size_t Expansions = llvm::count_if(Patterns, [&](StringRef P) {
+      return P.consume_back("...") && substitute(P, Pack, 0) != P;
+    });
+    const size_t Fixed = Patterns.size() - Expansions;
+    if (Arguments.size() < Fixed || (!Expansions && Arguments.size() != Fixed))
+      return;
+    size_t Count = 0;
+    if (Expansions) {
+      size_t Remaining = Arguments.size() - Fixed;
+      if (Remaining % Expansions)
+        throw DeductionFailure{{At, "inconsistent nested pack pattern arity"}};
+      Count = Remaining / Expansions;
+      DeduceCount(Count);
     }
+    size_t I = 0;
+    for (StringRef P : Patterns) {
+      if (P.consume_back("...") && substitute(P, Pack, 0) != P)
+        I += Count;
+      else {
+        const auto &Arg = Arguments[I++];
+        if (!Arg.IR)
+          inferNestedPack(F, Fam, P, Arg.Type, Pack, DeduceCount, At);
+      }
+    }
+  };
+  if (auto P = splitCallableType(Formal)) {
+    if (auto A = splitCallableType(Actual)) {
+      inferNestedPack(F, Fam, P->Result, A->Result, Pack, DeduceCount, At);
+      std::vector<Value> Arguments;
+      for (const auto &Argument : splitArguments(A->Parameters))
+        Arguments.emplace_back(Argument);
+      InferList(P->Parameters, Arguments);
+    }
+    return;
+  }
+  if (auto Owner = matchOwnerPattern(F.U, Fam, Formal, Actual)) {
+    inferNestedPack(F, Fam, Owner->FormalOwner, Owner->ActualOwner, Pack,
+                    DeduceCount, At);
+    auto Open = Owner->Member.find('<');
+    auto It = F.U.TypeApplications.find(Actual.str());
+    if (Open != StringRef::npos && It != F.U.TypeApplications.end())
+      InferList(Owner->Member.slice(Open + 1, Owner->Member.size() - 1),
+                It->second.Arguments);
+  } else {
+    size_t Open;
+    if (auto *App = matchingApplication(F.U, Fam, Formal, Actual, Open))
+      InferList(Formal.slice(Open + 1, Formal.size() - 1), App->Arguments);
   }
 }
 // Compare the admitted structural type patterns symbolically. A repeated
 // parameter has to match the same pattern at every occurrence.
 bool acceptsPattern(const Node &General, const Node &Specific) {
-  if (General.Params.size() != Specific.Params.size())
-    return false;
   std::set<std::string> Variables;
   for (auto &P : General.Generics)
     Variables.insert(P.Text);
   std::map<std::string, std::string> Bound;
+  StringRef Pack;
+  if (!General.Generics.empty() && General.Generics.back().Pack)
+    Pack = General.Generics.back().Text;
+  std::optional<std::pair<size_t, bool>> PackShape;
+  std::optional<size_t> PackIndex;
+  auto MatchList = [&](llvm::ArrayRef<std::string> Left,
+                       llvm::ArrayRef<std::string> Right,
+                       llvm::function_ref<bool(StringRef, StringRef)> Match) {
+    auto Splice = [](StringRef S) { return S.ends_with("..."); };
+    const size_t LC = llvm::count_if(Left, Splice);
+    const size_t RC = llvm::count_if(Right, Splice);
+    if (LC > 1 || RC > 1 || (LC && !Splice(Left.back())) ||
+        (RC && !Splice(Right.back())))
+      return false;
+    const size_t LF = Left.size() - LC, RF = Right.size() - RC;
+    if (LF > RF || (!LC && (RC || LF != RF)))
+      return false;
+    for (size_t I = 0; I < LF; ++I)
+      if (!Match(Left[I], Right[I]))
+        return false;
+    if (!LC)
+      return true;
+    const auto Shape = std::make_pair(RF - LF, RC != 0);
+    if (PackShape && *PackShape != Shape)
+      return false;
+    PackShape = Shape;
+    auto Expanded = StringRef(Left.back()).drop_back(3);
+    for (size_t I = LF; I < Right.size(); ++I) {
+      StringRef Target = Right[I];
+      if (RC && I == RF)
+        Target = Target.drop_back(3);
+      llvm::SaveAndRestore Index(PackIndex);
+      PackIndex = I - LF;
+      if (!Match(Expanded, Target))
+        return false;
+    }
+    return true;
+  };
   auto Match = [&](auto &&Self, llvm::StringRef A, llvm::StringRef B) -> bool {
     if (Variables.count(A.str())) {
-      auto [It, New] = Bound.emplace(A.str(), B.str());
+      std::string Name = A.str();
+      if (A == Pack && PackIndex)
+        Name += "$" + std::to_string(*PackIndex);
+      auto [It, New] = Bound.emplace(std::move(Name), B.str());
       return New || It->second == B;
     }
     for (auto S : {"&&", "&", "*"})
@@ -243,31 +473,40 @@ bool acceptsPattern(const Node &General, const Node &Specific) {
              Self(Self, A.slice(I + 1, A.size() - 1),
                   B.slice(J + 1, B.size() - 1));
     }
+    if (auto L = splitCallableType(A)) {
+      auto R = splitCallableType(B);
+      if (!R || L->Flags != R->Flags || !Self(Self, L->Result, R->Result))
+        return false;
+      auto LP = splitArguments(L->Parameters),
+           RP = splitArguments(R->Parameters);
+      return MatchList(
+          LP, RP, [&](StringRef P, StringRef Q) { return Self(Self, P, Q); });
+    }
     auto I = A.find('<'), J = B.find('<');
     if (I != llvm::StringRef::npos && J != llvm::StringRef::npos &&
         A.take_front(I) == B.take_front(J)) {
       auto L = splitArguments(A.slice(I + 1, A.size() - 1));
       auto R = splitArguments(B.slice(J + 1, B.size() - 1));
-      if (L.size() != R.size())
-        return false;
-      for (size_t K = 0; K < L.size(); ++K)
-        if (!Self(Self, L[K], R[K]))
-          return false;
-      return true;
+      return MatchList(
+          L, R, [&](StringRef P, StringRef Q) { return Self(Self, P, Q); });
     }
     return A == B;
   };
-  for (size_t I = 0; I < General.Params.size(); ++I)
-    if (!Match(Match, General.Params[I].Type, Specific.Params[I].Type))
-      return false;
-  return true;
+  std::vector<std::string> Left, Right;
+  for (const auto &P : General.Params)
+    Left.push_back(P.Type + (P.Pack ? "..." : ""));
+  for (const auto &P : Specific.Params)
+    Right.push_back(P.Type + (P.Pack ? "..." : ""));
+  return MatchList(Left, Right, [&](StringRef L, StringRef R) {
+    return Match(Match, L, R);
+  });
 }
 std::string substituteBinders(llvm::StringRef Text, const Node &Decl,
                               const Node *New) {
   std::string Key;
   while (!Text.empty()) {
     auto Word = Text.take_while([](char C) {
-      return llvm::isAlnum(C) || C == '_' ||
+      return llvm::isAlnum(C) || C == '_' || C == '$' ||
              static_cast<unsigned char>(C) >= 128;
     });
     if (Word.empty()) {
@@ -289,6 +528,11 @@ std::string substituteBinders(llvm::StringRef Text, const Node &Decl,
 }
 std::string normalized(llvm::StringRef Text, const Node &Decl) {
   return substituteBinders(Text, Decl, nullptr);
+}
+std::string numberSpelling(const Node &N) {
+  llvm::SmallString<32> Digits;
+  integerLiteral(N.At).toString(Digits, 10, false);
+  return Digits.str().str();
 }
 Node normalizedValueContracts(const Node &Decl) {
   Node Copy;
@@ -320,8 +564,10 @@ Node normalizedValueContracts(const Node &Decl) {
   return Copy;
 }
 std::string atom(const Node &N, const Node &Decl) {
-  std::string Key = std::to_string(N.K) + "(" + normalized(N.Text, Decl) + "|" +
-                    normalized(N.Type, Decl);
+  auto Spelling =
+      N.K == Node::Number ? numberSpelling(N) : normalized(N.Text, Decl);
+  std::string Key =
+      std::to_string(N.K) + "(" + Spelling + "|" + normalized(N.Type, Decl);
   for (const auto &A : N.TemplateArgs)
     Key += "<" + atom(A, Decl) + ">";
   for (const auto &C : N.Children)
@@ -340,6 +586,165 @@ std::set<std::string> requirements(const Node &Decl) {
   for (auto &Req : Decl.TemplateArgs)
     Add(Add, Req);
   return Set;
+}
+
+enum class PatternMatch { Established, Different, Unestablished };
+
+struct SymbolicValue {
+  std::optional<Value> Concrete;
+  std::string Key;
+  std::set<std::string> Parameters;
+  bool Rigid = false;
+};
+using SymbolicValues = std::map<std::string, SymbolicValue>;
+
+bool expressionUses(const Node &N, StringRef Binder) {
+  const std::set<std::string> Name{Binder.str()};
+  if ((N.K == Node::Name && substitute(N.Text, Name, 0) != N.Text) ||
+      substitute(N.Type, Name, 0) != N.Type)
+    return true;
+  auto Visit = [&](const Node &C) { return expressionUses(C, Binder); };
+  return llvm::any_of(N.Children, Visit) || llvm::any_of(N.TemplateArgs, Visit);
+}
+
+std::string constantIdentity(const Value &V) {
+  auto *C = llvm::dyn_cast_or_null<llvm::ConstantInt>(V.IR);
+  if (!C)
+    return {};
+  llvm::SmallString<32> Digits;
+  C->getValue().toString(Digits, 10, signedType(V.Type));
+  return V.Type + "(" + Digits.str().str() + ")";
+}
+
+SymbolicValue symbolicValue(Frame &F, const Family &Family, const Node &Expr,
+                            const std::string &Domain,
+                            const SymbolicValues &Bindings) {
+  if (Expr.K == Node::Name) {
+    if (auto I = Bindings.find(Expr.Text); I != Bindings.end()) {
+      if (!I->second.Concrete || I->second.Concrete->Type == Domain)
+        return I->second;
+    }
+  }
+  Frame Probe(F.U, nullptr, nullptr, Family.Prefix);
+  Probe.Opt = Family.Site.Configuration;
+  Probe.LookupLimit = Family.Site.Through;
+  Probe.Env = Family.Enclosing;
+  bool NeedsSymbols = false;
+  for (const auto &Parameter : Family.Decl.Generics) {
+    auto I = Bindings.find(Parameter.Text);
+    if (I != Bindings.end() && I->second.Concrete)
+      Probe.Env.Values[Parameter.Text] = *I->second.Concrete;
+    else if (expressionUses(Expr, Parameter.Text))
+      NeedsSymbols = true;
+  }
+  if (!NeedsSymbols) {
+    try {
+      auto V = Probe.convert(Probe.constantEval(Expr), Domain, Expr.At);
+      auto Key = constantIdentity(V);
+      if (!Key.empty())
+        return SymbolicValue{V, std::move(Key), {}, false};
+    } catch (const ResourceExhausted &) {
+      throw;
+    } catch (const Diagnostic &) {
+      // A comparison against a symbolic head can fail to establish a
+      // value that the concrete use itself never needs to evaluate.
+    }
+    return {};
+  }
+  auto Compose = [&](auto &&Visit, const Node &N) -> SymbolicValue {
+    if (N.K == Node::Name) {
+      if (auto I = Bindings.find(N.Text); I != Bindings.end())
+        return I->second;
+      if (N.Text == "true" || N.Text == "false")
+        return {{}, N.Text, {}, false};
+      return {};
+    }
+    if (N.K == Node::Number)
+      return {{}, "numeric:" + numberSpelling(N), {}, false};
+    if (N.K != Node::Unary && N.K != Node::Binary && N.K != Node::Conditional)
+      return {};
+    SymbolicValue Result;
+    Result.Key = std::to_string(N.K) + ":" + N.Text + "(";
+    for (const auto &Child : N.Children) {
+      auto Part = Visit(Visit, Child);
+      if (Part.Key.empty())
+        return {};
+      Result.Key += Part.Key + ",";
+      Result.Parameters.insert(Part.Parameters.begin(), Part.Parameters.end());
+    }
+    Result.Key += ")";
+    return Result;
+  };
+  auto Result = Compose(Compose, Expr);
+  if (!Result.Key.empty())
+    Result.Key +=
+        "@" + Domain + "/" + Probe.Opt.Overflow + "/" + Probe.Opt.DefaultInt;
+  return Result;
+}
+
+PatternMatch compareTerms(const SymbolicValue &Expected,
+                          const SymbolicValue &Found) {
+  if (Expected.Key.empty() || Found.Key.empty())
+    return PatternMatch::Unestablished;
+  if (Expected.Key == Found.Key)
+    return PatternMatch::Established;
+  if ((Expected.Concrete && Found.Concrete) ||
+      (Expected.Rigid && !Found.Parameters.count(Expected.Key)) ||
+      (Found.Rigid && !Expected.Parameters.count(Found.Key)))
+    return PatternMatch::Different;
+  return PatternMatch::Unestablished;
+}
+
+PatternMatch compareSpecializationHeads(Frame &F, const Family &General,
+                                        const Node &GeneralTypes,
+                                        const Family &Specific,
+                                        const Node &SpecificTypes,
+                                        const std::vector<Node> &Domains,
+                                        const Substitution &Actual,
+                                        const Token &At) {
+  F.U.chargeSolver(At);
+  if (!acceptsPattern(GeneralTypes, SpecificTypes))
+    return PatternMatch::Different;
+  SymbolicValues Rigid, Deduced;
+  for (const auto &Parameter : Specific.Decl.Generics) {
+    if (Parameter.K != Node::ValueParam)
+      continue;
+    auto Key = "$value." + std::to_string(Rigid.size()) + ":" + Parameter.Type;
+    Rigid.emplace(Parameter.Text, SymbolicValue{{}, Key, {Key}, true});
+  }
+  auto Outcome = PatternMatch::Established;
+  auto Satisfy = [&](PatternMatch Match) {
+    if (Match != PatternMatch::Established)
+      Outcome = Match;
+    return Outcome != PatternMatch::Different;
+  };
+  std::vector<std::pair<size_t, SymbolicValue>> Deferred;
+  for (size_t I = 0; I < Domains.size(); ++I) {
+    if (Domains[I].K == Node::TypeParam)
+      continue;
+    const auto &Expected = General.Decl.Pattern[I];
+    auto Found = symbolicValue(F, Specific, Specific.Decl.Pattern[I],
+                               Actual.Values.at(Domains[I].Text).Type, Rigid);
+    if (Expected.K == Node::Name &&
+        llvm::any_of(General.Decl.Generics, [&](const Node &Parameter) {
+          return Parameter.K == Node::ValueParam &&
+                 Parameter.Text == Expected.Text;
+        })) {
+      auto [Binding, New] = Deduced.try_emplace(Expected.Text, Found);
+      if (!New && !Satisfy(compareTerms(Binding->second, Found)))
+        return Outcome;
+    } else {
+      Deferred.emplace_back(I, std::move(Found));
+    }
+  }
+  for (const auto &[I, Found] : Deferred) {
+    auto Expected =
+        symbolicValue(F, General, General.Decl.Pattern[I],
+                      Actual.Values.at(Domains[I].Text).Type, Deduced);
+    if (!Satisfy(compareTerms(Expected, Found)))
+      break;
+  }
+  return Outcome;
 }
 } // namespace
 std::string cpn::rebindTypeNames(llvm::StringRef Text, const Node &Old,
@@ -498,20 +903,39 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
   auto &D = Result.Decl;
   auto P = D.Generics.back();
   std::set<std::string> Names{P.Text};
-  auto collect = [&](auto &&Visit, const Node &N) -> void {
+  auto InnerPacks = [&](const Node &N, std::set<std::string> Inherited) {
+    if (&N != &D && !N.Generics.empty() && N.Generics.back().Pack)
+      Inherited.insert(N.Generics.back().Text);
+    for (const auto &Param : N.Params)
+      if (Param.Pack && substitute(Param.Type, Inherited, 0) != Param.Type)
+        Inherited.insert(Param.Text);
+    return Inherited;
+  };
+  auto collect = [&](auto &&Visit, const Node &N,
+                     const std::set<std::string> &Inherited) -> void {
+    auto Deferred = InnerPacks(N, Inherited);
     for (auto &Param : N.Params)
-      if (Param.Pack)
+      if (Param.Pack && !Deferred.count(Param.Text))
         Names.insert(Param.Text);
     for (auto &Child : N.Children)
-      Visit(Visit, Child);
+      Visit(Visit, Child, Deferred);
   };
-  collect(collect, D);
+  collect(collect, D, {});
+  std::set<std::string> Deferred;
+  auto InvolvesDeferred = [&](auto &&Visit, const Node &N) -> bool {
+    if (substitute(N.Text, Deferred, 0) != N.Text ||
+        substitute(N.Type, Deferred, 0) != N.Type)
+      return true;
+    auto Includes = [&](const Node &C) { return Visit(Visit, C); };
+    return llvm::any_of(N.Children, Includes) ||
+           llvm::any_of(N.TemplateArgs, Includes);
+  };
   std::function<void(Node &, std::optional<size_t>)> transform;
   std::function<void(std::vector<Node> &, std::optional<size_t>)> sequence =
       [&](std::vector<Node> &Nodes, std::optional<size_t> I) {
         std::vector<Node> Out;
         for (auto N : Nodes) {
-          if (N.Pack) {
+          if (N.Pack && !InvolvesDeferred(InvolvesDeferred, N)) {
             N.Pack = false;
             for (size_t J = 0; J < Count; ++J) {
               auto Copy = N;
@@ -526,11 +950,16 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
         Nodes = std::move(Out);
       };
   transform = [&](Node &N, std::optional<size_t> I) {
-    if (!I && N.K == Node::Name && Names.count(N.Text))
+    llvm::SaveAndRestore Scope(Deferred);
+    Deferred = InnerPacks(N, Deferred);
+    auto Active = Names;
+    for (const auto &Hidden : Deferred)
+      Active.erase(Hidden);
+    if (!I && N.K == Node::Name && Active.count(N.Text))
       fail(N.At, "unexpanded pack in expression");
-    N.Text = expandPackLists(N.Text, Names, Count, I, N.At);
-    N.At.Text = expandPackLists(N.At.Text, Names, Count, I, N.At);
-    N.Type = expandPackLists(N.Type, Names, Count, I, N.At);
+    N.Text = expandPackLists(N.Text, Active, Count, I, N.At, Deferred);
+    N.At.Text = expandPackLists(N.At.Text, Active, Count, I, N.At, Deferred);
+    N.Type = expandPackLists(N.Type, Active, Count, I, N.At, Deferred);
     if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
       std::string Bound;
       auto Add = [&](llvm::StringRef Effect) {
@@ -545,7 +974,8 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
         bool Pack = Kind != "trap" && Region != "any" && Region != "global" &&
                     Region != "this" &&
                     llvm::any_of(N.Params, [&](const Node &Param) {
-                      return Param.Pack && Param.Text == Region;
+                      return Param.Pack && Param.Text == Region &&
+                             !Deferred.count(Param.Text);
                     });
         if (!Pack)
           Add(Item);
@@ -555,6 +985,8 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
       }
       E->second = Bound.empty() ? "none" : std::move(Bound);
     }
+    if (&N != &D)
+      sequence(N.Generics, I);
     sequence(N.Params, I);
     sequence(N.Children, I);
     sequence(N.TemplateArgs, I);
@@ -707,11 +1139,25 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
     Substitution Env;
     bool VariableArity;
   };
-  auto Better = [](const Candidate &A, const Candidate &B) {
-    if (A.VariableArity != B.VariableArity && acceptsPattern(A.Head, B.Head) &&
-        acceptsPattern(B.Head, A.Head))
+  auto Better = [&](const Candidate &A, const Candidate &B) {
+    auto AB =
+        compareSpecializationHeads(*this, A.Definition, A.Head, B.Definition,
+                                   B.Head, Primary.Decl.Generics, Actual, At);
+    auto BA =
+        compareSpecializationHeads(*this, B.Definition, B.Head, A.Definition,
+                                   A.Head, Primary.Decl.Generics, Actual, At);
+    if (AB == PatternMatch::Different && BA == PatternMatch::Established)
+      return true;
+    if (AB == PatternMatch::Established && BA == PatternMatch::Different)
+      return false;
+    if (AB == PatternMatch::Different && BA == PatternMatch::Different)
+      return false;
+    if (A.VariableArity != B.VariableArity && AB == PatternMatch::Established &&
+        BA == PatternMatch::Established)
       return !A.VariableArity;
-    return betterTypePattern(A.Head, B.Head);
+    auto Left = requirements(A.Head), Right = requirements(B.Head);
+    return Left.size() > Right.size() &&
+           std::includes(Left.begin(), Left.end(), Right.begin(), Right.end());
   };
   std::vector<Candidate> Best;
   for (const auto &Declaration : Group->second) {
@@ -794,13 +1240,15 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
           StringRef T = Actual.Types.at(Param.Text);
           visitTypeArguments(Probe, Spec, Pattern.Type, T, Deduce);
           TypeChecks.emplace_back(&Pattern, T);
+          Slot.Type = normalized(Pattern.Type, Spec.Decl) == Pattern.Type
+                          ? T.str()
+                          : Pattern.Type;
         }
-        Slot.Type = Pattern.Type;
+        Head.Params.push_back(std::move(Slot));
       } else {
         auto V = Actual.Values.at(Param.Text);
         bool Direct =
             Pattern.K == Node::Name && binder(Pattern.Text, Node::ValueParam);
-        Slot.Type = Direct ? Pattern.Text : atom(Pattern, Spec.Decl);
         if (Direct) {
           auto [It, New] = Probe.Env.Values.emplace(Pattern.Text, V);
           Fits = New || It->second.IR == V.IR;
@@ -809,7 +1257,6 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
           ValueChecks.emplace_back(&Pattern, V);
         }
       }
-      Head.Params.push_back(std::move(Slot));
     }
     if (!Fits || Probe.Env.Types.size() + Probe.Env.Values.size() !=
                      Head.Generics.size())

@@ -399,7 +399,9 @@ Value Frame::constantAggregate(const std::string &T,
   return finishTail(Result);
 }
 
-Value Frame::constantAddress(const ConstantPlace &Place, const Token &At) {
+Value Frame::constantAddress(const ConstantPlace &Place, const Token &At,
+                             bool ExtentOnly) {
+  Place.checkLifetime(At, ExtentOnly);
   if (Place.Lifetime && Place.Lifetime->expired())
     fail(At, "constant reference designates an object whose lifetime ended");
   auto PointerType =
@@ -459,8 +461,14 @@ Value Frame::constantAddress(const ConstantPlace &Place, const Token &At) {
       llvm::PoisonValue::get(Ty), "cpn.constant.address");
   auto Storage = Place;
   Storage.Readonly = false;
+  auto *Physical = Lifetime->OriginalExtent && Place.Steps.empty()
+                       ? llvm::cast<llvm::GlobalVariable>(
+                             constantAddress(*Lifetime->OriginalExtent, At,
+                                             /*ExtentOnly=*/true)
+                                 .IR)
+                       : Address;
   U.LocalConstantAddresses.emplace(
-      Address, Context::LocalConstantAddress{Storage, Lifetime, At});
+      Address, Context::LocalConstantAddress{Storage, Lifetime, At, Physical});
   Lifetime->Designations.push_back(Address);
   return {PointerType, Address};
 }
@@ -623,9 +631,16 @@ void ConstantPlace::trackLifetime() {
   Lifetime = Identity;
 }
 
-Value ConstantPlace::read(Frame &F, const Token &At) const {
+void ConstantPlace::checkLifetime(const Token &At, bool ExtentOnly) const {
   if (Lifetime && Lifetime->expired())
     fail(At, "constant reference designates an object whose lifetime ended");
+  const auto &Identity = Root->ConstantIdentity.Storage;
+  if (!ExtentOnly && Identity && Identity->Ended)
+    fail(At, "ended object generation");
+}
+
+Value ConstantPlace::read(Frame &F, const Token &At) const {
+  checkLifetime(At);
   auto V = F.load(*Root);
   for (auto S : Steps) {
     auto *C = llvm::dyn_cast_or_null<llvm::Constant>(V.IR);
@@ -644,8 +659,7 @@ Value ConstantPlace::read(Frame &F, const Token &At) const {
 }
 
 void ConstantPlace::write(Frame &F, Value V, const Token &At) const {
-  if (Lifetime && Lifetime->expired())
-    fail(At, "constant reference designates an object whose lifetime ended");
+  checkLifetime(At);
   if (Readonly || Root->Address)
     fail(At, "constant assignment requires writable local storage");
   if (Steps.empty()) {

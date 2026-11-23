@@ -73,10 +73,29 @@ void Frame::checkAbandon(const std::string &Type, const Token &At) {
 void Frame::endConstantScope() {
   auto Names = std::move(Scopes.back().ConstantDrops);
   Scopes.back().ConstantDrops.clear();
-  for (const auto &Name : llvm::reverse(Names)) {
-    auto V = Scopes.back().Names.at(Name);
-    constantDrop(V, F ? F->Decl.At : Token{});
+  for (const auto &Name : llvm::reverse(Names))
+    retireConstantCell(Scopes.back().Names.at(Name), F ? F->Decl.At : Token{});
+}
+
+void Frame::retireConstantCell(Value &Cell, const Token &At, bool Explicit,
+                               bool Destroy) {
+  auto Storage = Cell.ConstantIdentity.Storage;
+  if (Storage && Storage->Ended) {
+    if (Explicit)
+      fail(At, "ended object generation");
+    if (Storage->Replacement)
+      retireConstantCell(*Storage->Replacement, At);
+    return;
   }
+  std::optional<llvm::SaveAndRestore<bool>> Retiring;
+  if (Storage) {
+    Storage->Ended = true;
+    Retiring.emplace(Storage->Retiring, true);
+  }
+  if (Destroy)
+    constantDrop(Cell, At);
+  else
+    checkAbandon(Cell.Type, At);
 }
 
 void Frame::endConstantField(const std::string &Slot, bool Run,

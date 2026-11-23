@@ -198,6 +198,13 @@ void Frame::guard(llvm::Value *Bad, StringRef Kind) {
   B.SetInsertPoint(OK);
 }
 cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
+  if (memoryIdentity(A.Type) || memoryIdentity(D.Type)) {
+    if (A.Type != D.Type || (N.Text != "==" && N.Text != "!="))
+      fail(N.At, "memory identities support equality with their own type");
+    return {"bool",
+            B.CreateICmp(N.Text == "==" ? CmpInst::ICMP_EQ : CmpInst::ICMP_NE,
+                         A.IR, D.IR)};
+  }
   if (floating(A.Type) || floating(D.Type) || A.Type == "real" ||
       D.Type == "real")
     return floatingBinary(N, A, D);
@@ -223,9 +230,20 @@ cpn::Value Frame::binary(const Node &N, cpn::Value A, cpn::Value D) {
         D = convert(D, A.Type, At);
     }
     if (Cmp && (Op == "==" || Op == "!=") && A.Type == D.Type &&
-        A.IR->getType() == D.IR->getType())
-      return {"bool", Op == "==" ? B.CreateICmpEQ(A.IR, D.IR)
-                                 : B.CreateICmpNE(A.IR, D.IR)};
+        A.IR->getType() == D.IR->getType()) {
+      auto physical = [&](llvm::Value *Address) -> llvm::Value * {
+        if (!IR && llvm::isa<llvm::GlobalVariable>(Address)) {
+          auto It = U.LocalConstantAddresses.find(
+              llvm::cast<llvm::GlobalVariable>(Address));
+          if (It != U.LocalConstantAddresses.end())
+            return It->second.PhysicalAddress;
+        }
+        return Address;
+      };
+      auto *Left = physical(A.IR), *Right = physical(D.IR);
+      return {"bool", Op == "==" ? B.CreateICmpEQ(Left, Right)
+                                 : B.CreateICmpNE(Left, Right)};
+    }
     fail(At, "unsupported operand types for '" + Op + "'");
   }
   unsigned WA = A.IR->getType()->getIntegerBitWidth(),

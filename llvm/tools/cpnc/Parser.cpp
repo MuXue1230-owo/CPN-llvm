@@ -202,6 +202,49 @@ class Parser {
       Selector.Type = type();
     return Selector;
   }
+  bool opensBitArgumentTemplate(size_t Angle) const {
+    size_t I = Angle - 1;
+    std::string Name = peek(I).Text;
+    if (!identifier(Name))
+      return false;
+    while (I >= 2 && peek(I - 1).Text == "::" && identifier(peek(I - 2).Text)) {
+      I -= 2;
+      Name = peek(I).Text + "::" + Name;
+    }
+    return known(Name) || Families.count(Name) ||
+           integerLibraryName(Name, true) || builtinPredicate(Name);
+  }
+  std::optional<unsigned> bitExtractionArity() const {
+    // The standard has a single type argument on the dynamic form and two
+    // constant arguments on the static form.
+    int Angles = 1, Group = 0;
+    unsigned Count = 1;
+    for (size_t I = 1; !peek(I).Text.empty(); ++I) {
+      StringRef Word = peek(I).Text;
+      if (Word == ";" || Word == "{" || Word == "}")
+        break;
+      if (Word == "(" || Word == "[")
+        ++Group;
+      else if (Word == ")" || Word == "]") {
+        if (Group == 0)
+          break;
+        --Group;
+      } else if (Group == 0) {
+        if (Word == "," && Angles == 1)
+          ++Count;
+        else if (Word == "<" && opensBitArgumentTemplate(I))
+          ++Angles;
+        else if (Word == ">" || Word == ">>") {
+          Angles -= Word == ">" ? 1 : 2;
+          if (Angles <= 0)
+            return Angles == 0 && peek(I + 1).Text == "("
+                       ? std::optional<unsigned>(Count)
+                       : std::nullopt;
+        }
+      }
+    }
+    return std::nullopt;
+  }
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr) {
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
@@ -209,12 +252,19 @@ class Parser {
                                                     : name();
     std::string Schema = T.Text;
     while (true) {
+      std::optional<bool> BitArgumentsAreTypes;
+      if (Application && is("<") && (Root || !HiddenTypes.count(T.Text)) &&
+          bitExtractionName(T.Text))
+        if (auto Arity = bitExtractionArity())
+          BitArgumentsAreTypes = *Arity == 1;
       const bool NumericApplication =
-          Application && is("<") && integerLibraryName(T.Text, true) &&
-          (StringRef(T.Text).contains("::") ||
-           ((Root || !HiddenTypes.count(T.Text)) &&
-            (known(peek(1).Text) || peek(1).Text == "::" ||
-             peek(2).Text == "::")));
+          BitArgumentsAreTypes.has_value() ||
+          (Application && is("<") && integerLibraryName(T.Text, true) &&
+           !bitExtractionName(T.Text) &&
+           (StringRef(T.Text).contains("::") ||
+            ((Root || !HiddenTypes.count(T.Text)) &&
+             (known(peek(1).Text) || peek(1).Text == "::" ||
+              peek(2).Text == "::"))));
       if (is("<") &&
           (Families.count(Schema) || NumericApplication ||
            (Application &&
@@ -229,7 +279,7 @@ class Parser {
           Args.push_back(baseSelector());
           closeAngle();
         } else
-          Args = templateArgs(Schema, &Canonical);
+          Args = templateArgs(Schema, &Canonical, BitArgumentsAreTypes);
         if (!Application || is("::") || Types.count(Schema))
           T.Text += Canonical.empty() ? spelling(Start) : Canonical;
         else {
@@ -274,7 +324,8 @@ class Parser {
       expect(">");
   }
   std::vector<Node> templateArgs(const std::string &Name,
-                                 std::string *Canonical = nullptr) {
+                                 std::string *Canonical = nullptr,
+                                 std::optional<bool> ArgumentIsType = {}) {
     expect("<");
     if (Canonical)
       *Canonical = "<";
@@ -291,7 +342,8 @@ class Parser {
       bool T = It != Families.end() && !It->second.empty()
                    ? It->second[std::min(I, It->second.size() - 1)].K ==
                          Node::TypeParam
-                   : integerLibraryName(Name, true) || known(peek().Text);
+                   : ArgumentIsType.value_or(integerLibraryName(Name, true) ||
+                                             known(peek().Text));
       if (T) {
         Node A(Node::TypeArg, peek());
         A.Type = type();
@@ -1622,6 +1674,7 @@ class Parser {
 public:
   explicit Parser(std::vector<Token> T) : Tokens(std::move(T)) {
     Types.insert({"std::ScalarError", "std::Result"});
+    Types.insert({"std::mem::StorageView", "std::mem::StorageIdentity"});
     Types.insert({"std::numeric::NumericResult", "std::numeric::NumericStatus",
                   "std::numeric::NumericErrorCode", "std::numeric::FPFlag",
                   "std::numeric::FPFlagSet"});
@@ -1917,8 +1970,8 @@ void cpn::configure(Options &O, const Node &N, ConfigScope Scope) {
       if (!StringRef(V).starts_with("[") || !StringRef(V).ends_with("]"))
         fail(N.At, "CFG001: diagnostic selection requires a list");
       static const std::set<std::string> NonErrors{
-          "LIFE003", "LIFE004", "GEN001", "NUM002",
-          "NUM003",  "STAT002", "EXC001"};
+          "LIFE003", "LIFE004", "GEN001",  "MEM002",
+          "NUM002",  "NUM003",  "STAT002", "EXC001"};
       bool Promoting = K == "diagnostics.promote";
       auto &Selection = Promoting ? O.Promote : O.Suppress;
       Selection.clear();

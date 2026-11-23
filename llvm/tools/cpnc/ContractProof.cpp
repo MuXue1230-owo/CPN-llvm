@@ -79,6 +79,22 @@ void reduceProofCFG(llvm::Function &F) {
 }
 } // namespace
 
+bool Context::proveNoContractFailure(llvm::Function &F) {
+  // Implication is over valid boundary states. Readiness instrumentation
+  // cannot modify any source object while evaluating the predicates.
+  for (auto &Block : F)
+    for (auto &Inst : llvm::make_early_inc_range(Block))
+      if (auto *Call = llvm::dyn_cast<llvm::CallInst>(&Inst);
+          Call && StaticRead && Call->getCalledFunction() == StaticRead)
+        Call->eraseFromParent();
+  reduceProofCFG(F);
+  for (const auto &Block : F)
+    for (const auto &Inst : Block)
+      if (Inst.getMetadata("cpn.override.failure"))
+        return false;
+  return true;
+}
+
 void Context::verifyProvenContracts() {
   if (ContractProofs.empty())
     return;

@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Intrinsics.h"
 
@@ -25,6 +26,23 @@ bool sameExpression(const Node &A, const Node &B) {
 bool trivialPredicate(const Node &Clause) {
   const Node &Expr = Clause.Children.front();
   return Expr.K == Node::Name && Expr.Text == "true";
+}
+
+void bindPredicateEnvironment(Frame &Check) {
+  const auto &F = *Check.F;
+  Check.Opt = F.Defaults.Configuration;
+  Check.LookupLimit = F.Defaults.Through;
+  Check.Prefix = F.DefaultPrefix;
+  Check.Env = F.DefaultEnv;
+}
+
+void bindPredicateParameter(std::map<std::string, Value> &Names,
+                            const Function &F, size_t I, Value Arg,
+                            bool Entry) {
+  Names.emplace(boundParameter(I), Arg);
+  const auto &Original = F.DefaultParams[I].Text;
+  if (!Original.empty() && (Entry || Original != "return_value"))
+    Names.emplace(Original, std::move(Arg));
 }
 } // namespace
 
@@ -57,18 +75,129 @@ bool cpn::sameContracts(const Node &A, const Node &B) {
                     sameExpression);
 }
 
-bool cpn::compatibleValueOverride(const Node &Derived, const Node &Base) {
-  auto Preserves = [](const Node &Superset, const Node &Subset, StringRef Key) {
-    for (const auto &Clause : Subset.Contracts)
-      if (Clause.Text == Key && !trivialPredicate(Clause) &&
-          llvm::none_of(Superset.Contracts, [&](const Node &Other) {
-            return sameExpression(Clause, Other);
-          }))
-        return false;
-    return true;
-  };
-  return Preserves(Base, Derived, "requires") &&
-         Preserves(Derived, Base, "ensures");
+void Context::proveValueOverride(Function &Derived, Function &Base,
+                                 const BasePath &Path) {
+  const auto Pointer = llvm::PointerType::getUnqual(C);
+  for (bool Entry : {true, false}) {
+    if (!Entry && Derived.Result == "never")
+      continue;
+    auto &Premise = Entry ? Base : Derived;
+    auto &Goal = Entry ? Derived : Base;
+    auto Key = Entry ? "requires" : "ensures";
+    auto NeedsProof = [&](const Node &Clause) {
+      return Clause.Text == Key && !trivialPredicate(Clause);
+    };
+    if (llvm::none_of(Goal.Decl.Contracts, NeedsProof))
+      continue;
+
+    llvm::SmallVector<llvm::Type *> Types(
+        Derived.IR->getFunctionType()->params());
+    bool AggregateResult = aggregate(Derived.Result);
+    StringRef ResultType = Derived.Result;
+    bool ReferenceResult = ResultType.consume_back("&");
+    if (ReferenceResult)
+      ResultType.consume_back("&");
+    auto *PreparedType =
+        ReferenceResult ? Pointer : ir(Derived.Result, Derived.Decl.At);
+    bool HasPreparedArgument =
+        !Entry && !AggregateResult && !PreparedType->isVoidTy();
+    unsigned PreparedArgument = Types.size();
+    if (HasPreparedArgument)
+      Types.push_back(PreparedType);
+    auto *Scratch = llvm::Function::Create(
+        llvm::FunctionType::get(llvm::Type::getVoidTy(C), Types, false),
+        llvm::GlobalValue::PrivateLinkage, "", M);
+    auto Discard = llvm::scope_exit([&] { Scratch->eraseFromParent(); });
+
+    Frame Probe(*this, &Derived, Scratch);
+    Probe.TypeQuery = true;
+    Probe.TracksStorage = false;
+    Probe.B.SetInsertPoint(Probe.block("entry"));
+    Probe.bindParams();
+    // Lower the actual inherited view. Shared virtual-base offsets remain
+    // symbolic inputs read from the receiver's layout.
+    auto BaseReceiver = Probe.baseView(Probe.Self, Path);
+    Value Prepared{unconst(ResultType.str())};
+    if (AggregateResult)
+      Prepared.Address = Scratch->getArg(0);
+    else if (HasPreparedArgument) {
+      if (ReferenceResult)
+        Prepared.Address = Scratch->getArg(PreparedArgument);
+      else
+        Prepared.IR = Scratch->getArg(PreparedArgument);
+    }
+    Prepared.Readonly = true;
+
+    auto *Valid = Probe.block("compatible"), *Invalid = Probe.block("invalid");
+    llvm::SmallPtrSet<llvm::Instruction *, 8> PremiseFailures;
+    auto MarkFailure = [&](llvm::Instruction &I) {
+      I.setMetadata("cpn.override.failure", llvm::MDNode::get(C, {}));
+    };
+    auto EmitConditions = [&](Function &Declaration, bool Assume) {
+      EnterDefinition Site(*this, Declaration.Defaults);
+      Frame Check(*this, &Declaration, Scratch);
+      bindPredicateEnvironment(Check);
+      Check.TypeQuery = true;
+      Check.TracksStorage = false;
+      Check.Self = &Declaration == &Base ? BaseReceiver : Probe.Self;
+      Check.B.SetInsertPoint(Probe.B.GetInsertBlock());
+      auto &Names = Check.Scopes.front().Names;
+      auto ReceiverType = Check.Self.Type;
+      if (Check.Self.Readonly)
+        ReceiverType = qualifyConst(ReceiverType);
+      Names["this"] = {ReceiverType + "*", Check.Self.Address};
+      for (size_t I = 0; I < Declaration.Params.size(); ++I) {
+        auto Input =
+            Probe.Scopes.front().Names.at(parameterBinding(Derived.Decl, I));
+        StringRef Parameter = Declaration.Params[I];
+        bool Reference = Parameter.consume_back("&");
+        if (Reference)
+          Parameter.consume_back("&");
+        Input.Readonly = Declaration.DefaultParams[I].Const ||
+                         (Reference && Parameter.starts_with("const<"));
+        bindPredicateParameter(Names, Declaration, I, std::move(Input), Entry);
+      }
+      if (!Entry && Prepared.Type != "void" && Prepared.Type != "never")
+        Names["return_value"] = Prepared;
+      unsigned Ordinal = 0;
+      for (const auto &Clause : Declaration.Decl.Contracts) {
+        ++Ordinal;
+        if (!NeedsProof(Clause))
+          continue;
+        auto *Result = Check.evaluatePredicate(Clause, Declaration.Name,
+                                               Ordinal, "prove", true);
+        auto *Next = Check.block("next");
+        Check.B.CreateCondBr(Result, Next, Assume ? Valid : Invalid);
+        Check.B.SetInsertPoint(Next);
+      }
+      Probe.B.SetInsertPoint(Check.B.GetInsertBlock());
+      for (auto &Block : *Scratch)
+        for (auto &I : Block)
+          if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+              Call && Call->getIntrinsicID() == llvm::Intrinsic::trap) {
+            if (Assume)
+              PremiseFailures.insert(&I);
+            else if (!PremiseFailures.contains(&I))
+              MarkFailure(I);
+          }
+    };
+    EmitConditions(Premise, true);
+    EmitConditions(Goal, false);
+    Probe.B.CreateBr(Valid);
+    Probe.B.SetInsertPoint(Valid);
+    Probe.B.CreateRetVoid();
+    Probe.B.SetInsertPoint(Invalid);
+    MarkFailure(*Probe.B.CreateCall(
+        llvm::Intrinsic::getOrInsertDeclaration(&M, llvm::Intrinsic::trap)));
+    Probe.B.CreateUnreachable();
+    if (!proveNoContractFailure(*Scratch))
+      fail(
+          Derived.Decl.At,
+          std::string(
+              "invalid override of inherited virtual slot: cannot establish ") +
+              (Entry ? "precondition" : "postcondition") +
+              " implication for '" + Base.Name + "'");
+  }
 }
 
 void Frame::requireObserver(const EffectBound &Bound, const Token &At,
@@ -187,11 +316,8 @@ void Frame::checkContracts(bool Entry, Value Result, bool ValidateOnly,
                         (Mode != "check" && Mode != "prove")))
     return;
   Frame Check(U, F, IR);
-  Check.Opt = Policy;
+  bindPredicateEnvironment(Check);
   Check.TypeQuery = ValidateOnly;
-  Check.LookupLimit = F->Defaults.Through;
-  Check.Prefix = F->DefaultPrefix;
-  Check.Env = F->DefaultEnv;
   Check.Transaction = Transaction;
   Check.Active = Active;
   Check.Extents = Extents;
@@ -212,12 +338,8 @@ void Frame::checkContracts(bool Entry, Value Result, bool ValidateOnly,
   }
   for (size_t I = 0; I < F->Params.size(); ++I) {
     if (auto Arg = Parameters.find(parameterBinding(F->Decl, I));
-        Arg != Parameters.end()) {
-      Names.emplace(boundParameter(I), Arg->second);
-      const auto &Original = F->DefaultParams[I].Text;
-      if (!Original.empty() && (Entry || Original != "return_value"))
-        Names.emplace(Original, Arg->second);
-    }
+        Arg != Parameters.end())
+      bindPredicateParameter(Names, *F, I, Arg->second, Entry);
   }
   if (!Entry && F->Result != "void" && F->Result != "never") {
     Result.Readonly = true;

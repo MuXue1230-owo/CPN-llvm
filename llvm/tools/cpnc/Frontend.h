@@ -65,6 +65,7 @@ inline bool operatorSpelling(llvm::StringRef Name) {
 bool builtin(llvm::StringRef);
 bool builtinPredicate(llvm::StringRef);
 bool integerLibraryName(llvm::StringRef, bool ExplicitDestination = false);
+bool bitExtractionName(llvm::StringRef);
 bool realToken(llvm::StringRef);
 bool floating(llvm::StringRef);
 struct Node {
@@ -137,8 +138,9 @@ struct Node {
   Node() = default;
   Node(Kind K, Token At) : K(K), At(std::move(At)), Text(this->At.Text) {}
 };
-using EffectSet = std::set<std::string>;
+bool bitExtensionArgument(const Node &);
 bool usesNumericLibrary(const Node &);
+using EffectSet = std::set<std::string>;
 using EffectBound = std::optional<EffectSet>;
 EffectSet bindEffectNames(llvm::StringRef, const std::vector<Node> &,
                           bool HasReceiver, const Token &);

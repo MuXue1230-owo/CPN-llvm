@@ -131,16 +131,7 @@ void Context::buildTables(const std::string &Name,
                            [&](auto *Item) { return same(Item, D); });
     bool Override = D->Decl.Settings.count("override");
     if (It != R.Virtuals.end()) {
-      if (!Override || (*It)->Decl.Settings.count("final") ||
-          // These indices designate fields declared by the owning layer.
-          // Equal offsets in two different layers denote different slots.
-          (D->Owner != (*It)->Owner &&
-           (!D->Initializes.empty() || !D->RequiresAlive.empty())) ||
-          D->Initializes != (*It)->Initializes ||
-          D->RequiresAlive != (*It)->RequiresAlive ||
-          ((*It)->Decl.Noexcept && !D->Decl.Noexcept) ||
-          !compatibleValueOverride(D->Decl, (*It)->Decl) ||
-          !compatibleCallable(callableType(*D), callableType(**It)))
+      if (!Override)
         fail(D->Decl.At, "invalid override of inherited virtual slot");
       D->Slot = It - R.Virtuals.begin();
       *It = D;
@@ -210,6 +201,28 @@ void Context::buildTables(const std::string &Name,
     DispatchTables.emplace(Table.Entries,
                            std::make_pair(Name, R.Tables.size()));
     R.Tables.push_back(std::move(Table));
+  }
+}
+void Context::validateOverrides(const std::string &Name,
+                                const std::vector<Function *> &Methods) {
+  for (auto *D : Methods) {
+    if (D->Decl.K != Node::Function || !D->Decl.Settings.count("override"))
+      continue;
+    for (const auto &[Path, Owner] : Records.at(Name).Views) {
+      if (Path.empty())
+        continue;
+      for (auto *Base : Records.at(Owner).Virtuals) {
+        if (Base->Owner != Owner || !same(Base, D))
+          continue;
+        // Construction-state indices belong to each declaring layer.
+        if (Base->Decl.Settings.count("final") || !D->Initializes.empty() ||
+            !D->RequiresAlive.empty() || D->Initializes != Base->Initializes ||
+            D->RequiresAlive != Base->RequiresAlive ||
+            !compatibleCallable(callableType(*D), callableType(*Base)))
+          fail(D->Decl.At, "invalid override of inherited virtual slot");
+        proveValueOverride(*D, *Base, Path);
+      }
+    }
   }
 }
 llvm::Value *Frame::fieldAddress(Value Obj, unsigned I) {
@@ -589,6 +602,8 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   std::vector<llvm::Value *> Vals;
   auto *Storage = resultAddress(Sig.front(), At);
   auto Flags = callableFlags(T);
+  std::set<unsigned> NoEscape, Borrowed;
+  bool MayWriteCallStorage = Storage || callableFlag(T, " whole");
   std::set<unsigned> Origins;
   std::string StorageOrigin;
   std::vector<Value> Actual;
@@ -598,10 +613,15 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
     Vals.push_back(Storage);
   }
   for (size_t I = 0; I < Args.size(); ++I) {
+    auto Position = std::to_string(I);
     Types.push_back(U.aggregate(Sig[I + 1]) ? B.getPtrTy() : U.ir(Sig[I + 1]));
     auto &Param = Sig[I + 1];
     auto V = eval(Args[I], Param);
-    if (Flags.count("borrow#" + std::to_string(I))) {
+    if (Flags.count("noescape#" + Position))
+      NoEscape.insert(I);
+    MayWriteCallStorage |= Flags.count("consumes#" + Position) != 0;
+    if (Flags.count("borrow#" + Position)) {
+      Borrowed.insert(I);
       Origins.insert(V.Origins.begin(), V.Origins.end());
       StorageOrigin = V.Storage;
       ++Sources;
@@ -627,6 +647,9 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   for (unsigned I = 0; I < Args.size(); ++I)
     if (U.aggregate(Sig[I + 1]))
       ValueAggregates.push_back(I);
+  describeBorrowCall(*Call, At, Opt, llvm::ArrayRef(Sig).drop_front(),
+                     Storage ? 1 : 0, NoEscape, Borrowed, Effects,
+                     MayWriteCallStorage || !ValueAggregates.empty());
   describeEffectCall(*Call, Effects, Storage ? 1 : 0, false, nullptr,
                      ValueAggregates, Predicate);
   if (Sig[0] == "never") {
