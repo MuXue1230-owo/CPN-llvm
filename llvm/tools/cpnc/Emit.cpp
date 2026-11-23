@@ -1157,7 +1157,7 @@ Function *Frame::select(std::string Name, const Node &N,
     Function *Decl;
     std::vector<unsigned> Ranks;
   };
-  auto Better = [Generated](const Candidate &A, const Candidate &B) {
+  auto Better = [&](const Candidate &A, const Candidate &B) {
     bool Strict = false;
     for (size_t I = 0; I < A.Ranks.size(); ++I) {
       if (A.Ranks[I] > B.Ranks[I])
@@ -1166,8 +1166,7 @@ Function *Frame::select(std::string Name, const Node &N,
     }
     return Strict ||
            (Generated && B.Decl == Generated && A.Decl != Generated) ||
-           betterPattern(A.Decl->Origin ? A.Decl->Origin->Decl : A.Decl->Decl,
-                         B.Decl->Origin ? B.Decl->Origin->Decl : B.Decl->Decl);
+           betterOverloadPattern(*A.Decl, *B.Decl, N.At);
   };
   std::vector<Candidate> Best;
   auto Group =

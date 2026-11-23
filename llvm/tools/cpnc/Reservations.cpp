@@ -1,5 +1,6 @@
 #include "Sema.h"
 #include "llvm/Analysis/Loads.h"
+#include "llvm/Analysis/ValueTracking.h"
 using namespace cpn;
 namespace {
 // For each path, only the first use of a slot affects its eligibility. Joining
@@ -560,12 +561,31 @@ void Construction::publish(Frame &Em) {
     Em.B.CreateStore(Em.B.getInt32(Frontier), Cursor);
 }
 namespace {
-enum class LayerAlias { NoEvidence, Exact, Possible };
+enum class LayerAlias { Disjoint, Exact, Possible };
+
+bool canReachAliasArm(const llvm::BasicBlock *Block) {
+  for (unsigned Depth = 0; Depth < 16; ++Depth) {
+    const auto *Previous = Block->getSinglePredecessor();
+    if (!Previous)
+      break;
+    if (const auto *Branch =
+            llvm::dyn_cast_or_null<llvm::CondBrInst>(Previous->getTerminator()))
+      if (const auto *Condition =
+              llvm::dyn_cast<llvm::ConstantInt>(Branch->getCondition());
+          Condition &&
+          Branch->getSuccessor(Condition->isZero() ? 1 : 0) != Block)
+        return false;
+    Block = Previous;
+  }
+  return true;
+}
 
 LayerAlias layerAlias(llvm::Value *Pointer, llvm::Value *Receiver) {
   llvm::SmallVector<llvm::Value *> Pending{Pointer};
   llvm::SmallPtrSet<llvm::Value *, 8> Seen;
-  bool Match = false, Other = false;
+  Receiver = Receiver->stripPointerCasts();
+  const auto *ReceiverObject = llvm::getUnderlyingObject(Receiver);
+  bool Match = false, Other = false, Unknown = false;
   unsigned Budget = 64;
   while (!Pending.empty() && Budget--) {
     auto *V = Pending.pop_back_val()->stripPointerCasts();
@@ -574,10 +594,17 @@ LayerAlias layerAlias(llvm::Value *Pointer, llvm::Value *Receiver) {
     if (V == Receiver) {
       Match = true;
     } else if (auto *Select = llvm::dyn_cast<llvm::SelectInst>(V)) {
-      Pending.push_back(Select->getTrueValue());
-      Pending.push_back(Select->getFalseValue());
+      if (auto *C = llvm::dyn_cast<llvm::ConstantInt>(Select->getCondition()))
+        Pending.push_back(C->isZero() ? Select->getFalseValue()
+                                      : Select->getTrueValue());
+      else {
+        Pending.push_back(Select->getTrueValue());
+        Pending.push_back(Select->getFalseValue());
+      }
     } else if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(V)) {
-      llvm::append_range(Pending, Phi->incoming_values());
+      for (unsigned I = 0; I < Phi->getNumIncomingValues(); ++I)
+        if (canReachAliasArm(Phi->getIncomingBlock(I)))
+          Pending.push_back(Phi->getIncomingValue(I));
     } else if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(V);
                Load && Load->isSimple()) {
       auto Start = Load->getIterator();
@@ -586,14 +613,30 @@ LayerAlias layerAlias(llvm::Value *Pointer, llvm::Value *Receiver) {
           Stored && Stored->getType()->isPointerTy())
         Pending.push_back(Stored);
       else
-        Other = true;
+        Unknown = true;
     } else {
-      Other = true;
+      const auto *Object = llvm::getUnderlyingObject(V);
+      const auto Direct = [](const llvm::Value *P) {
+        return llvm::isa<llvm::AllocaInst, llvm::GlobalVariable,
+                         llvm::Argument>(P);
+      };
+      // A fresh automatic slot cannot be named by a distinct direct object
+      // or an incoming pointer. Two incoming pointers may be equal.
+      bool Separate =
+          Object != ReceiverObject &&
+          ((llvm::isa<llvm::AllocaInst>(Object) && Direct(ReceiverObject)) ||
+           (llvm::isa<llvm::AllocaInst>(ReceiverObject) && Direct(Object)) ||
+           (llvm::isa<llvm::GlobalVariable>(Object) &&
+            llvm::isa<llvm::GlobalVariable>(ReceiverObject)));
+      if (Separate || llvm::isa<llvm::ConstantPointerNull>(V))
+        Other = true;
+      else
+        Unknown = true;
     }
   }
-  if (!Match)
-    return LayerAlias::NoEvidence;
-  return Other || !Pending.empty() ? LayerAlias::Possible : LayerAlias::Exact;
+  if (Unknown || !Pending.empty() || (Match && Other))
+    return LayerAlias::Possible;
+  return Match ? LayerAlias::Exact : LayerAlias::Disjoint;
 }
 } // namespace
 
@@ -604,7 +647,7 @@ void Construction::checkSlot(Frame &Em, size_t Slot, const Token &At,
     return;
   auto Alias =
       Designated ? layerAlias(Designated, Object.Address) : LayerAlias::Exact;
-  if (Alias == LayerAlias::NoEvidence)
+  if (Alias == LayerAlias::Disjoint)
     return;
   bool AlwaysPending = *States.rbegin() <= Slot;
   if (AlwaysPending && Alias == LayerAlias::Exact)

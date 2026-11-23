@@ -15,7 +15,8 @@ ConstantActivation::ConstantActivation(Context &U, const Token &At)
     : Depth(U.ConstantDepth, U.ConstantDepth + 1) {
   if (U.ConstantDepth == 1)
     U.ConstantSteps = 0;
-  if (U.ConstantDepth > 256)
+  // Activations keep expression and statement evaluation on the host stack.
+  if (U.ConstantDepth > 64)
     throw ResourceExhausted{{At, "constant invocation depth exhausted"}};
   U.chargeConstant(At);
 }

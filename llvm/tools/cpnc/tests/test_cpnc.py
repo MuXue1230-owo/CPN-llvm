@@ -951,6 +951,55 @@ class CompilerTests(unittest.TestCase):
                     -signal.SIGILL,
                 )
 
+    def test_construction_checks_opaque_aliases_and_whole_value_copies(self):
+        source = """
+            declare struct Box;
+            [[effects(none),returns_borrowed_from(self,other)]]
+            Box* choose(bool use_self, Box* self, Box* other) {
+                return use_self?self:other;
+            }
+            [[effects(read(view))]] declare i32 read_box(const<Box>* view);
+            struct Box {
+                i32 field;
+                Box(i32 n){init field(n);}
+                Box(bool use_self, Box* other){init field(EXPRESSION);}
+            };
+            [[effects(read(view))]] i32 read_box(const<Box>* view){return view->field;}
+            i32 main(){Box alive(42);Box chosen(SELECT_SELF,&alive);return chosen.field;}
+        """
+        opaque = source.replace("EXPRESSION", "read_box(choose(use_self,this,other))")
+        for preset in ("Debug", "Release"):
+            with self.subTest(preset=preset):
+                self.assertEqual(
+                    self.program(
+                        opaque.replace("SELECT_SELF", "false"), "--preset", preset
+                    ),
+                    42,
+                )
+        self.assertEqual(
+            self.program(opaque.replace("SELECT_SELF", "true")), -signal.SIGILL
+        )
+        constant_alias = source.replace("EXPRESSION", "read_box(true?this:other)")
+        result = self.compile(constant_alias.replace("SELECT_SELF", "false"), "--check")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("LIFE002", result.stderr)
+
+        copied = self.compile(
+            """
+                declare struct Box;
+                declare i32 consume(Box item);
+                struct Box {
+                    i32 field;
+                    Box(){init field(consume(*this));}
+                    Box(const<Box>& other)=default;
+                };
+                i32 consume(Box item){return item.field;}
+            """,
+            "--check",
+        )
+        self.assertEqual(copied.returncode, 1, copied.stderr)
+        self.assertIn("LIFE002", copied.stderr)
+
     def test_construction_state_respects_closed_nonaccessing_call_contracts(self):
         source = """
             struct PureMethod {
@@ -4034,6 +4083,113 @@ class CompilerTests(unittest.TestCase):
                 result = self.compile(source, "--check")
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("std::forward", result.stderr)
+
+    def test_constraint_order_expands_named_structural_requirements(self):
+        self.assertEqual(
+            self.program("""
+                constraint Readable<type T> {
+                    expression(const<T>& x){x.read()->i32;}
+                };
+                constraint SizedReadable<type T> {
+                    requires(Readable<T>);
+                    expression(const<T>& value){value.size()->usize;}
+                };
+                struct Data {
+                    i32 read() const {return 40;}
+                    usize size() const {return 2;}
+                };
+                generic<type Item> requires(Readable<Item>)
+                i32 use(const<Item>& x){return 1;}
+                generic<type Value> requires(SizedReadable<Value>)
+                i32 use(const<Value>& x){return x.read();}
+                generic<type T> struct Rank { i32 get() const {return 0;} };
+                generic<type T> requires(Readable<T>)
+                specialize struct Rank<T> {i32 get() const {return 1;}};
+                generic<type T> requires(SizedReadable<T>)
+                specialize struct Rank<T> {i32 get() const {return 2;}};
+                i32 main(){ Data data; Rank<Data> rank; return use(data)+rank.get(); }
+            """),
+            42,
+        )
+
+    def test_constraint_order_uses_boolean_implication(self):
+        self.assertEqual(
+            self.program("""
+                alias Word=i32;
+                constraint EnabledWord<type T,const bool Enabled=true> {
+                    requires(Enabled && SameType<T,Word>);
+                };
+                generic<type T> requires(SameType<T,i32> || SameType<T,i64>)
+                i32 choose(T value){return 1;}
+                generic<type T> requires(EnabledWord<T> && !SameType<T,bool>)
+                i32 choose(T value){return 42;}
+                i32 main(){return choose(i32(0));}
+            """),
+            42,
+        )
+        for source in (
+            "generic<const i32 N> requires(N>0) i32 f(){return 1;}"
+            "generic<const i32 N> requires(N>=1) i32 f(){return 2;}"
+            "i32 main(){return f<2>();}",
+            "generic<type T> requires(SameType<T,i32>) i32 f(T x){return 1;}"
+            "generic<type T> requires((SameType<T,i32> && CompleteType<T>) ||"
+            " (SameType<T,i32> && !CompleteType<T>)) i32 f(T x){return 2;}"
+            "i32 main(){return f(i32(0));}",
+        ):
+            with self.subTest(source=source):
+                result = self.compile(source, "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("ambiguous overload", result.stderr)
+
+    def test_constraint_order_preserves_short_circuit_evaluation(self):
+        source = """
+            constexpr bool recursive(){return recursive();}
+            generic<type T> requires(SameType<T,i32> || recursive())
+            i32 choose(T value){return 1;}
+            generic<type T> requires(SameType<T,i32> && CompleteType<T>)
+            i32 choose(T value){return 42;}
+            i32 main(){return choose(TYPE(0));}
+        """
+        self.assertEqual(self.program(source.replace("TYPE", "i32")), 42)
+        reached = self.compile(source.replace("TYPE", "i64"), "--check")
+        self.assertEqual(reached.returncode, 1, reached.stderr)
+        self.assertIn("constant invocation depth exhausted", reached.stderr)
+
+    def test_required_constraint_evaluation_failure_is_not_false(self):
+        source = """
+            bool runtime_only(){return true;}
+            constraint Gate<type T> {requires(CONDITION);};
+            generic<type T> requires(Gate<T>) i32 pick(T value){return 1;}
+            generic<type T> i32 pick(T value){return 42;}
+            i32 main(){return pick(i32(0));}
+        """
+        self.assertEqual(
+            self.program(source.replace("CONDITION", "false && runtime_only()")),
+            42,
+        )
+        for condition, diagnostic in (
+            ("true && runtime_only()", "constexpr function"),
+            ("i32(1)", "Boolean type"),
+        ):
+            with self.subTest(condition=condition):
+                result = self.compile(source.replace("CONDITION", condition), "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
+    def test_core_type_predicates_exclude_nonobject_and_incomplete_enum_types(self):
+        self.assertEqual(
+            self.program("""
+                declare enum State:i32;
+                constexpr bool opaque(ObjectType<State> && !CompleteType<State>
+                    && !CopyConstructible<State>);
+                enum State:i32 {case Ready(1)};
+                alias Signature=function<void()>;
+                i32 main(){return opaque && CompleteType<State>
+                    && CopyConstructible<State> && !ObjectType<never>
+                    && !ObjectType<Signature> && !CompleteType<Signature> ? 42 : 0;}
+            """),
+            42,
+        )
 
     def test_pack_expansion_and_forwarding(self):
         self.assertEqual(

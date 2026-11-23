@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
 using namespace cpn;
 using llvm::StringRef;
@@ -700,6 +701,335 @@ std::set<std::string> requirements(const Node &Decl) {
   return Set;
 }
 
+bool expressionUses(const Node &, StringRef);
+std::string constantIdentity(const Value &);
+
+// An ordered Boolean decision graph uses one variable per normalized atom.
+// Comparing A with B checks whether A && !B is unsatisfiable, without
+// identifying different arithmetic predicates using their concrete results.
+class ConstraintOrdering {
+  using Formula = unsigned;
+  using Symbols = std::map<std::string, std::string>;
+  using Decision = std::tuple<unsigned, Formula, Formula>;
+  Frame Probe;
+  const Token &At;
+  std::map<std::string, unsigned> Atoms;
+  std::vector<Decision> Nodes{{}, {}};
+  std::map<Decision, Formula> Unique;
+  std::map<std::pair<Formula, Formula>, Formula> Conjunctions;
+  std::map<Formula, Formula> Negations;
+  std::set<std::string> Expanding;
+
+  void charge(unsigned Depth) {
+    Probe.U.chargeSolver(At);
+    if (Depth > 512 || Nodes.size() - 2 > Probe.Opt.MaxNormalNodes)
+      throw ResourceExhausted{{At, "constraint ordering resource exhausted"}};
+  }
+  Formula node(unsigned Atom, Formula False, Formula True) {
+    if (False == True)
+      return False;
+    Decision Key{Atom, False, True};
+    auto [I, New] = Unique.try_emplace(Key, Nodes.size());
+    if (New)
+      Nodes.push_back(Key);
+    return I->second;
+  }
+  Formula variable(const std::string &Key) {
+    auto I = Atoms.try_emplace(Key, Atoms.size()).first;
+    return node(I->second, 0, 1);
+  }
+  Formula negate(Formula F, unsigned Depth = 0) {
+    if (F < 2)
+      return 1 - F;
+    if (auto I = Negations.find(F); I != Negations.end())
+      return I->second;
+    charge(Depth);
+    auto [Atom, False, True] = Nodes[F];
+    auto Result = node(Atom, negate(False, Depth + 1), negate(True, Depth + 1));
+    Negations.emplace(F, Result);
+    return Result;
+  }
+  Formula conjunction(Formula L, Formula R, unsigned Depth = 0) {
+    if (L > R)
+      std::swap(L, R);
+    if (L == 0 || L == R)
+      return L;
+    if (L == 1)
+      return R;
+    if (auto I = Conjunctions.find({L, R}); I != Conjunctions.end())
+      return I->second;
+    charge(Depth);
+    auto [LA, LF, LT] = Nodes[L];
+    auto [RA, RF, RT] = Nodes[R];
+    unsigned Top = std::min(LA, RA);
+    auto False = conjunction(LA == Top ? LF : L, RA == Top ? RF : R, Depth + 1);
+    auto True = conjunction(LA == Top ? LT : L, RA == Top ? RT : R, Depth + 1);
+    auto Result = node(Top, False, True);
+    Conjunctions.emplace(std::pair(L, R), Result);
+    return Result;
+  }
+  std::string spelling(StringRef Text, const Symbols &Bindings) {
+    std::string Key;
+    while (!Text.empty()) {
+      if (Text.front() == '\'' || Text.front() == '"') {
+        auto Literal = quotedSpelling(Text);
+        Key += Literal;
+        Text = Text.drop_front(Literal.size());
+        continue;
+      }
+      auto Word = Text.take_while(identifierByte);
+      if (Word.empty()) {
+        auto Mark =
+            Text.starts_with("::") ? Text.take_front(2) : Text.take_front();
+        Key += Mark;
+        Text = Text.drop_front(Mark.size());
+        continue;
+      }
+      if (StringRef(Key).ends_with("::"))
+        Key += Word;
+      else if (auto I = Bindings.find(Word.str()); I != Bindings.end())
+        Key += I->second;
+      else if (auto I = Probe.Env.Types.find(Word.str());
+               I != Probe.Env.Types.end())
+        Key += I->second;
+      else
+        Key += Word;
+      Text = Text.drop_front(Word.size());
+    }
+    return Key;
+  }
+  std::string canonicalType(StringRef Type, unsigned Depth = 0) {
+    charge(Depth);
+    for (StringRef Suffix : {"&&", "&", "*"})
+      if (Type.ends_with(Suffix))
+        return canonicalType(Type.drop_back(Suffix.size()), Depth + 1) +
+               Suffix.str();
+    if (Type.starts_with("const<") && Type.ends_with(">"))
+      return qualifyConst(
+          canonicalType(Type.slice(6, Type.size() - 1), Depth + 1));
+    if (Type == "byte" || Type == "::byte")
+      return "u8";
+    auto Base = Type.split('<').first;
+    auto Name = scopeKey(Probe.Prefix, Base, [&](const std::string &K) {
+      return Probe.U.Records.count(K) || Probe.U.Enums.count(K) ||
+             Probe.U.Families.count(K) || Probe.U.Aliases.count(K);
+    });
+    if (Name.empty())
+      return Type.str();
+    if (Base.size() == Type.size())
+      if (auto Alias = Probe.U.Aliases.find(Name);
+          Alias != Probe.U.Aliases.end())
+        return Alias->second;
+    return Name + Type.drop_front(Base.size()).str();
+  }
+  std::string typeKey(StringRef Type, const Symbols &Bindings) {
+    return canonicalType(spelling(Type, Bindings));
+  }
+  std::string atomKey(const Node &N, const Symbols &Bindings, unsigned Depth) {
+    charge(Depth);
+    if (N.K == Node::TypeArg)
+      return "type(" + typeKey(N.Type, Bindings) + ")";
+    if (N.K == Node::Name && N.TemplateArgs.empty()) {
+      if (auto I = Bindings.find(N.Text); I != Bindings.end())
+        return I->second;
+      if (auto I = Probe.Env.Values.find(N.Text); I != Probe.Env.Values.end())
+        return constantIdentity(I->second);
+    }
+    auto Name =
+        N.K == Node::Number ? numberSpelling(N) : spelling(N.Text, Bindings);
+    if (N.K == Node::Name && !builtinPredicate(Name)) {
+      auto Bound = scopeKey(Probe.Prefix, Name, [&](const std::string &K) {
+        return Probe.U.Globals.count(K) || Probe.U.Cases.count(K) ||
+               !Probe.visibleOverloads(K).empty() ||
+               Probe.U.FunctionFamilies.count(K);
+      });
+      if (!Bound.empty())
+        Name = "::" + Bound;
+    }
+    std::string Key = std::to_string(N.K) + ":" + Name;
+    if (N.Definition)
+      Key += "#defined";
+    if (N.Pack)
+      Key += "...";
+    Key += "(";
+    for (const auto &[Setting, Value] : N.Settings)
+      Key += Setting + "=" + Value + ",";
+    for (const auto &A : N.TemplateArgs)
+      Key += atomKey(A, Bindings, Depth + 1) + ",";
+    for (const auto &C : N.Children)
+      Key += atomKey(C, Bindings, Depth + 1) + ",";
+    return Key + ")";
+  }
+  std::string policyKey() const {
+    const auto &O = Probe.Opt;
+    return O.Overflow + "/" + O.DefaultInt + "/" + O.DefaultReal + "/" +
+           O.FPProfile + "/" + O.FPRounding + "/" + O.FPSubnormal + "/" +
+           O.LiteralRounding;
+  }
+  std::optional<Value> evaluate(const Node &N, const Symbols &Bindings,
+                                bool Reached) {
+    if (N.K == Node::Name && N.TemplateArgs.empty() && !Bindings.count(N.Text))
+      if (auto I = Probe.Env.Values.find(N.Text); I != Probe.Env.Values.end())
+        return I->second;
+    if (!Reached && N.K != Node::Number && N.K != Node::Character &&
+        !(N.K == Node::Name && (N.Text == "true" || N.Text == "false")))
+      return {};
+    if (llvm::any_of(Bindings,
+                     [&](const auto &B) { return expressionUses(N, B.first); }))
+      return {};
+    try {
+      auto V = Probe.constantEval(N);
+      if (llvm::isa_and_nonnull<llvm::ConstantInt>(V.IR))
+        return V;
+    } catch (const ResourceExhausted &) {
+      throw;
+    } catch (const Diagnostic &) {
+      // Applicability diagnoses a failing evaluation when the branch runs.
+    }
+    return {};
+  }
+  Formula named(const Family &F, const Node &N, const Symbols &Caller,
+                unsigned Depth, bool Reached) {
+    // A pack application has an ordered argument list of its own. It can
+    // share identity with the same application even before its length is known.
+    if (!F.Decl.Generics.empty() && F.Decl.Generics.back().Pack) {
+      if (llvm::any_of(N.TemplateArgs, [](const Node &A) { return A.Pack; }))
+        return variable(F.Prefix + F.Decl.Text + ":" +
+                        atomKey(N, Caller, Depth));
+      auto Fixed = F.Decl.Generics.size() - 1;
+      auto Count =
+          N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0;
+      return named(expand(F, Count, N.At), N, Caller, Depth, Reached);
+    }
+
+    struct Argument {
+      std::string Key;
+      std::optional<Value> Constant;
+    };
+    auto bindArgument = [&](const Node &P, const Node &Actual,
+                            const Symbols &Bindings) {
+      if (P.K == Node::TypeParam)
+        return Argument{typeKey(Actual.Type, Bindings), {}};
+      return Argument{atomKey(Actual, Bindings, Depth + 1),
+                      evaluate(Actual, Bindings, Reached)};
+    };
+    Symbols Arguments;
+    std::string Application = F.Prefix + F.Decl.Text + "<";
+    std::vector<Argument> Explicit;
+    for (auto [I, P] : llvm::enumerate(F.Decl.Generics)) {
+      if (I >= N.TemplateArgs.size())
+        break;
+      Explicit.push_back(bindArgument(P, N.TemplateArgs[I], Caller));
+    }
+    llvm::SaveAndRestore Prefix(Probe.Prefix, F.Prefix);
+    llvm::SaveAndRestore Opt(Probe.Opt, F.Site.Configuration);
+    llvm::SaveAndRestore Visibility(Probe.LookupLimit, F.Site.Through);
+    llvm::SaveAndRestore Env(Probe.Env, F.Enclosing);
+    for (auto [I, P] : llvm::enumerate(F.Decl.Generics)) {
+      if (I >= Explicit.size() && P.Children.empty())
+        return variable("constraint:" + Application + ">/missing");
+      auto Term = I < Explicit.size()
+                      ? std::move(Explicit[I])
+                      : bindArgument(P, P.Children.front(), Arguments);
+      Probe.Env.Types.erase(P.Text);
+      Probe.Env.Values.erase(P.Text);
+      if (P.K == Node::TypeParam &&
+          !StringRef(Term.Key).contains("$constraint.")) {
+        Probe.Env.Types[P.Text] = Term.Key;
+      } else if (Term.Constant) {
+        auto Type = typeKey(P.Type, Arguments);
+        if (!StringRef(Type).contains("$constraint.")) {
+          try {
+            auto V = Probe.convert(*Term.Constant, Type, P.At);
+            Term.Key = constantIdentity(V);
+            Probe.Env.Values[P.Text] = std::move(V);
+          } catch (const ResourceExhausted &) {
+            throw;
+          } catch (const Diagnostic &) {
+            Arguments[P.Text] = Term.Key;
+          }
+        } else
+          Arguments[P.Text] = Term.Key;
+      } else {
+        Arguments[P.Text] = Term.Key;
+      }
+      Application += Term.Key + ",";
+    }
+    if (!Expanding.insert(Application).second)
+      fail(N.At, "cyclic named constraint expansion");
+    auto Done = llvm::scope_exit([&] { Expanding.erase(Application); });
+    Formula Result = 1;
+    for (auto [I, Rule] : llvm::enumerate(F.Decl.Children)) {
+      if (Result == 0)
+        break;
+      Formula Requirement = Rule.Text == "requires"
+                                ? build(Rule.Children.front(), Arguments,
+                                        Depth + 1, Reached && Result == 1)
+                                : variable("requirement:" + Application + ">/" +
+                                           std::to_string(I));
+      Result = conjunction(Result, Requirement);
+    }
+    return Result;
+  }
+  Formula build(const Node &N, const Symbols &Bindings, unsigned Depth,
+                bool Reached) {
+    charge(Depth);
+    if (N.K == Node::Name && (N.Text == "true" || N.Text == "false"))
+      return N.Text == "true";
+    if (N.K == Node::Unary && N.Text == "!")
+      return negate(build(N.Children.front(), Bindings, Depth + 1, Reached));
+    if (N.K == Node::Binary && (N.Text == "&&" || N.Text == "||")) {
+      bool And = N.Text == "&&";
+      auto L = build(N.Children.front(), Bindings, Depth + 1, Reached);
+      if (L == (And ? 0u : 1u))
+        return L;
+      auto R = build(N.Children.back(), Bindings, Depth + 1,
+                     Reached && L == (And ? 1u : 0u));
+      return And ? conjunction(L, R)
+                 : negate(conjunction(negate(L), negate(R)));
+    }
+    if (N.K == Node::Name)
+      if (const auto *F = Probe.constraint(N.Text))
+        return named(*F, N, Bindings, Depth, Reached);
+    if (auto V = evaluate(N, Bindings, Reached); V && V->Type == "bool")
+      return llvm::cast<llvm::ConstantInt>(V->IR)->isOne();
+    auto Key = atomKey(N, Bindings, Depth);
+    return variable(builtinPredicate(N.Text) ? Key : Key + "@" + policyKey());
+  }
+  Formula buildFamily(const Family &F, llvm::ArrayRef<Node> Requirements) {
+    Probe.Prefix = F.Prefix;
+    Probe.LookupLimit = F.Site.Through;
+    Probe.Opt = F.Site.Configuration;
+    Probe.Env = F.Enclosing;
+    Symbols Parameters;
+    for (auto [I, P] : llvm::enumerate(F.Decl.Generics)) {
+      Probe.Env.Types.erase(P.Text);
+      Probe.Env.Values.erase(P.Text);
+      auto Name = "$constraint." + std::to_string(I);
+      if (P.K == Node::ValueParam)
+        Name += ":" + typeKey(P.Type, Parameters);
+      Parameters[P.Text] = std::move(Name);
+    }
+    Formula Result = 1;
+    for (const auto &R : Requirements) {
+      if (Result == 0)
+        break;
+      Result = conjunction(Result, build(R, Parameters, 0, Result == 1));
+    }
+    return Result;
+  }
+
+public:
+  ConstraintOrdering(Context &U, const Token &At)
+      : Probe(U, nullptr, nullptr), At(At) {}
+  bool stronger(const Family &A, llvm::ArrayRef<Node> Left, const Family &B,
+                llvm::ArrayRef<Node> Right) {
+    auto L = buildFamily(A, Left);
+    auto R = buildFamily(B, Right);
+    return L != R && conjunction(L, negate(R)) == 0;
+  }
+};
+
 enum class PatternMatch { Established, Different, Unestablished };
 
 struct SymbolicValue {
@@ -863,19 +1193,18 @@ std::string cpn::rebindTypeNames(llvm::StringRef Text, const Node &Old,
                                  const Node &New) {
   return substituteBinders(Text, Old, &New);
 }
-bool cpn::betterPattern(const Node &A, const Node &B) {
-  if (A.Generics.empty() || B.Generics.empty())
-    return A.Generics.empty() && !B.Generics.empty() && B.TemplateArgs.empty();
-  return betterTypePattern(A, B);
-}
-bool cpn::betterTypePattern(const Node &A, const Node &B) {
-  if (!acceptsPattern(B, A))
+bool Frame::betterOverloadPattern(const Function &A, const Function &B,
+                                  const Token &At) {
+  const auto *Left = A.Origin;
+  const auto *Right = B.Origin;
+  if (!Left || !Right)
+    return !Left && Right && Right->Decl.TemplateArgs.empty();
+  if (!acceptsPattern(Right->Decl, Left->Decl))
     return false;
-  if (!acceptsPattern(A, B))
+  if (!acceptsPattern(Left->Decl, Right->Decl))
     return true;
-  auto Left = requirements(A), Right = requirements(B);
-  return Left.size() > Right.size() &&
-         std::includes(Left.begin(), Left.end(), Right.begin(), Right.end());
+  return ConstraintOrdering(U, At).stronger(*Left, Left->Decl.TemplateArgs,
+                                            *Right, Right->Decl.TemplateArgs);
 }
 bool cpn::sameGenericResult(const Node &A, const Node &B) {
   return normalized(A.Type, A) == normalized(B.Type, B);
@@ -1204,10 +1533,15 @@ bool Frame::predicate(const Node &N) {
     auto T = resolve(N.TemplateArgs[0].Type, N.At);
     if (N.Text == "SameType")
       return T == resolve(N.TemplateArgs[1].Type, N.At);
-    if (T == "void" || llvm::StringRef(T).ends_with("&"))
+    if (T == "void" || T == "never" || llvm::StringRef(T).ends_with("&") ||
+        U.Signatures.count(T))
       return false;
-    if (N.Text == "ObjectType" || N.Text == "CompleteType")
-      return N.Text == "ObjectType" || U.ir(T, N.At)->isSized();
+    if (N.Text == "ObjectType")
+      return true;
+    if (U.Enums.count(T) && !U.DefinedEnums.count(T))
+      return false;
+    if (N.Text == "CompleteType")
+      return U.ir(T, N.At)->isSized();
     return constructible(T,
                          N.Text == "CopyConstructible"
                              ? SpecialOperation::CopyConstruct
@@ -1229,23 +1563,26 @@ bool Frame::predicate(const Node &N) {
   auto *Fn = llvm::Function::Create(
       llvm::FunctionType::get(B.getVoidTy(), false),
       llvm::GlobalValue::InternalLinkage, "cpn.requirement", U.M);
+  auto Discard = llvm::scope_exit([&] { Fn->eraseFromParent(); });
   EnterDefinition Site(U, C.Site);
   Frame Probe(U, nullptr, Fn, C.Prefix);
   Probe.Env = std::move(S);
   Probe.B.SetInsertPoint(Probe.block("entry"));
-  bool OK = true;
-  try {
-    for (auto &R : C.Decl.Children) {
-      if (!OK)
-        break;
-      U.chargeSolver(R.At);
-      Probe.Scopes.emplace_back();
+  for (auto &R : C.Decl.Children) {
+    U.chargeSolver(R.At);
+    if (R.Text == "requires") {
+      const auto &Expression = R.Children.front();
+      auto V = Probe.constantEval(Expression);
+      if (V.Type != "bool")
+        fail(Expression.At, "a generic requirement must have Boolean type");
+      if (llvm::cast<llvm::ConstantInt>(V.IR)->isZero())
+        return false;
+      continue;
+    }
+    Probe.Scopes.emplace_back();
+    try {
       if (R.Text == "type")
         Probe.resolve(R.Type, R.At);
-      else if (R.Text == "requires")
-        OK &=
-            !llvm::cast<llvm::ConstantInt>(Probe.constantEval(R.Children[0]).IR)
-                 ->isZero();
       else {
         for (auto &P : R.Params) {
           auto T = Probe.resolve(P.Type, P.At);
@@ -1273,22 +1610,18 @@ bool Frame::predicate(const Node &N) {
           if (V.Type != T ||
               (Reference ? (!V.Address || V.Prvalue || V.Expiring != Xvalue ||
                             V.Readonly != Const)
-                         : (V.Address && !V.Prvalue))) {
-            OK = false;
-            break;
-          }
+                         : (V.Address && !V.Prvalue)))
+            return false;
         }
       }
-      Probe.Scopes.pop_back();
+    } catch (const ResourceExhausted &) {
+      throw;
+    } catch (const Diagnostic &) {
+      return false;
     }
-  } catch (const ResourceExhausted &) {
-    Fn->eraseFromParent();
-    throw;
-  } catch (const Diagnostic &) {
-    OK = false;
+    Probe.Scopes.pop_back();
   }
-  Fn->eraseFromParent();
-  return OK;
+  return true;
 }
 
 // Deduce each specialization's own parameters from the primary's canonical
@@ -1320,9 +1653,8 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
     if (A.VariableArity != B.VariableArity && AB == PatternMatch::Established &&
         BA == PatternMatch::Established)
       return !A.VariableArity;
-    auto Left = requirements(A.Head), Right = requirements(B.Head);
-    return Left.size() > Right.size() &&
-           std::includes(Left.begin(), Left.end(), Right.begin(), Right.end());
+    return ConstraintOrdering(U, At).stronger(
+        A.Definition, A.Head.TemplateArgs, B.Definition, B.Head.TemplateArgs);
   };
   std::vector<Candidate> Best;
   for (const auto &Declaration : Group->second) {
@@ -1446,11 +1778,14 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
       }
     if (!Fits)
       continue;
-    if (!Spec.Decl.Params.empty() &&
-        !llvm::cast<llvm::ConstantInt>(
-             Probe.constantEval(Spec.Decl.Params.front()).IR)
-             ->isOne())
-      continue;
+    if (!Spec.Decl.Params.empty()) {
+      const auto &Requirement = Spec.Decl.Params.front();
+      auto V = Probe.constantEval(Requirement);
+      if (V.Type != "bool")
+        fail(Requirement.At, "a generic requirement must have Boolean type");
+      if (llvm::cast<llvm::ConstantInt>(V.IR)->isZero())
+        continue;
+    }
     Candidate Current{std::move(Spec), std::move(Head), std::move(Probe.Env),
                       Packed};
     if (llvm::any_of(Best, [&](const Candidate &Entry) {

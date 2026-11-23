@@ -467,8 +467,6 @@ std::string parameterBinding(const Node &, size_t);
 void normalizeContracts(Node &);
 bool sameContracts(const Node &, const Node &);
 std::vector<std::string> splitArguments(llvm::StringRef);
-bool betterTypePattern(const Node &, const Node &);
-bool betterPattern(const Node &, const Node &);
 Family expand(const Family &, size_t, const Token &);
 std::string element(const std::string &T);
 bool integer(const std::string &T);
@@ -667,6 +665,7 @@ public:
                    Function *Generated = nullptr);
   Function *prepareCandidate(const Family &, const std::string &, const Node &,
                              const std::vector<Value> &);
+  bool betterOverloadPattern(const Function &, const Function &, const Token &);
   void selectTypeSpecialization(const std::string &, Family &, Substitution &,
                                 const Token &);
   Substitution bind(const Family &, const std::vector<Node> &,
@@ -864,6 +863,7 @@ public:
   void checkAccess(Frame &, const Token &,
                    llvm::Value *Designated = nullptr) const;
   void checkBaseAccess(Frame &, const Value &, const Token &) const;
+  void checkWholeView(Frame &, const Value &, const Token &) const;
   void checkReceiver(Frame &, const Function &, const Token &,
                      llvm::Value *Designated = nullptr) const;
   static bool mayAccess(const EffectBound &, const EffectSet &Predicate,

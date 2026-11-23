@@ -118,6 +118,8 @@ void Frame::transfer(Value Source, llvm::Value *Dest, SpecialOperation Op,
     return;
   }
   auto &R = It->second;
+  if (Transaction)
+    Transaction->checkWholeView(*this, Source, At);
   Value Result{Source.Type, nullptr, Dest};
   Result.BaseView = AsBase;
   auto *Previous = assignment(Op) ? nullptr : pushInvariantLifetime(Result);

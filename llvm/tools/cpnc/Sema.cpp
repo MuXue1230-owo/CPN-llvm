@@ -614,11 +614,15 @@ std::string Frame::resolve(std::string S, const Token &At) {
         U.chargeInstance(At);
         Frame Probe(U, nullptr, nullptr, Fam.Prefix);
         Probe.Env = E;
-        if (!Fam.Decl.Params.empty() &&
-            !llvm::cast<llvm::ConstantInt>(
-                 Probe.constantEval(Fam.Decl.Params[0]).IR)
-                 ->getZExtValue())
-          fail(At, "constraint is not satisfied");
+        if (!Fam.Decl.Params.empty()) {
+          const auto &Requirement = Fam.Decl.Params.front();
+          auto V = Probe.constantEval(Requirement);
+          if (V.Type != "bool")
+            fail(Requirement.At,
+                 "a generic requirement must have Boolean type");
+          if (llvm::cast<llvm::ConstantInt>(V.IR)->isZero())
+            fail(At, "constraint is not satisfied");
+        }
         if (Fam.Decl.K == Node::Union)
           U.tagged(Fam.Decl, Full, Fam.Prefix, E);
         else

@@ -435,6 +435,15 @@ void Construction::checkCallArguments(Frame &Em, llvm::ArrayRef<Value> Actual,
   }
 }
 
+void Construction::checkWholeView(Frame &Em, const Value &View,
+                                  const Token &At) const {
+  if (Em.TypeQuery || !View.Address)
+    return;
+  checkBaseAccess(Em, View, At);
+  if (View.Type == Object.Type && !Order.empty())
+    checkSlot(Em, Order.size() - 1, At, View.Address);
+}
+
 void Construction::checkReceiver(Frame &Em, const Function &D, const Token &At,
                                  llvm::Value *Designated) const {
   if (D.Owner != Object.Type)
