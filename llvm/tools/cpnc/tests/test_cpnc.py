@@ -6661,6 +6661,30 @@ class CompilerTests(unittest.TestCase):
             self.assertNotEqual(invalid.returncode, 0)
             self.assertIn("preserve lifecycle_effect", invalid.stderr)
 
+    def test_whole_effect_from_implicit_local_cleanup(self):
+        source = """
+            declare struct Owner;
+            declare void request(Owner* owner);
+            struct Guard {
+                Owner* target;
+                Guard(Owner* owner){init target(owner);}
+                ~Guard(){request(target);}
+            };
+            struct Result {i32 value;};
+            Result produce(Owner* owner){Guard local(owner);return Result(42);}
+            struct Base {};
+            struct Owner:Base {Complete base<Base>;};
+            void request(Owner* owner){destroy_base<Base>(owner);}
+            void bind(){function<Result(Owner*) EFFECT>* selected(&produce);}
+        """
+        rejected = self.compile(source.replace("EFFECT", ""), "--check")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("preserve lifecycle_effect", rejected.stderr)
+        accepted = self.compile(
+            source.replace("EFFECT", "[[lifecycle_effect(whole)]]"), "--check"
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
     def test_alive_base_path_request_skips_containing_layers(self):
         for request, expected in [("destroy_base", 232456), ("abandon_base", 32456)]:
             with self.subTest(request=request):

@@ -113,6 +113,18 @@ void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
       V.BaseView && !V.ExtentType.empty() ? V.ExtentType : V.Type;
   auto *Entry = MayRunCleanup ? destructor(F, CompleteType)
                               : llvm::ConstantPointerNull::get(F.B.getPtrTy());
+  if (MayRunCleanup && F.F && F.U.Whole && !F.TypeQuery && !V.BaseView) {
+    auto Current = F.Active.find(V.Storage);
+    auto Original = F.StorageGenerations.find(V.Generation);
+    auto Cleanup = F.U.Overloads.find(CompleteType + "::$drop");
+    // The live generation supplies the authored destructor. A class with
+    // no bases runs it under the caller's active Whole coordinator.
+    if (Current != F.Active.end() && Original != F.StorageGenerations.end() &&
+        Current->second == Original->second &&
+        Cleanup != F.U.Overloads.end() &&
+        F.U.Records.at(CompleteType).Bases.empty())
+      F.F->Calls.insert(Cleanup->second.front());
+  }
   llvm::Value *Operands[] = {
       V.Address,
       Entry,
