@@ -105,7 +105,8 @@ bool Frame::containsDispatchState(const std::string &Type) const {
 }
 Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
                                  const Token &At, const Node *Tail,
-                                 Value *BaseDestination) {
+                                 Value *BaseDestination,
+                                 llvm::function_ref<void()> Admit) {
   requireObserver(D.Effects, At, &D);
   if (D.Decl.Prototype || D.Decl.Children.empty())
     fail(At, "constant construction requires a constructor definition");
@@ -115,6 +116,8 @@ Value Frame::constantConstructor(Function &D, const std::vector<Value> &Args,
     if (!StringRef(D.Params[I]).ends_with("&") && Args[I].Prvalue)
       consume(Args[I]);
   Root.bindInlineParams(Args);
+  if (Admit)
+    Admit();
   Root.checkContracts(true);
   Value Object =
       BaseDestination
@@ -274,7 +277,8 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
 }
 Value Frame::constantAggregate(const std::string &T,
                                const std::vector<Node> &Args, const Token &At,
-                               const Node *Tail, Value *BaseDestination) {
+                               const Node *Tail, Value *BaseDestination,
+                               llvm::function_ref<void()> Admit) {
   ConstantActivation Activation(U, At);
   auto *Ty = U.ir(T, At);
   auto *Array = llvm::dyn_cast<llvm::ArrayType>(Ty);
@@ -321,6 +325,8 @@ Value Frame::constantAggregate(const std::string &T,
     Input.push_back(eval(Args[I], unconst(Expected)));
   }
   if (Input.size() == 1 && Input.front().Type == T) {
+    if (Admit)
+      Admit();
     auto V = Input.front();
     if (!V.Prvalue || BaseDestination)
       V = constantCopy(V, At, false, BaseDestination);
@@ -345,10 +351,12 @@ Value Frame::constantAggregate(const std::string &T,
         fail(At, "union construction requires a selected case");
       auto *D = select("$ctor", Node(Node::Name, At), Input, {T});
       return finishTail(
-          constantConstructor(*D, Input, At, Tail, BaseDestination));
+          constantConstructor(*D, Input, At, Tail, BaseDestination, Admit));
     }
     if (!U.DefaultCase.count(T))
       fail(At, "union construction requires a selected case");
+    if (Admit)
+      Admit();
     return finishTail(
         variant(U.Cases.at(U.DefaultCase.at(T)), {}, At, nullptr, true, false));
   }
@@ -364,10 +372,12 @@ Value Frame::constantAggregate(const std::string &T,
                      Fits ? &Aggregate : nullptr);
     if (D != &Aggregate)
       return finishTail(
-          constantConstructor(*D, Input, At, Tail, BaseDestination));
+          constantConstructor(*D, Input, At, Tail, BaseDestination, Admit));
   }
   if (Args.size() > Count - Bases)
     fail(At, "too many aggregate initializers");
+  if (Admit)
+    Admit();
   auto scalar = [&](const std::string &S) {
     auto E = unconst(S);
     return integer(E) || floating(E) || E == "bool" || E == "char" ||

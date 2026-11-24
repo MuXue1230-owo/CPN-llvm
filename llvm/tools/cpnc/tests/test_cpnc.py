@@ -8034,22 +8034,21 @@ class CompilerTests(unittest.TestCase):
             """),
             -signal.SIGILL,
         )
-        self.assertEqual(
-            self.program("""
+        whole = """
                 i32 trace;
                 i8 backing;
                 declare struct Outer;
-                declare void request(Outer* owner);
+                declare i32 request(Outer* owner);
                 struct Parent {~Parent(){trace=trace*10+1;}};
                 struct Stage {~Stage(){trace=trace*10+2;}};
                 struct Work {
-                    Stage finished;
-                    Work(Outer* owner){request(owner);}
+                    WORK;
                     ~Work(){trace=trace*10+9;}
                 };
                 struct Outer:Parent {
                     Complete base<Parent>;
                     ~Outer(){
+                        CALLER
                         auto area(storage_of(backing));
                         destroy(backing);
                         construct_at<Work>(area,this);
@@ -8060,11 +8059,24 @@ class CompilerTests(unittest.TestCase):
                         if(*resumed==42){trace=trace*10+3;}
                     }
                 };
-                void request(Outer* owner){destroy_base<Parent>(owner);}
+                i32 request(Outer* owner){destroy_base<Parent>(owner);return 0;}
                 i32 main(){{Outer value;}return trace==123 ? 42 : 1;}
-            """),
-            42,
-        )
+            """
+        for caller, work in (
+            ("", "Stage finished;Work(Outer* owner){request(owner);}"),
+            (
+                "Stage caller;",
+                "i8 item;Work(Outer* owner,i32 code(request(owner)))"
+                "{init item(42);trace=trace*10+8;}",
+            ),
+        ):
+            with self.subTest(caller=caller):
+                self.assertEqual(
+                    self.program(
+                        whole.replace("CALLER", caller).replace("WORK;", work)
+                    ),
+                    42,
+                )
 
     def test_scalar_reconstruction_evaluates_operand_before_admission(self):
         self.assertEqual(
@@ -8116,6 +8128,160 @@ class CompilerTests(unittest.TestCase):
                 }
                 """,
             ),
+            42,
+        )
+
+    def test_aggregate_reconstruction_evaluates_arguments_before_admission(self):
+        source = """
+            extern "C" i64 operand(i32 digit);
+            DECLARATION
+            extern "C" i32 replace_object(bool use_small){
+                i8 small;
+                TYPE large;
+                auto view(use_small ? storage_of(small) : storage_of(large));
+                destroy(small);
+                destroy(large);
+                auto rebuilt(construct_at<TYPE>(view,ARGUMENTS));
+                CHECK
+            }
+        """
+        host = """
+            #include <stdbool.h>
+            #include <signal.h>
+            #include <stdint.h>
+            #include <stdlib.h>
+            extern int32_t replace_object(bool);
+            static volatile sig_atomic_t trace;
+            int64_t operand(int32_t digit) { trace = trace * 10 + digit; return 21; }
+            static void rejected(int reason) {
+                _Exit(reason == SIGILL && trace == 12 ? 42 : 1);
+            }
+            int main(void) {
+                if (replace_object(false) != 42 || trace != 12) return 2;
+                trace = 0;
+                if (signal(SIGILL, rejected) == SIG_ERR) return 3;
+                replace_object(true);
+                return 4;
+            }
+        """
+        authored = (
+            "struct Pair {i64 sum;Pair(i64 a,i64 b(operand(2))){init sum(a+b);}"
+            "Pair(const<Pair>& original)=delete;Pair(Pair&& original)=delete;};"
+        )
+        borrowed = (
+            "struct Item {i64 data;Item(const<Item>& original)=default;}; Item item(21); "
+            "Item& choose(i32 digit){operand(digit);return item;} "
+        )
+        for declaration, kind, args, check in (
+            (authored, "Pair", "operand(1)", "return rebuilt->sum==42 ? 42 : 1;"),
+            (authored, "Pair", "Pair(operand(1))", "return rebuilt->sum==42 ? 42 : 1;"),
+            (
+                authored + "Pair make(){return Pair(operand(1));}",
+                "Pair",
+                "make()",
+                "return rebuilt->sum==42 ? 42 : 1;",
+            ),
+            (
+                "struct Pair {i64 first;i64 second;};",
+                "Pair",
+                "operand(1),operand(2)",
+                "return rebuilt->first+rebuilt->second==42 ? 42 : 1;",
+            ),
+            (
+                "",
+                "i64[2]",
+                "operand(1),operand(2)",
+                "return (*rebuilt)[0]+(*rebuilt)[1]==42 ? 42 : 1;",
+            ),
+            (
+                "union Choice {default case Empty;case Pair(i64 first,i64 second);};",
+                "Choice",
+                "Choice::Pair(operand(1),operand(2))",
+                "match(*rebuilt){case Choice::Pair(value first,value second)"
+                "{return first+second==42 ? 42 : 1;}case Choice::Empty{return 1;}}",
+            ),
+            (
+                borrowed + "struct Holder {Item first;i64 second;};",
+                "Holder",
+                "choose(1),operand(2)",
+                "return rebuilt->first.data+rebuilt->second==42 ? 42 : 1;",
+            ),
+            (
+                borrowed,
+                "Item[2]",
+                "choose(1),choose(2)",
+                "return (*rebuilt)[0].data+(*rebuilt)[1].data==42 ? 42 : 1;",
+            ),
+            (
+                borrowed
+                + "union Choice {default case Empty;case Pair(Item first,i64 second);};",
+                "Choice",
+                "Choice::Pair(choose(1),operand(2))",
+                "match(*rebuilt){case Choice::Pair(ref first,value second)"
+                "{return first.data+second==42 ? 42 : 1;}case Choice::Empty{return 1;}}",
+            ),
+        ):
+            with self.subTest(kind=kind, args=args):
+                program = (
+                    source.replace("DECLARATION", declaration)
+                    .replace("TYPE", kind)
+                    .replace("ARGUMENTS", args)
+                    .replace("CHECK", check)
+                )
+                self.assertEqual(self.program(program, host=host), 42)
+
+        self.assertEqual(
+            self.program("""
+                struct Object {
+                    i32 data;
+                    Object(i32* expected){init data(42);if(&data!=expected){data=1;}}
+                    Object(const<Object>& old)=delete;
+                    Object(Object&& old)=delete;
+                };
+                Object make(i32* expected){return Object(expected);}
+                i32 main(){
+                    i32 original;
+                    i32* expected(&original);
+                    auto view(storage_of(original));
+                    destroy(original);
+                    return construct_at<Object>(view,make(expected))->data;
+                }
+            """),
+            42,
+        )
+
+        self.assertEqual(
+            self.program("""
+                struct Value {i32 data;};
+                struct Owner {
+                    Value value;
+                    Owner(function<i32()>* produce){init value(produce());}
+                };
+                i32 choice(){return 42;}
+                i32 choice(i32 alternate){return alternate;}
+                i32 main(){
+                    i32 extent;
+                    auto view(storage_of(extent));
+                    destroy(extent);
+                    return construct_at<Owner>(view,&choice)->value.data;
+                }
+            """),
+            42,
+        )
+
+    def test_constant_aggregate_reconstruction_admits_after_arguments(self):
+        self.assertEqual(
+            self.program("""
+                struct Object {i32 data;Object(i32 value){init data(value);}};
+                constexpr i32 retire(Object& value){destroy(value);return 42;}
+                constexpr i32 evaluate(){
+                    Object original(1);
+                    auto view(storage_of(original));
+                    return construct_at<Object>(view,retire(original))->data;
+                }
+                constexpr i32 expected(evaluate());
+                i32 main(){return expected==42 ? evaluate() : 1;}
+            """),
             42,
         )
 

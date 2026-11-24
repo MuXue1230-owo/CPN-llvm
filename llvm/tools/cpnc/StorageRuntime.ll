@@ -220,8 +220,14 @@ commit:
 }
 
 define internal void @cpn.slot.unreserve(ptr %entry) {
+  %head = load ptr, ptr @cpn.reconstructions
+  %active = icmp eq ptr %head, %entry
+  br i1 %active, label %remove, label %done
+remove:
   %previous = load ptr, ptr %entry
   store ptr %previous, ptr @cpn.reconstructions
+  br label %done
+done:
   ret void
 }
 

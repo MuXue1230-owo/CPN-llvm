@@ -172,10 +172,12 @@ llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
 
 Value Frame::variant(const Case &C, const std::vector<Node> &Args,
                      const Token &At, llvm::Value *Dest, bool Default,
-                     bool CheckInvariant) {
+                     bool CheckInvariant, llvm::function_ref<void()> Admit) {
   if (!Default && Args.size() != C.Types.size())
     fail(At, "wrong union payload arity");
   if (!IR) {
+    if (Default && Admit)
+      Admit();
     std::vector<llvm::Constant *> Fields;
     for (size_t I = 0; I < C.Types.size(); ++I) {
       auto V = Default ? construct(C.Types[I], {}, At)
@@ -184,6 +186,8 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
                                      Args[I].At);
       Fields.push_back(llvm::cast<llvm::Constant>(V.IR));
     }
+    if (!Default && Admit)
+      Admit();
     Value V{C.Owner,
             packVariant(C, llvm::ConstantStruct::get(C.Payload, Fields), At)};
     if (CheckInvariant)
@@ -192,6 +196,19 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     return V;
   }
   auto *Ptr = Dest ? Dest : allocate(C.Owner, At);
+  std::vector<Value> Operands;
+  if (Admit) {
+    if (!Default && llvm::none_of(llvm::enumerate(Args), [&](const auto &Item) {
+          return operandNeedsDestination(Item.value(), C.Types[Item.index()]);
+        }))
+      for (size_t I = 0; I < Args.size(); ++I) {
+        const auto &Type = C.Types[I];
+        const auto &Arg = Args[I];
+        Operands.push_back(constructionOperand(
+            convert(eval(Arg, Type), Type, Arg.At), Arg.At));
+      }
+    Admit();
+  }
   auto *Progress = C.Types.empty()
                        ? nullptr
                        : beginConstructionPrefix({C.Owner, nullptr, Ptr}, &C);
@@ -199,6 +216,8 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     auto *Slot = payloadAddress(C, Ptr, I);
     if (Default)
       construct(C.Types[I], {}, At, Slot);
+    else if (!Operands.empty())
+      materialize(Operands[I], Args[I].At, Slot);
     else if (!directConstruction(Args[I], C.Types[I], Slot)) {
       auto V = convert(eval(Args[I], C.Types[I], Slot), C.Types[I], Args[I].At);
       materialize(V, Args[I].At, Slot);

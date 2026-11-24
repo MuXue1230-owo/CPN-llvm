@@ -588,6 +588,7 @@ public:
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
   Value ExpressionDestination;
+  llvm::function_ref<llvm::Value *()> ReplacementFits;
   llvm::Value *resultAddress(const std::string &, const Token &);
   bool Live = true, RequireNoexcept = false, BaseLayer = false;
   bool TypeQuery = false;
@@ -646,7 +647,8 @@ public:
   Value eval(const Node &, std::string Expected = "",
              llvm::Value *Dest = nullptr);
   Value constantEval(const Node &);
-  std::string unevaluatedType(const Node &, bool IncludeCategory);
+  std::string unevaluatedType(const Node &, bool IncludeCategory,
+                              const std::string &Expected = {});
   Value floatingConvert(Value, const std::string &, const Token &,
                         bool Explicit = false);
   Value floatingBinary(const Node &, Value, Value,
@@ -683,7 +685,8 @@ public:
                                   Value SingleDestination = {});
   void admitArguments(CallArguments &, Function *, const Token &);
   Value invoke(Function &, std::vector<Value>, const Token &,
-               Value Receiver = {}, bool Prepared = false);
+               Value Receiver = {}, bool Prepared = false,
+               llvm::function_ref<void()> BeforeInvoke = {});
   std::optional<unsigned> conversionRank(Value, const std::string &,
                                          const Token &);
   std::vector<Function *> visibleOverloads(const std::string &) const;
@@ -707,8 +710,13 @@ public:
   std::string initSlot(const Node &);
   Initializer deferInitializer(const Node &, const std::string &Expected);
   Value runInitializer(Initializer &, Value Target, const Token &);
-  std::optional<Value> directConstruction(const Node &, const std::string &,
-                                          llvm::Value *);
+  Value constructionOperand(Value, const Token &);
+  bool operandNeedsDestination(const Node &, const std::string &);
+  Value constructPrvalue(const Node &, const std::string &, llvm::Value *,
+                         const Token &, llvm::function_ref<void()> Admit);
+  std::optional<Value>
+  directConstruction(const Node &, const std::string &, llvm::Value *,
+                     llvm::function_ref<void()> Admit = {});
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
                   bool AsBase = false, llvm::function_ref<void()> Admit = {});
@@ -784,7 +792,8 @@ public:
   const Case *findCase(const std::string &, const Token &);
   Value variant(const Case &, const std::vector<Node> &, const Token &,
                 llvm::Value *Dest = nullptr, bool Default = false,
-                bool CheckInvariant = true);
+                bool CheckInvariant = true,
+                llvm::function_ref<void()> Admit = {});
   void visitPayload(Value, llvm::function_ref<void(const Case &)>);
   void dropPayload(Value);
   void transferPayload(Value, llvm::Value *, SpecialOperation, const Token &);
@@ -815,10 +824,12 @@ public:
                      Value *BaseDestination = nullptr);
   Value constantConstructor(Function &, const std::vector<Value> &,
                             const Token &, const Node *,
-                            Value *BaseDestination = nullptr);
+                            Value *BaseDestination = nullptr,
+                            llvm::function_ref<void()> Admit = {});
   Value constantAggregate(const std::string &, const std::vector<Node> &,
                           const Token &, const Node *,
-                          Value *BaseDestination = nullptr);
+                          Value *BaseDestination = nullptr,
+                          llvm::function_ref<void()> Admit = {});
   ConstantPlace constantBasePlace(ConstantPlace, const BasePath &) const;
   ConstantPlace constantFieldPlace(Value &, unsigned) const;
   Value constantField(Value &, unsigned, const Token &);
