@@ -108,6 +108,7 @@ struct Value {
   bool Rollback = false;
   llvm::Value *ConstructionProgress = nullptr;
   llvm::Value *ConstructionReservation = nullptr;
+  llvm::Value *DeferredConstruction = nullptr;
   const Case *ConstructionCase = nullptr;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
@@ -588,7 +589,19 @@ public:
   llvm::Value *PendingObject = nullptr;
   std::set<std::string> PendingSlots;
   Value ExpressionDestination;
-  llvm::function_ref<llvm::Value *()> ReplacementFits;
+  struct StorageReplacement {
+    llvm::Value *Address;
+    llvm::Value *Slot;
+    llvm::Value *Birth;
+    llvm::Value *Reservation;
+    uint64_t Size;
+    uint64_t Alignment;
+    Token At;
+  };
+  const StorageReplacement *Replacement = nullptr;
+  llvm::Value *DeferredResultAddress = nullptr;
+  bool admitsResult(llvm::Value *) const;
+  void admitResult(llvm::Value *);
   llvm::Value *resultAddress(const std::string &, const Token &);
   bool Live = true, RequireNoexcept = false, BaseLayer = false;
   bool TypeQuery = false;
@@ -713,7 +726,7 @@ public:
   Value constructionOperand(Value, const Token &);
   bool operandNeedsDestination(const Node &, const std::string &);
   Value constructPrvalue(const Node &, const std::string &, llvm::Value *,
-                         const Token &, llvm::function_ref<void()> Admit);
+                         const Token &);
   std::optional<Value>
   directConstruction(const Node &, const std::string &, llvm::Value *,
                      llvm::function_ref<void()> Admit = {});

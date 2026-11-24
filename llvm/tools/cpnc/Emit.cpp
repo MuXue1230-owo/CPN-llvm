@@ -1952,40 +1952,6 @@ bool Frame::operandNeedsDestination(const Node &N, const std::string &Type) {
   return !ends(Source, "&") || unconst(baseRef(Source)) != unconst(Type);
 }
 
-Value Frame::constructPrvalue(const Node &N, const std::string &T,
-                              llvm::Value *Dest, const Token &At,
-                              llvm::function_ref<void()> Admit) {
-  // Capacity and alignment belong to the captured extent and cannot improve
-  // during evaluation. On permanent rejection, evaluate into a temporary.
-  // A successful operand still constructs at the original final address.
-  auto *Fits = ReplacementFits();
-  auto *Reserve = block("storage.reserve"),
-       *Temporary = block("storage.temporary"),
-       *Operand = block("storage.operand");
-  B.CreateCondBr(Fits, Reserve, Temporary);
-  B.SetInsertPoint(Reserve);
-  Admit();
-  auto *Admitted = B.GetInsertBlock();
-  branch(Operand);
-  B.SetInsertPoint(Temporary);
-  auto *Scratch = B.CreateAlloca(U.ir(T, At));
-  Scratch->setMetadata("cpn.object", llvm::MDNode::get(U.C, {}));
-  branch(Operand);
-  B.SetInsertPoint(Operand);
-  auto *Target = B.CreatePHI(B.getPtrTy(), 2);
-  Target->addIncoming(Dest, Admitted);
-  Target->addIncoming(Scratch, Temporary);
-  auto Source = eval(N, T, Target);
-  guard(B.CreateNot(Fits));
-  materialize(Source, At, Target, false);
-  Value Result{T, nullptr, Dest};
-  if (U.Records.count(T)) {
-    checkInvariants(Result);
-    Result.IR = B.CreateLoad(U.ir(T), Dest);
-  }
-  return Result;
-}
-
 void Frame::runConstructionTail(Value Object, const Node *Tail,
                                 bool BoundSlots) {
   if (!Tail)
@@ -2069,6 +2035,9 @@ void Frame::rollbackConstructionPrefix(Value Object, llvm::Value *Count) {
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
                        bool AsBase, llvm::function_ref<void()> Admit) {
+  auto AdmitResult = [&] { admitResult(Dest); };
+  if (!Admit && U.aggregate(T) && admitsResult(Dest))
+    Admit = AdmitResult;
   if (InPredicate && U.aggregate(T))
     fail(At, "contract predicates cannot construct aggregate temporaries");
   if ((T == StorageViewType || memoryIdentity(T)) && Args.empty())
@@ -2111,8 +2080,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Admit) {
       auto Source = Args.size() == 1 ? unevaluatedType(Args.front(), true, E)
                                      : std::string();
-      if (ReplacementFits && !Tail && unconst(Source) == T)
-        return constructPrvalue(Args.front(), T, Ptr, At, Admit);
+      if (!Tail && unconst(Source) == T)
+        return constructPrvalue(Args.front(), T, Ptr, At);
       if (ends(Source, "&") && unconst(baseRef(Source)) == T) {
         auto Input = eval(Args.front());
         Admit();
@@ -2123,13 +2092,12 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Temps.push_back(V);
         return V;
       }
-      if (unconst(baseRef(Source)) != T &&
-          llvm::none_of(Args, [&](const Node &Arg) {
-            return operandNeedsDestination(Arg, E);
-          })) {
+      if (unconst(baseRef(Source)) != T) {
         if (Args.size() > Count)
           fail(At, "too many array initializers");
         for (const auto &Arg : Args) {
+          if (operandNeedsDestination(Arg, E))
+            break;
           auto Operand =
               AggregateElement ? eval(Arg, E) : construct(E, {Arg}, Arg.At);
           Operands.push_back(constructionOperand(Operand, Arg.At));
@@ -2156,7 +2124,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       fail(At, "too many array initializers");
     for (size_t I = 0; I < Args.size(); ++I) {
       auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), B.getInt64(I)});
-      if (!Operands.empty())
+      if (I < Operands.size())
         materialize(Operands[I], Args[I].At, P);
       else if (!First)
         construct(E, {Args[I]}, At, P);
@@ -2208,8 +2176,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   if (Admit && U.aggregate(T) && Args.size() == 1 &&
       !(Args.front().K == Node::Unary && Args.front().Text == "&") &&
       unconst(unevaluatedType(Args.front(), true)) == T) {
-    if (ReplacementFits && !Tail && !AsBase)
-      return constructPrvalue(Args.front(), T, Dest, At, Admit);
+    if (!Tail && !AsBase)
+      return constructPrvalue(Args.front(), T, Dest, At);
     // The source produces this complete object in the selected destination.
     Admit();
     Admit = {};
@@ -2277,17 +2245,25 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Fits)
       for (size_t I = 0; I < Args.size(); ++I)
         Aggregate.Params.push_back(R.Fields[R.Bases.size() + I].Type);
+    size_t BeforeAdmission = Args.size();
     if (Admit && Fits &&
         (It == U.Overloads.end() || llvm::none_of(It->second, [&](auto *D) {
            return D->Params == Aggregate.Params;
-         })))
-      for (auto [Index, Arg] : llvm::enumerate(Args))
-        if (operandNeedsDestination(Arg, Aggregate.Params[Index])) {
-          // Positional prvalues can construct directly in the final field.
+         }))) {
+      for (auto [Index, Arg] : llvm::enumerate(Args)) {
+        if (!operandNeedsDestination(Arg, Aggregate.Params[Index]))
+          continue;
+        // A generated aggregate has a fixed field producer at this position.
+        // Bind the remaining initializers with the construction cleanup active.
+        if (It == U.Overloads.end() && Args.size() > 1)
+          BeforeAdmission = Index;
+        else {
           Admit();
           Admit = {};
-          break;
         }
+        break;
+      }
+    }
     llvm::Value *Progress = nullptr, *Previous = nullptr;
     auto Start = [&] {
       if (Admit)
@@ -2302,7 +2278,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       Start();
     std::vector<Initializer> Inputs;
     std::vector<Value> Actual;
-    for (size_t I = 0; I < Args.size(); ++I) {
+    auto BindInput = [&](size_t I) {
       std::string Expected;
       if (Args[I].K == Node::Unary && Args[I].Text == "&") {
         if (It != U.Overloads.end() && It->second.size() == 1 &&
@@ -2313,13 +2289,15 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       }
       Inputs.push_back(deferInitializer(Args[I], Expected));
       Actual.push_back(Inputs.back().Result);
-    }
+    };
+    for (size_t I = 0; I < BeforeAdmission; ++I)
+      BindInput(I);
     std::map<std::string, const Node *> Producers;
     if (Tail)
       for (auto &S : Tail->Children)
         if (S.K == Node::Init && !Producers.emplace(initSlot(S), &S).second)
           fail(S.At, "duplicate initialization producer");
-    if (Actual.size() == 1 && Actual[0].Type == T) {
+    if (Args.size() == 1 && Actual[0].Type == T) {
       // An embedded layer shares virtual bases with its complete object.
       auto Target = AsBase && R.VirtualCount ? Value{} : Obj;
       Actual[0] = runInitializer(Inputs.front(), Admit ? Value{} : Target, At);
@@ -2376,15 +2354,18 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Producers.clear();
         }
       } else {
-        if (Actual.size() + R.Bases.size() > R.Fields.size())
+        if (Args.size() + R.Bases.size() > R.Fields.size())
           fail(At, "too many aggregate initializers");
+        const size_t Staged = Admit ? Actual.size() : 0;
         if (Admit) {
-          for (size_t I = 0; I < Actual.size(); ++I)
+          for (size_t I = 0; I < Staged; ++I)
             Actual[I] =
                 constructionOperand(convert(runInitializer(Inputs[I], {}, At),
                                             Aggregate.Params[I], At),
                                     At);
           Start();
+          for (size_t I = Staged; I < Args.size(); ++I)
+            BindInput(I);
         }
         if (R.Bases.size() == (AsBase ? R.VirtualCount : 0))
           installTables(Obj);
@@ -2406,9 +2387,10 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             if (Found != Producers.end())
               fail(At, "duplicate aggregate initialization producer");
             auto Argument = I - R.Bases.size();
-            auto V = Admit ? Actual[Argument]
-                           : runInitializer(Inputs[Argument],
-                                            {Field.Type, nullptr, P}, At);
+            auto V = Argument < Staged
+                         ? Actual[Argument]
+                         : runInitializer(Inputs[Argument],
+                                          {Field.Type, nullptr, P}, At);
             materialize(convert(V, Field.Type, At), At, P);
           } else {
             llvm::SaveAndRestore Policy(Opt);
@@ -2485,6 +2467,11 @@ void Frame::drop(Value V, bool AsBase) {
   if (V.ConstructionReservation) {
     B.CreateCall(U.M.getFunction("cpn.slot.unreserve"),
                  {V.ConstructionReservation});
+    return;
+  }
+  if (V.DeferredConstruction) {
+    B.CreateCall(U.M.getFunction("cpn.slot.end.result"),
+                 {V.DeferredConstruction});
     return;
   }
   if (!V.Address)

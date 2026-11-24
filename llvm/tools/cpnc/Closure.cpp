@@ -4,6 +4,8 @@ Value Frame::closure(const Node &N) {
   std::string Type = "$closure." + std::string(F ? F->Name : Prefix) + "." +
                      std::to_string(N.At.Line) + "." +
                      std::to_string(N.At.Column);
+  if (ExpressionDestination.Type.empty() || ExpressionDestination.Type == Type)
+    admitResult(ExpressionDestination.Address);
   std::vector<Value> Values;
   std::vector<llvm::AllocaInst *> Slots;
   for (auto &C : N.TemplateArgs) {

@@ -196,14 +196,17 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     return V;
   }
   auto *Ptr = Dest ? Dest : allocate(C.Owner, At);
+  auto AdmitResult = [&] { admitResult(Dest); };
+  if (!Admit && admitsResult(Dest))
+    Admit = AdmitResult;
   std::vector<Value> Operands;
   if (Admit) {
-    if (!Default && llvm::none_of(llvm::enumerate(Args), [&](const auto &Item) {
-          return operandNeedsDestination(Item.value(), C.Types[Item.index()]);
-        }))
+    if (!Default)
       for (size_t I = 0; I < Args.size(); ++I) {
         const auto &Type = C.Types[I];
         const auto &Arg = Args[I];
+        if (operandNeedsDestination(Arg, Type))
+          break;
         Operands.push_back(constructionOperand(
             convert(eval(Arg, Type), Type, Arg.At), Arg.At));
       }
@@ -216,7 +219,7 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     auto *Slot = payloadAddress(C, Ptr, I);
     if (Default)
       construct(C.Types[I], {}, At, Slot);
-    else if (!Operands.empty())
+    else if (I < Operands.size())
       materialize(Operands[I], Args[I].At, Slot);
     else if (!directConstruction(Args[I], C.Types[I], Slot)) {
       auto V = convert(eval(Args[I], C.Types[I], Slot), C.Types[I], Args[I].At);

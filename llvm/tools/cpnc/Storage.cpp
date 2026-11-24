@@ -448,6 +448,61 @@ Value Frame::storageViewObserver(Value View, llvm::StringRef Name,
                        B.CreateStructGEP(U.SlotType, View.Slot, Field))};
 }
 
+bool Frame::admitsResult(llvm::Value *Address) const {
+  return TracksStorage && !TypeQuery && Address &&
+         (Address == DeferredResultAddress ||
+          (F && U.aggregate(F->Result) && Address == IR->getArg(0)));
+}
+
+void Frame::admitResult(llvm::Value *Address) {
+  if (admitsResult(Address))
+    guard(B.CreateNot(
+        B.CreateCall(U.M.getFunction("cpn.slot.admit.result"), {Address})));
+}
+
+Value Frame::constructPrvalue(const Node &N, const std::string &T,
+                              llvm::Value *Dest, const Token &At) {
+  const auto *Request =
+      Replacement && Replacement->Address == Dest ? Replacement : nullptr;
+  llvm::SaveAndRestore ResultAddress(DeferredResultAddress,
+                                     Request ? Dest : DeferredResultAddress);
+  llvm::SaveAndRestore ReplacementScope(Replacement,
+                                        Request ? nullptr : Replacement);
+  Value Release;
+  if (Request) {
+    // A factory can retire the old generation while preparing its result.
+    // Forward the final address and validate at the first construction
+    // frontier.
+    llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
+    Release.DeferredConstruction = Entry.CreateAlloca(
+        llvm::StructType::getTypeByName(U.C, "cpn.deferred.result"));
+    B.CreateCall(U.M.getFunction("cpn.slot.defer.result"),
+                 {Release.DeferredConstruction, Request->Slot, Request->Birth,
+                  Dest, Request->Reservation, B.getInt64(Request->Size),
+                  B.getInt64(Request->Alignment)});
+    Scopes.back().Drops.push_back(Release);
+  }
+  auto Source = eval(N, T, Dest);
+  materialize(Source, At, Dest, false);
+  if (Request) {
+    auto *Extent = B.CreateCall(U.M.getFunction("cpn.extent.valid"),
+                                {Request->Slot, Request->Birth});
+    markStorageSite(*Extent, "cpn.storage.construct.use", Request->At,
+                    {Request->Size, Request->Alignment});
+    guard(B.CreateNot(Extent));
+    assert(Scopes.back().Drops.back().DeferredConstruction ==
+           Release.DeferredConstruction);
+    Scopes.back().Drops.pop_back();
+    drop(Release);
+  }
+  Value Result{T, nullptr, Dest};
+  if (U.Records.count(T)) {
+    checkInvariants(Result);
+    Result.IR = B.CreateLoad(U.ir(T), Dest);
+  }
+  return Result;
+}
+
 Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
   if (!TracksStorage)
     fail(C.At, "storage operation requires runtime object storage");
@@ -468,49 +523,19 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
         llvm::StructType::getTypeByName(U.C, "cpn.reconstruction"));
     Value Release;
     Release.ConstructionReservation = Reservation;
-    auto validExtent = [&] {
-      return B.CreateCall(U.M.getFunction("cpn.extent.valid"),
-                          {S.Slot, S.Generation});
-    };
-    auto tooSmall = [&] {
-      auto loadBound = [&](SlotField Index) {
-        return B.CreateLoad(B.getInt64Ty(),
-                            B.CreateStructGEP(U.SlotType, S.Slot, Index));
-      };
-      return B.CreateOr(
-          B.CreateICmpULT(loadBound(Capacity), B.getInt64(Size)),
-          B.CreateICmpULT(loadBound(Alignment), B.getInt64(Align)));
-    };
+    Scopes.back().Drops.push_back(Release);
     auto Admit = [&] {
-      auto *Extent = validExtent();
-      markStorageSite(*Extent, "cpn.storage.construct.use", C.At,
+      auto *Admitted =
+          B.CreateCall(U.M.getFunction("cpn.slot.admit.replacement"),
+                       {S.Slot, S.Generation, Reservation, B.getInt64(Size),
+                        B.getInt64(Align)});
+      markStorageSite(*Admitted, "cpn.storage.construct.use", C.At,
                       {Size, Align});
-      guard(B.CreateNot(Extent));
-      auto *Current = B.CreateCall(U.M.getFunction("cpn.generation"),
-                                   {S.Slot, B.getFalse()});
-      guard(B.CreateTrunc(Current, B.getInt1Ty()));
-      guard(tooSmall());
-      auto *Reserved = B.CreateCall(U.M.getFunction("cpn.slot.reserve"),
-                                    {Reservation, S.Slot});
-      guard(B.CreateNot(Reserved));
-      Scopes.back().Drops.push_back(Release);
+      guard(B.CreateNot(Admitted));
     };
-    auto Fits = [&]() -> llvm::Value * {
-      auto *Entry = B.GetInsertBlock();
-      auto *Check = block("storage.geometry"),
-           *Done = block("storage.geometry.done");
-      B.CreateCondBr(validExtent(), Check, Done);
-      B.SetInsertPoint(Check);
-      auto *Enough = B.CreateNot(tooSmall());
-      branch(Done);
-      B.SetInsertPoint(Done);
-      auto *Result = B.CreatePHI(B.getInt1Ty(), 2);
-      Result->addIncoming(B.getFalse(), Entry);
-      Result->addIncoming(Enough, Check);
-      return Result;
-    };
-    llvm::SaveAndRestore ExtentProbe(ReplacementFits,
-                                     llvm::function_ref<llvm::Value *()>(Fits));
+    const StorageReplacement Request{S.IR, S.Slot, S.Generation, Reservation,
+                                     Size, Align,  C.At};
+    llvm::SaveAndRestore ReplacementScope(Replacement, &Request);
     construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR, nullptr, false,
               Admit);
     assert(Scopes.back().Drops.back().ConstructionReservation == Reservation);

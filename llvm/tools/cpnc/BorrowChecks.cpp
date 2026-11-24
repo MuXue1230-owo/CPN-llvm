@@ -161,6 +161,9 @@ class EscapeCheck {
             Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
             Name == "cpn.slot.find" || Name == "cpn.slot.child" ||
             Name == "cpn.slot.release" || Name == "cpn.generation" ||
+            Name == "cpn.slot.defer.result" ||
+            Name == "cpn.slot.admit.result" || Name == "cpn.slot.end.result" ||
+            Name == "cpn.slot.admit.replacement" ||
             Name == "cpn.borrow.valid" || Name == "cpn.whole.epoch")
           return false;
         if (F->getIntrinsicID() == llvm::Intrinsic::lifetime_start ||
@@ -1600,10 +1603,12 @@ class EscapeCheck {
     auto Name = F->getName();
     if (Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
         Name == "cpn.slot.reserve" || Name == "cpn.slot.unreserve" ||
+        Name == "cpn.slot.defer.result" || Name == "cpn.slot.admit.result" ||
+        Name == "cpn.slot.end.result" || Name == "cpn.slot.admit.replacement" ||
         Name == "cpn.slot.child" || Name == "cpn.slot.find" ||
         Name == "cpn.slot.linked" || Name == "cpn.generation" ||
         Name == "cpn.borrow.valid" || Name == "cpn.extent.valid" ||
-        Name == "cpn.pointer.field" ||
+        Name == "cpn.pointer.field" || Name == "cpn.static.read" ||
         F->getIntrinsicID() == llvm::Intrinsic::trap)
       return true;
     if (Verified.contains(F))
@@ -2268,7 +2273,19 @@ void Context::checkBorrowEscapes() {
   // scalar union payloads only updates the compiler's lifetime sidecars.
   llvm::SmallPtrSet<llvm::Function *, 8> TrivialDrops;
   auto *ExtentCheck = M.getFunction("cpn.extent.valid");
-  bool StableRegistrations = !ExtentCheck || ExtentCheck->use_empty();
+  auto *AdmitReplacement = M.getFunction("cpn.slot.admit.replacement");
+  bool StableRegistrations =
+      (!ExtentCheck ||
+       llvm::all_of(ExtentCheck->users(),
+                    [&](auto *Use) {
+                      auto *Call = llvm::dyn_cast<llvm::CallBase>(Use);
+                      return Call && Call->getFunction() == AdmitReplacement;
+                    })) &&
+      (!AdmitReplacement ||
+       llvm::none_of(AdmitReplacement->users(), [](auto *Use) {
+         auto *Call = llvm::dyn_cast<llvm::CallBase>(Use);
+         return !Call || Call->getMetadata(ConstructStorageUse);
+       }));
   if (StableRegistrations) {
     auto ScalarOnly = [&](const std::vector<std::string> &Types) {
       return llvm::none_of(Types, [&](const auto &T) { return aggregate(T); });

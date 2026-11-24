@@ -200,6 +200,8 @@ Value Frame::materialize(Value Source, const Token &At, llvm::Value *Dest,
   bool Aggregate = U.aggregate(Source.Type);
   if (Dest && Dest == Source.Address)
     return Source;
+  if (Aggregate)
+    admitResult(Dest);
   if (!Aggregate || !Source.Address || Source.Prvalue) {
     if (Source.Prvalue)
       consume(Source);

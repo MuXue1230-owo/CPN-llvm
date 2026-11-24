@@ -8269,6 +8269,211 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_factory_reconstruction_admits_at_final_result(self):
+        source = """
+            struct Object {
+                i32 data;
+                Object(i32 value,i32* expected){
+                    init data(value);
+                    if(&data!=expected){data=1;}
+                }
+                Object(const<Object>& old)=delete;
+                Object(Object&& old)=delete;
+            };
+            i32 retire(i32& original){destroy(original);return 42;}
+            Object prepare(i32& original,i32* expected){
+                RETURN
+            }
+            Object relay(i32& original,i32* expected){
+                return Object(prepare(original,expected));
+            }
+            i32 main(){
+                i32 original;
+                auto view(storage_of(original));
+                i32* expected(&original);
+                function<Object(i32&,i32*)>* selected(&relay);
+                return construct_at<Object>(view,FACTORY)->data;
+            }
+        """
+        for body, factory in (
+            (
+                "destroy(original);return Object(42,expected);",
+                "prepare(original,expected)",
+            ),
+            (
+                "return Object(retire(original),expected);",
+                "selected(original,expected)",
+            ),
+            (
+                "return expected!=nullptr ? Object(retire(original),expected)"
+                " : Object(1,expected);",
+                "relay(original,expected)",
+            ),
+        ):
+            with self.subTest(body=body, factory=factory):
+                self.assertEqual(
+                    self.program(
+                        source.replace("RETURN", body).replace("FACTORY", factory)
+                    ),
+                    42,
+                )
+
+        still_live = self.compile(
+            """
+            struct Object {i32 data;};
+            Object prepare(){return Object(42);}
+            i32 main(){
+                i32 original;
+                return construct_at<Object>(storage_of(original),prepare())->data;
+            }
+            """,
+            "--check",
+        )
+        self.assertNotEqual(still_live.returncode, 0)
+        self.assertIn("storage contains a live generation", still_live.stderr)
+
+        self.assertEqual(
+            self.program(
+                """
+                extern "C" i32 operand(i32 digit);
+                struct Object {
+                    i32 data;
+                    Object(i32 input,i32 last(operand(2))){init data(input+last);}
+                };
+                i32 prepare(i32& original,bool retire){
+                    if(retire){destroy(original);}
+                    return operand(1);
+                }
+                Object make(i32& original,bool retire){
+                    return Object(prepare(original,retire));
+                }
+                extern "C" i32 reconstruct(bool retire){
+                    i32 original;
+                    return construct_at<Object>(storage_of(original),make(original,retire))->data;
+                }
+                """,
+                host="""
+                #include <stdbool.h>
+                #include <signal.h>
+                #include <stdint.h>
+                #include <stdlib.h>
+                extern int32_t reconstruct(bool);
+                static volatile sig_atomic_t trace;
+                int32_t operand(int32_t digit) { trace = trace * 10 + digit; return 21; }
+                static void rejected(int reason) {
+                    _Exit(reason == SIGILL && trace == 12 ? 42 : 1);
+                }
+                int main(void) {
+                    if (reconstruct(true) != 42 || trace != 12) return 2;
+                    trace = 0;
+                    if (signal(SIGILL, rejected) == SIG_ERR) return 3;
+                    reconstruct(false);
+                    return 4;
+                }
+                """,
+            ),
+            42,
+        )
+
+    def test_factory_reconstruction_releases_deferred_result_on_whole_exit(self):
+        source = """
+            i32 trace;
+            i8 backing;
+            declare struct Outer;
+            declare i32 request(Outer* owner);
+            struct Parent {~Parent(){trace=trace*10+1;}};
+            struct Stage {~Stage(){trace=trace*10+2;}};
+            struct Work {
+                i8 item;
+                Work(Outer* owner,i32 code(DEFAULT_ARGUMENT)){
+                    init item(42);
+                    CONSTRUCTOR_BODY
+                }
+            };
+            Work prepare(Outer* owner){destroy(backing);return Work(owner);}
+            struct Outer:Parent {
+                Complete base<Parent>;
+                ~Outer(){
+                    Stage caller;
+                    auto area(storage_of(backing));
+                    construct_at<Work>(area,prepare(this));
+                    trace=trace*10+7;
+                }
+                cleanup{
+                    auto resumed(construct_at<Work>(storage_of(backing),Work(this,0)));
+                    if(resumed->item==42){trace=trace*10+3;}
+                }
+            };
+            i32 request(Outer* owner){destroy_base<Parent>(owner);return 1;}
+            i32 main(){{Outer value;}return trace==123 ? 42 : 1;}
+        """
+        for default, body in (
+            ("request(owner)", ""),
+            ("1", "if(code==1){request(owner);}"),
+        ):
+            with self.subTest(default=default):
+                self.assertEqual(
+                    self.program(
+                        source.replace("DEFAULT_ARGUMENT", default).replace(
+                            "CONSTRUCTOR_BODY", body
+                        )
+                    ),
+                    42,
+                )
+
+    def test_independent_operands_precede_positional_prvalue_construction(self):
+        common = """
+            i32 trace;
+            struct Child {
+                i32 data;
+                Child(i32 input){init data(input);trace=trace*10+2;}
+                Child(const<Child>& old)=default;
+                Child(Child&& old)=delete;
+            };
+            i32 retire(i64[2]& old){destroy(old);trace=trace*10+1;return 21;}
+        """
+        for source in (
+            """
+            struct Replacement {i32 first;Child child;};
+            i32 main(){
+                i64[2] old;
+                auto extent(storage_of(old));
+                auto rebuilt(construct_at<Replacement>(extent,retire(old),Child(21)));
+                return trace==12 ? rebuilt->first+rebuilt->child.data : 1;
+            }
+            """,
+            """
+            Child existing(21);
+            Child& retire_and_borrow(i64[2]& old){retire(old);return existing;}
+            i32 main(){
+                trace=0;
+                i64[2] old;
+                auto extent(storage_of(old));
+                auto rebuilt(construct_at<Child[2]>(extent,retire_and_borrow(old),Child(21)));
+                return trace==12 ? (*rebuilt)[0].data+(*rebuilt)[1].data : 1;
+            }
+            """,
+            """
+            union Replacement {
+                default case Empty;
+                case Pair(i32 first,Child second);
+            };
+            i32 main(){
+                i64[2] old;
+                auto extent(storage_of(old));
+                auto rebuilt(construct_at<Replacement>(extent,Replacement::Pair(retire(old),Child(21))));
+                match(*rebuilt){
+                case Replacement::Pair(value first,ref second){
+                    return trace==12 ? first+second.data : 1;
+                }
+                case Replacement::Empty{return 1;}
+                }
+            }
+            """,
+        ):
+            with self.subTest(source=source):
+                self.assertEqual(self.program(common + source), 42)
+
     def test_constant_aggregate_reconstruction_admits_after_arguments(self):
         self.assertEqual(
             self.program("""
