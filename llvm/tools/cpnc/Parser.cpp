@@ -1553,13 +1553,13 @@ class Parser {
       expect("<");
       do {
         Node Edge(Node::TypeArg, peek());
-        Edge.Type = type();
+        Edge.Type = type(Edge);
         Selector.TemplateArgs.push_back(Edge);
       } while (eat(","));
       closeAngle();
       Selector.Type = Selector.TemplateArgs.back().Type;
     } else
-      Selector.Type = type();
+      Selector.Type = type(Selector);
     return Selector;
   }
   bool opensBitArgumentTemplate(size_t Angle) const {
@@ -1609,7 +1609,10 @@ class Parser {
   Token qualified(bool AllowBuiltin = false, Node *Application = nullptr,
                   std::string *NominalSchema = nullptr,
                   ReceiverType *Receiver = nullptr,
-                  std::string *QualifiedMember = nullptr) {
+                  std::string *QualifiedMember = nullptr,
+                  std::vector<Node> *ArrayExtents = nullptr) {
+    if (!ArrayExtents && Application)
+      ArrayExtents = &Application->ArrayExtents;
     bool Root = eat("::");
     auto T = Application && is("operator")          ? operatorName()
              : AllowBuiltin && builtin(peek().Text) ? take()
@@ -1679,9 +1682,13 @@ class Parser {
           Args = deferredTemplateArgs();
         else
           Args = templateArgs(ArgumentSchema, &Canonical, BitArgumentsAreTypes);
-        if (!Application || is("::") || Types.count(ArgumentSchema))
+        if (!Application || is("::") || Types.count(ArgumentSchema)) {
           T.Text += Canonical.empty() ? spelling(Start) : Canonical;
-        else {
+          if (ArrayExtents)
+            for (auto &Arg : Args)
+              for (auto &Extent : Arg.ArrayExtents)
+                ArrayExtents->push_back(std::move(Extent));
+        } else {
           Application->ExplicitApplication = true;
           Application->TemplateArgs = std::move(Args);
         }
@@ -1759,7 +1766,7 @@ class Parser {
     if (!A.At.Text.empty() && llvm::isDigit(A.At.Text.front()))
       fail(A.At, "expected a type argument");
     ReceiverType Shape;
-    A.Type = type(nullptr, &Shape);
+    A.Type = type(A, nullptr, &Shape);
     TypeArguments[sourceSite(A.At)] = std::move(Shape);
     return A;
   }
@@ -1905,12 +1912,13 @@ class Parser {
     return Arguments;
   }
   std::string type(std::string *NominalSchema = nullptr,
-                   ReceiverType *Receiver = nullptr) {
+                   ReceiverType *Receiver = nullptr,
+                   std::vector<Node> *ArrayExtents = nullptr) {
     Nest Guard(Depth, peek());
     auto T = peek();
     std::string S;
     if (eat("(")) {
-      S = type(NominalSchema, Receiver);
+      S = type(NominalSchema, Receiver, ArrayExtents);
       expect(")");
     } else if (eat("decltype")) {
       expect("(");
@@ -1925,14 +1933,14 @@ class Parser {
       TypeQueries[S] = std::move(Query);
     } else if (eat("const")) {
       expect("<");
-      S = "const<" + type(nullptr, Receiver) + ">";
+      S = "const<" + type(nullptr, Receiver, ArrayExtents) + ">";
       if (Receiver)
         Receiver->Readonly = true;
       closeAngle();
     } else if (eat("function")) {
       expect("<");
       ReceiverType Result;
-      auto Return = type(nullptr, Receiver ? &Result : nullptr);
+      auto Return = type(nullptr, Receiver ? &Result : nullptr, ArrayExtents);
       if (Receiver && Result.known())
         Receiver->CallableResult =
             std::make_shared<const ReceiverType>(std::move(Result));
@@ -1940,7 +1948,7 @@ class Parser {
       auto Parameters = params();
       std::map<std::string, unsigned> Named;
       for (size_t I = 0; I < Parameters.size(); ++I) {
-        const auto &P = Parameters[I];
+        auto &P = Parameters[I];
         if (!P.Children.empty())
           fail(P.At, "callable type cannot contain a parameter default");
         if (StringRef(P.Type).starts_with("forward "))
@@ -1952,6 +1960,9 @@ class Parser {
         S += P.Type;
         if (P.Pack)
           S += "...";
+        if (ArrayExtents)
+          for (auto &Extent : P.ArrayExtents)
+            ArrayExtents->push_back(std::move(Extent));
       }
       S += ")";
       bool Noexcept = eat("noexcept");
@@ -1995,7 +2006,9 @@ class Parser {
     } else {
       if (!is("::") && !identifier(peek().Text))
         fail(T, "unsupported or unknown type '" + T.Text + "'");
-      S = qualified(true, nullptr, NominalSchema, Receiver).Text;
+      S = qualified(true, nullptr, NominalSchema, Receiver, nullptr,
+                    ArrayExtents)
+              .Text;
       if (!IndexingMembers && !known(S) &&
           !(StringRef(S).contains("::") &&
             known(StringRef(S).split("::").first)))
@@ -2025,9 +2038,13 @@ class Parser {
           NominalSchema->clear();
       } else if (eat("[")) {
         size_t Begin = Pos;
-        expr();
-        S += "[" + spelling(Begin) + "]";
+        Node Extent(Node::ArrayExtent, peek());
+        Extent.Children.push_back(expr());
+        Extent.Text = spelling(Begin);
+        S += "[" + Extent.Text + "]";
         expect("]");
+        if (ArrayExtents)
+          ArrayExtents->push_back(std::move(Extent));
         if (Receiver && Receiver->known()) {
           Receiver->Layers += '[';
           Receiver->Scalar.clear();
@@ -2038,6 +2055,10 @@ class Parser {
         break;
     }
     return S;
+  }
+  std::string type(Node &Owner, std::string *NominalSchema = nullptr,
+                   ReceiverType *Receiver = nullptr) {
+    return type(NominalSchema, Receiver, &Owner.ArrayExtents);
   }
   std::vector<Node> args() {
     expect("(");
@@ -2095,7 +2116,7 @@ class Parser {
       }
       if (eat("async"))
         fail(T, "async closures require asynchronous execution");
-      N.Type = type();
+      N.Type = type(N);
       llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
       N.Params = params(true);
       N.Const = !eat("mutable");
@@ -2128,7 +2149,7 @@ class Parser {
       expect("(");
       if (typeBefore(false)) {
         Node Ty(Node::TypeArg, peek());
-        Ty.Type = type();
+        Ty.Type = type(Ty);
         N.Children.push_back(Ty);
       } else {
         if (N.Text == "alignof")
@@ -2403,13 +2424,16 @@ class Parser {
     bool CX = !RO && eat("constexpr");
     if (RO || CX || is("auto") || typeBefore(true)) {
       ReceiverType Receiver;
-      auto Ty = eat("auto") ? std::string("auto") : type(nullptr, &Receiver);
+      std::vector<Node> ArrayExtents;
+      auto Ty = eat("auto") ? std::string("auto")
+                            : type(nullptr, &Receiver, &ArrayExtents);
       auto Id = name();
       Receiver.Readonly |= RO || CX;
       ValueReceivers[Id.Text] = std::move(Receiver);
       if (Types.count(Id.Text) || integerLibraryName(Id.Text, true))
         HiddenTypes.insert(Id.Text);
       auto O = object(Id, Ty, RO, CX);
+      O.ArrayExtents = std::move(ArrayExtents);
       if (Ty == "auto" && O.Children.size() == 1) {
         auto Deduced = receiverType(O.Children.front());
         Deduced.Readonly = RO || CX;
@@ -2613,7 +2637,7 @@ class Parser {
         take();
       bool Forward = eat("forward");
       ReceiverType Receiver;
-      P.Type = type(nullptr, BindReceivers ? &Receiver : nullptr);
+      P.Type = type(P, nullptr, BindReceivers ? &Receiver : nullptr);
       if (Forward)
         P.Type = "forward " + P.Type;
       if (P.Const && P.Type.back() == '&') {
@@ -2689,7 +2713,7 @@ class Parser {
       if (!eat("type")) {
         expect("const");
         P.K = Node::ValueParam;
-        P.Type = type(nullptr, &ValueType);
+        P.Type = type(P, nullptr, &ValueType);
       }
       P.Pack = eat("...");
       P.At = name();
@@ -2704,7 +2728,7 @@ class Parser {
       if (eat("=")) {
         if (P.K == Node::TypeParam) {
           Node A(Node::TypeArg, peek());
-          A.Type = type();
+          A.Type = type(A);
           P.Children = {A};
         } else
           P.Children = {expr(1, true)};
@@ -3007,9 +3031,10 @@ class Parser {
             bool RO = is("const") && peek(1).Text != "<";
             if (RO)
               take();
-            auto Ty = type();
-            Node Field(Node::Parameter, name());
-            Field.Type = Ty;
+            Node Field(Node::Parameter, peek());
+            Field.Type = type(Field);
+            Field.At = name();
+            Field.Text = Field.At.Text;
             Field.Const = RO;
             if (!Fields.insert(Field.Text).second)
               fail(Field.At, "duplicate union payload field");
@@ -3024,7 +3049,7 @@ class Parser {
       if (!Union && eat("destruction_owner")) {
         Node D(Node::DestructionOwner, peek());
         expect("<");
-        D.Type = type();
+        D.Type = type(D);
         closeAngle();
         expect("=");
         D.TemplateArgs.push_back(baseSelector());
@@ -3055,7 +3080,7 @@ class Parser {
         if (!is(";")) {
           I.Text = name().Text;
           if ((I.Text == "base" || I.Text == "virtual_base") && eat("<")) {
-            I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type();
+            I.Text = (I.Text == "base" ? "$base:" : "$virtual:") + type(I);
             closeAngle();
           }
         } else
@@ -3237,7 +3262,7 @@ class Parser {
           expect(";");
         } else if (eat("type")) {
           Rule.Text = "type";
-          Rule.Type = type();
+          Rule.Type = type(Rule);
           expect(";");
         } else {
           expect("expression");
@@ -3261,7 +3286,7 @@ class Parser {
             editableTokens()[Arrow].Text = "$result";
             auto E = expr();
             expect("$result");
-            E.Type = type();
+            E.Type = type(E);
             E.Noexcept = eat("noexcept");
             expect(";");
             Rule.Children.push_back(E);
@@ -3292,7 +3317,7 @@ class Parser {
       expect("=");
       std::string Schema;
       ReceiverType Receiver;
-      N.Type = type(&Schema, &Receiver);
+      N.Type = type(N, &Schema, &Receiver);
       expect(";");
       Types.insert(N.Text);
       HiddenTypes.erase(N.Text);
@@ -3333,7 +3358,7 @@ class Parser {
       D.Type = Kind.Text;
       if (D.K == Node::Enumeration) {
         expect(":");
-        D.Type = type();
+        D.Type = type(D);
       }
       D.Prototype = true;
       expect(";");
@@ -3390,7 +3415,7 @@ class Parser {
           Node B(Node::TypeArg, peek());
           B.Definition = eat("virtual");
           ReceiverType Base;
-          B.Type = type(nullptr, &Base);
+          B.Type = type(B, nullptr, &Base);
           BaseReceivers[Receiver.Owner].push_back(std::move(Base));
           R.TemplateArgs.push_back(B);
         } while (eat(","));
@@ -3410,7 +3435,7 @@ class Parser {
     if (eat("enum")) {
       Node E(Node::Enumeration, name());
       expect(":");
-      E.Type = type();
+      E.Type = type(E);
       Types.insert(E.Text);
       AliasSchemas.erase(E.Text);
       expect("{");
@@ -3458,7 +3483,9 @@ class Parser {
     bool Static = StorageStatic || (!ThreadLocal && !RO && eat("static"));
     bool Virtual = !Static && !ThreadLocal && !RO && eat("virtual");
     ReceiverType Receiver;
-    auto Ty = eat("auto") ? std::string("auto") : type(nullptr, &Receiver);
+    std::vector<Node> ArrayExtents;
+    auto Ty = eat("auto") ? std::string("auto")
+                          : type(nullptr, &Receiver, &ArrayExtents);
     std::string Q;
     bool Dtor = false;
     std::vector<Node> Owners;
@@ -3479,6 +3506,7 @@ class Parser {
       Receiver.Readonly |= RO || CE;
       ValueReceivers[Id.Text] = Receiver;
       auto O = object(Id, Ty, RO, CE);
+      O.ArrayExtents = std::move(ArrayExtents);
       if (Ty == "auto" && O.Children.size() == 1) {
         auto Deduced = receiverType(O.Children.front());
         Deduced.Readonly = RO || CE;
@@ -3503,6 +3531,7 @@ class Parser {
     if (Virtual)
       F.Settings["virtual"] = "1";
     F.Type = Ty;
+    F.ArrayExtents = std::move(ArrayExtents);
     F.Generics = G;
     F.Pattern = std::move(Owners);
     if (!Q.empty())

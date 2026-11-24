@@ -207,16 +207,24 @@ void Frame::bindParams() {
       V.BoundsCell = incomingPointerCell(J + 1);
       if (!ends(T, "&")) {
         readBounds(V, V.BoundsCell);
-        if (ends(T, "*") && V.Slot)
+        if (ends(T, "*") && V.Slot) {
+          auto *Argument = llvm::MDNode::get(
+              U.C, llvm::ConstantAsMetadata::get(B.getInt32(A->getArgNo())));
           llvm::cast<llvm::Instruction>(V.Slot)->setMetadata(
-              IncomingPointerStorage,
-              llvm::MDNode::get(U.C, llvm::ConstantAsMetadata::get(
-                                         B.getInt32(A->getArgNo()))));
+              IncomingPointerStorage, Argument);
+          llvm::cast<llvm::Instruction>(V.ArraySlot)
+              ->setMetadata(IncomingArrayStorage, Argument);
+        }
         V.BoundsCell = storedPointerCell(V.Address);
         saveBounds(V.BoundsCell, V);
       }
     } else if (ends(T, "&"))
       readReferent(V, incomingPointerCell(J + 1));
+    if (ends(T, "&") && V.Slot)
+      llvm::cast<llvm::Instruction>(V.Slot)->setMetadata(
+          IncomingReferenceStorage,
+          llvm::MDNode::get(
+              U.C, llvm::ConstantAsMetadata::get(B.getInt32(A->getArgNo()))));
     if (ends(T, "&") || ends(T, "*"))
       V.Origins.insert(J);
     Scopes[0].Names[parameterBinding(F->Decl, J)] = V;
@@ -591,7 +599,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
   }
   case Node::Unary: {
     if (Op == "sizeof" || Op == "alignof") {
-      auto T = A[0].K == Node::TypeArg ? resolve(A[0].Type, N.At)
+      auto T = A[0].K == Node::TypeArg ? resolve(A[0].Type, A[0].At)
                : A[0].K == Node::String
                    ? "u8[" + std::to_string(unquote(A[0].At).size() + 1) + "]"
                    : "";

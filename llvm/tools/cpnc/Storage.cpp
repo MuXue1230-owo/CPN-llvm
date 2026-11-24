@@ -189,7 +189,8 @@ void Frame::trackLocal(Value &Cell, llvm::StringRef Prefix) {
     Cell.ExtentType = Owner.ExtentType;
   }
 }
-Value Frame::subobject(Value Parent, Value V) {
+Value Frame::subobject(Value Parent, Value V,
+                       llvm::ArrayRef<llvm::OperandBundleDef> Bundles) {
   V.Origins = Parent.Origins;
   if (!TracksStorage || !Parent.Address || !V.Address)
     return V;
@@ -199,7 +200,8 @@ Value Frame::subobject(Value Parent, Value V) {
                         {slotFor(Parent), V.Address, U.typeID(V.Type),
                          destructor(*this, V.Type),
                          B.getInt64(DL.getTypeAllocSize(Ty).getFixedValue()),
-                         B.getInt64(DL.getABITypeAlign(Ty).value())});
+                         B.getInt64(DL.getABITypeAlign(Ty).value())},
+                        Bundles);
   V.Generation =
       B.CreateCall(U.M.getFunction("cpn.generation"), {V.Slot, B.getTrue()});
   V.Storage = Parent.Storage;
@@ -262,7 +264,9 @@ void Frame::ensureLive(const Value &V, const Token &At) {
   auto *Selection = llvm::dyn_cast<llvm::CallBase>(Slot);
   const bool Child = Selection && Selection->getCalledFunction() ==
                                       U.M.getFunction("cpn.slot.child");
-  if ((Generation && (llvm::isa<llvm::LoadInst>(Slot) || Child)) ||
+  if ((Generation &&
+       (llvm::isa<llvm::AllocaInst, llvm::LoadInst, llvm::PHINode>(Slot) ||
+        Child)) ||
       (!Generation && llvm::isa<llvm::GlobalVariable>(Slot))) {
     const Token &Source = At.Text.empty() && F ? F->Decl.At : At;
     markStorageSite(*Validation,
@@ -319,7 +323,8 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
         (Storage.Replacement &&
          !Storage.Replacement->ConstantIdentity.Storage->Ended))
       fail(C.At, "storage contains a live generation");
-    auto Type = resolve(C.TemplateArgs.front().Type, C.At);
+    const auto &RequestedType = C.TemplateArgs.front();
+    auto Type = resolve(RequestedType.Type, RequestedType.At);
     auto *Requested = U.ir(Type, C.At);
     auto *Existing = U.ir(Extent.Type, C.At);
     if (!Requested->isSized())
@@ -450,7 +455,8 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     auto *Current =
         B.CreateCall(U.M.getFunction("cpn.generation"), {S.Slot, B.getFalse()});
     guard(B.CreateTrunc(Current, B.getInt1Ty()));
-    const auto T = resolve(C.TemplateArgs.front().Type, C.At);
+    const auto &RequestedType = C.TemplateArgs.front();
+    const auto T = resolve(RequestedType.Type, RequestedType.At);
     const auto &DL = U.M.getDataLayout();
     auto *Ty = U.ir(T, C.At);
     if (!Ty->isSized())
@@ -530,7 +536,8 @@ void Frame::forgetStorage() {
 // Array positions share the parent extent. Changing position selects the
 // destination element's generation, while the one-past address has no slot.
 void Frame::offsetRegistration(Value &P, llvm::Value *Target,
-                               const std::string &Element, const Token &At) {
+                               const std::string &Element, const Token &At,
+                               std::optional<int64_t> Displacement) {
   if (!TracksStorage || !P.ArraySlot || !P.Upper)
     return;
   Value Owner{Element, nullptr, P.Lower};
@@ -549,7 +556,14 @@ void Frame::offsetRegistration(Value &P, llvm::Value *Target,
       B.CreateAnd(B.CreateIsNotNull(P.ArraySlot), B.CreateNot(Past));
   B.CreateCondBr(B.CreateAnd(HasElement, Changed), ElementPath, Done);
   B.SetInsertPoint(ElementPath);
-  auto V = subobject(Owner, {Element, nullptr, Target});
+  llvm::SmallVector<llvm::OperandBundleDef, 1> Bundles;
+  if (Displacement && *Displacement && P.Slot && P.Generation &&
+      P.ArrayGeneration) {
+    llvm::Value *Operands[] = {P.Slot, P.Generation, P.ArrayGeneration,
+                               B.getInt64(*Displacement)};
+    Bundles.emplace_back(StorageProjectionBundle, Operands);
+  }
+  auto V = subobject(Owner, {Element, nullptr, Target}, Bundles);
   auto *Exit = B.GetInsertBlock();
   branch(Done);
   B.SetInsertPoint(Done);

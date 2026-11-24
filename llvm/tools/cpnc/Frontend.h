@@ -127,6 +127,7 @@ struct Node {
     ValueParam,
     TypeArg,
     TypeQuery,
+    ArrayExtent,
     Alias,
     Record,
     Field,
@@ -151,7 +152,7 @@ struct Node {
   Token At;
   std::string Text, Type;
   std::vector<Node> Children, Params, Generics, TemplateArgs, Policies, Pattern,
-      Contracts;
+      Contracts, ArrayExtents;
   std::map<std::string, std::string> Settings;
   bool HasInitializer = false, ExplicitApplication = false, Grouped = false;
   bool Const = false, Required = false, Foreign = false, Prototype = false,

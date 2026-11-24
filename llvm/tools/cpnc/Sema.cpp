@@ -83,7 +83,7 @@ std::string appliedName(std::string Name, const Family &Family,
 } // namespace
 std::string cpn::element(const std::string &T) {
   if (StringRef(T).ends_with("]"))
-    return T.substr(0, T.rfind('['));
+    return T.substr(0, arrayExtentStart(T));
   return T.empty() ? T : T.substr(0, T.size() - 1);
 }
 std::string cpn::unconst(const std::string &T) {
@@ -93,7 +93,7 @@ std::string cpn::unconst(const std::string &T) {
 }
 std::string cpn::qualifyConst(const std::string &T) {
   if (StringRef(T).ends_with("]")) {
-    auto Extent = T.rfind('[');
+    auto Extent = arrayExtentStart(T);
     return qualifyConst(T.substr(0, Extent)) + T.substr(Extent);
   }
   if (StringRef(T).ends_with("&")) {
@@ -124,7 +124,7 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
       return llvm::IntegerType::get(C, Bits);
   }
   if (StringRef(T).ends_with("]")) {
-    auto I = T.rfind('[');
+    auto I = arrayExtentStart(T);
     uint64_t N = 0;
     if (I == std::string::npos ||
         StringRef(T).slice(I + 1, T.size() - 1).getAsInteger(10, N))
@@ -519,9 +519,16 @@ std::string Frame::resolve(std::string S, const Token &At) {
   if (auto I = Env.Types.find(S); I != Env.Types.end())
     return I->second;
   if (StringRef(S).ends_with("]")) {
-    auto I = S.rfind('[');
-    auto N = constantEval(
-        parseExpression(StringRef(S).slice(I + 1, S.size() - 1), Opt));
+    auto I = arrayExtentStart(S);
+    if (I == StringRef::npos)
+      fail(At, "invalid array extent");
+    auto Spelling = StringRef(S).slice(I + 1, S.size() - 1);
+    auto Bound = U.ArrayExtents.find({{At.Line, At.Column}, Spelling.str()});
+    auto N = constantEval(Bound == U.ArrayExtents.end()
+                              ? parseExpression(Spelling, Opt)
+                              : *Bound->second);
+    if (!integer(N.Type))
+      fail(At, "array extent requires a compile-time integer");
     auto *C = llvm::dyn_cast_or_null<llvm::ConstantInt>(N.IR);
     if (!C || (signedType(N.Type) && C->isNegative()) ||
         C->getValue().getActiveBits() > 31)
@@ -719,13 +726,13 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
       if (A) {
         if (A->K != Node::TypeArg)
           Reject("expected a type argument");
-        S.Types[P.Text] = resolve(A->Type, At);
+        S.Types[P.Text] = resolve(A->Type, A->At);
       } else {
         if (auto Deduced = deduceGenericArgument(Fam, P, Actual, At))
           S.Types[P.Text] = Deduced->Type;
         if (!S.Types.count(P.Text) && !P.Children.empty()) {
-          auto Ty = P.Children[0].Type;
-          S.Types[P.Text] = Defaults.resolve(Ty, At);
+          const auto &Default = P.Children.front();
+          S.Types[P.Text] = Defaults.resolve(Default.Type, Default.At);
         }
         if (!S.Types.count(P.Text))
           Reject("cannot deduce generic type");
@@ -733,7 +740,7 @@ Substitution Frame::bind(const Family &Fam, const std::vector<Node> &Explicit,
     } else {
       if (A && A->K == Node::TypeArg)
         Reject("expected a constant argument");
-      auto Ty = Defaults.resolve(P.Type, At);
+      auto Ty = Defaults.resolve(P.Type, P.At);
       if (!integer(Ty) && Ty != "bool" && Ty != "char" && !U.Enums.count(Ty))
         fail(P.At, "invalid generic constant parameter type");
       if (!A) {
@@ -1802,17 +1809,35 @@ void Context::emitBody(Function &D, llvm::Function *Entry, bool AsBase) {
 }
 void cpn::compile(llvm::Module &M, const std::vector<Node> &AST, Options O) {
   Context U(M, std::move(O));
-  for (const auto &N : AST)
+  auto IndexExtents = [&](auto &Self, const Node &N) -> void {
+    for (const auto &Extent : N.ArrayExtents)
+      U.ArrayExtents.try_emplace({{N.At.Line, N.At.Column}, Extent.Text},
+                                 &Extent.Children.front());
+    for (const auto *Nodes :
+         {&N.Children, &N.Params, &N.Generics, &N.TemplateArgs, &N.Pattern,
+          &N.Contracts, &N.ArrayExtents})
+      for (const auto &Child : *Nodes)
+        Self(Self, Child);
+  };
+  for (const auto &N : AST) {
     if (N.K == Node::TypeQuery)
       U.TypeQueries.emplace(N.Text, N);
-  U.Whole = llvm::any_of(AST, Frame::usesWhole);
-  const bool Memory = llvm::any_of(AST, usesMemoryLibrary);
-  if (U.Whole || Memory || llvm::any_of(AST, Frame::usesStorage))
+    IndexExtents(IndexExtents, N);
+  }
+  auto Uses = [&](auto Scan) {
+    return llvm::any_of(AST, Scan) ||
+           llvm::any_of(U.ArrayExtents, [&](const auto &Extent) {
+             return Scan(*Extent.second);
+           });
+  };
+  U.Whole = Uses(Frame::usesWhole);
+  const bool Memory = Uses(usesMemoryLibrary);
+  if (U.Whole || Memory || Uses(Frame::usesStorage))
     U.enableStorage();
   U.bindScalarLibrary();
   U.bindMemoryLibrary(Memory);
-  const bool FPContext = llvm::any_of(AST, usesFloatingContext);
-  if (FPContext || llvm::any_of(AST, usesNumericLibrary))
+  const bool FPContext = Uses(usesFloatingContext);
+  if (FPContext || Uses(usesNumericLibrary))
     U.bindNumericLibrary(FPContext);
   U.unit(AST);
   U.emitForeignContractAdapters();

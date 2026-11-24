@@ -445,7 +445,7 @@ void visitTypeArguments(Frame &F, const Family &Fam, StringRef Formal,
     return;
   }
   if (Formal.ends_with("]") && Actual.ends_with("]")) {
-    auto P = Formal.rfind('['), A = Actual.rfind('[');
+    auto P = arrayExtentStart(Formal), A = arrayExtentStart(Actual);
     uint64_t Extent;
     if (P != StringRef::npos && A != StringRef::npos &&
         !Actual.slice(A + 1, Actual.size() - 1).getAsInteger(10, Extent)) {
@@ -511,9 +511,9 @@ void inferNestedPack(Frame &F, const Family &Fam, StringRef Formal,
     return;
   }
   if (Formal.ends_with("]") && Actual.ends_with("]")) {
-    inferNestedPack(F, Fam, Formal.take_front(Formal.rfind('[')),
-                    Actual.take_front(Actual.rfind('[')), Pack, DeduceCount,
-                    At);
+    inferNestedPack(F, Fam, Formal.take_front(arrayExtentStart(Formal)),
+                    Actual.take_front(arrayExtentStart(Actual)), Pack,
+                    DeduceCount, At);
     return;
   }
   auto InferList = [&](StringRef List, llvm::ArrayRef<Value> Arguments) {
@@ -627,7 +627,7 @@ bool acceptsPattern(const Node &General, const Node &Specific) {
       return B.consume_front("const<") && B.consume_back(">") &&
              Self(Self, A, B);
     if (A.ends_with("]") && B.ends_with("]")) {
-      auto I = A.rfind('['), J = B.rfind('[');
+      auto I = arrayExtentStart(A), J = arrayExtentStart(B);
       return I != llvm::StringRef::npos && J != llvm::StringRef::npos &&
              Self(Self, A.take_front(I), B.take_front(J)) &&
              Self(Self, A.slice(I + 1, A.size() - 1),
@@ -1226,6 +1226,28 @@ void cpn::validateTypePackExpansions(
   validateTypePackExpansions(U, Type.drop_front(Close + 1), At, IsPack);
 }
 
+size_t cpn::arrayExtentStart(StringRef Type) {
+  if (!Type.ends_with("]"))
+    return StringRef::npos;
+  unsigned Depth = 0;
+  size_t Start = StringRef::npos;
+  for (size_t I = 0; I < Type.size(); ++I) {
+    char C = Type[I];
+    if (C == '\'' || C == '"')
+      I += quotedSpelling(Type.drop_front(I)).size() - 1;
+    else if (C == '[') {
+      if (!Depth++)
+        Start = I;
+    } else if (C == ']') {
+      if (!Depth)
+        return StringRef::npos;
+      if (!--Depth && I + 1 == Type.size())
+        return Start;
+    }
+  }
+  return StringRef::npos;
+}
+
 void cpn::visitTypeQueries(const Context &U, StringRef Text,
                            llvm::function_ref<void(const Node &)> Visit) {
   if (!Text.contains("$decltype."))
@@ -1532,6 +1554,8 @@ Family cpn::expand(Context &U, const Family &Source, size_t Count,
                                 RewriteQueries);
     N.Type = expandPackLists(U, N.Type, Known, Deferred, Current, N.At,
                              RewriteQueries);
+    // These expressions are checked in the original definition's scope.
+    N.ArrayExtents.clear();
     if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
       std::string Bound;
       auto Add = [&](StringRef Effect) {
@@ -1614,9 +1638,10 @@ bool Frame::predicate(const Node &N) {
   if (builtinPredicate(N.Text)) {
     if (N.TemplateArgs.size() != (N.Text == "SameType" ? 2u : 1u))
       fail(N.At, "invalid number of predicate type arguments");
-    auto T = resolve(N.TemplateArgs[0].Type, N.At);
+    const auto &Argument = N.TemplateArgs[0];
+    auto T = resolve(Argument.Type, Argument.At);
     if (N.Text == "SameType")
-      return T == resolve(N.TemplateArgs[1].Type, N.At);
+      return T == resolve(N.TemplateArgs[1].Type, N.TemplateArgs[1].At);
     if (T == "void" || T == "never" || llvm::StringRef(T).ends_with("&") ||
         U.Signatures.count(T))
       return false;

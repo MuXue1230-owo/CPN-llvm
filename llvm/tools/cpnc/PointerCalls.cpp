@@ -64,7 +64,7 @@ llvm::SmallVector<llvm::OperandBundleDef, 1>
 Frame::storageArgumentBundles(llvm::ArrayRef<std::string> Params,
                               llvm::ArrayRef<Value> Arguments,
                               unsigned ABIHeaders) {
-  llvm::SmallVector<llvm::Value *, 6> StorageArguments;
+  llvm::SmallVector<llvm::Value *, StorageArgumentFields> StorageArguments;
   if (TracksStorage)
     for (auto [I, Type] : llvm::enumerate(Params)) {
       const bool Reference = StringRef(Type).ends_with("&");
@@ -78,6 +78,12 @@ Frame::storageArgumentBundles(llvm::ArrayRef<std::string> Params,
       StorageArguments.push_back(Designation.Slot);
       StorageArguments.push_back(Designation.Generation ? Designation.Generation
                                                         : B.getInt64(0));
+      StorageArguments.push_back(
+          Designation.ArraySlot ? Designation.ArraySlot
+                                : llvm::ConstantPointerNull::get(B.getPtrTy()));
+      StorageArguments.push_back(Designation.ArrayGeneration
+                                     ? Designation.ArrayGeneration
+                                     : B.getInt64(0));
     }
   llvm::SmallVector<llvm::OperandBundleDef, 1> Bundles;
   if (!StorageArguments.empty())

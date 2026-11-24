@@ -68,6 +68,12 @@ struct Check {
     });
   }
 
+  void typeSyntax(const Node &N, bool Bind) {
+    typeSyntax(N.Type, N.At, Bind);
+    for (const auto &Extent : N.ArrayExtents)
+      visit(Extent.Children.front(), Bind);
+  }
+
   bool known(const std::string &S) const {
     static const std::set<std::string> Intrinsics = {"std::move",
                                                      "std::forward",
@@ -251,7 +257,7 @@ struct Check {
   }
 
   void generic(const Node &G) {
-    typeSyntax(G.Type, G.At, true);
+    typeSyntax(G, true);
     for (const auto &Default : G.Children)
       visit(Default, true);
     Names[G.Text] = {G.K == Node::TypeParam ? Binding::TypeParameter
@@ -261,7 +267,7 @@ struct Check {
 
   void parameters(const std::vector<Node> &Params, bool Bind) {
     for (const auto &P : Params) {
-      typeSyntax(P.Type, P.At, Bind);
+      typeSyntax(P, Bind);
       if (P.Pack && !referencesPack(P.Type))
         fail(P.At, "parameter expansion requires a generic pack in its type");
       for (const auto &Default : P.Children)
@@ -274,7 +280,7 @@ struct Check {
   void members(const Node &N) {
     llvm::SaveAndRestore RecordScope(SyntaxOwner, &N);
     for (const auto &Base : N.TemplateArgs)
-      typeSyntax(Base.Type, Base.At, true);
+      typeSyntax(Base, true);
     for (const auto &Member : N.Children) {
       llvm::SaveAndRestore MemberScope(Names);
       if (nominalRecord(Member)) {
@@ -283,8 +289,8 @@ struct Check {
       }
       for (const auto &G : Member.Generics)
         generic(G);
-      typeSyntax(Member.Type, Member.At, true);
-      if (callable(Member))
+      typeSyntax(Member, true);
+      if (callable(Member) || Member.K == Node::Variant)
         parameters(Member.Params, true);
       for (const auto &Condition : Member.TemplateArgs)
         visit(Condition, true);
@@ -297,7 +303,7 @@ struct Check {
     Bind |= N.K == Node::If && N.Required;
     if (N.Pack && !referencesPack(N))
       fail(N.At, "pack expansion requires an unexpanded pack binding");
-    typeSyntax(N.Type, N.At, Bind);
+    typeSyntax(N, Bind);
     if (N.K == Node::Name)
       typeSyntax(N.Text, N.At, Bind);
     const auto &A = N.Children;
@@ -405,7 +411,7 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
     }
     Ch.generic(G);
   }
-  Ch.typeSyntax(N.Type, N.At, !N.Generics.empty());
+  Ch.typeSyntax(N, !N.Generics.empty());
   for (auto &Arg : N.Params) {
     if (llvm::StringRef(Arg.Type).starts_with("forward ") &&
         llvm::none_of(N.Generics, [&](auto &G) {

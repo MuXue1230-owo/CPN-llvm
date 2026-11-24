@@ -442,7 +442,13 @@ cpn::Value Frame::pointerBinary(const Node &N, cpn::Value P, cpn::Value Other) {
                       B.CreateOr(B.CreateICmpULT(Target, address(P.Lower)),
                                  B.CreateICmpUGT(Target, address(P.Upper)))));
   auto *Result = B.CreateIntToPtr(Raw, B.getPtrTy());
-  offsetRegistration(P, Result, T, N.At);
+  std::optional<int64_t> Displacement;
+  if (auto *Constant = dyn_cast<ConstantInt>(Offset)) {
+    auto Bytes = N.Text == "+" ? Constant->getValue() : -Constant->getValue();
+    if (Bytes.isSignedIntN(64))
+      Displacement = Bytes.getSExtValue();
+  }
+  offsetRegistration(P, Result, T, N.At, Displacement);
   P.IR = Result;
   P.Address = nullptr;
   P.BoundsCell = nullptr;

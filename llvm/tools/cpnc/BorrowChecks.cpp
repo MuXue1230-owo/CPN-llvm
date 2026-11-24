@@ -1162,7 +1162,8 @@ class EscapeCheck {
                               std::optional<llvm::DominatorTree> &Tree) const {
     for (unsigned Depth = 0; Depth != 16; ++Depth) {
       auto *Saved = llvm::dyn_cast<llvm::LoadInst>(Slot);
-      if (!Saved || Saved->getMetadata(IncomingPointerStorage))
+      if (!Saved || Saved->getMetadata(IncomingPointerStorage) ||
+          Saved->getMetadata(IncomingArrayStorage))
         break;
       if (!Tree)
         Tree.emplace(F);
@@ -1174,18 +1175,8 @@ class EscapeCheck {
     }
   }
 
-  bool isArgumentRegistration(llvm::Value *Slot, llvm::Value *Generation,
-                              llvm::Function &F, unsigned Argument,
-                              std::optional<llvm::DominatorTree> &Tree) const {
-    resolveSavedGeneration(Slot, Generation, F, Tree);
-    auto *Load = llvm::dyn_cast<llvm::LoadInst>(Slot);
-    const auto *Source =
-        Load ? Load->getMetadata(IncomingPointerStorage) : nullptr;
-    return Source && callSetting(*Source, 0) == Argument;
-  }
-
   bool mayReachBeforeRetirement(
-      llvm::CallBase *Capture, const llvm::Instruction &Use,
+      llvm::Instruction *Capture, const llvm::Instruction &Use,
       llvm::ArrayRef<const llvm::CallBase *> Retirements) const {
     auto *Start = Capture ? Capture->getParent() : &Root.getEntryBlock();
     llvm::SmallVector<llvm::BasicBlock *> Work{Start};
@@ -1216,6 +1207,7 @@ class EscapeCheck {
   // Keep all containing extents in a registration key, including layers that
   // start at the same physical address.
   using MemberPath = llvm::SmallVector<std::pair<int64_t, llvm::Value *>, 4>;
+  using MemberPathRef = llvm::ArrayRef<MemberPath::value_type>;
   using StorageRegistration =
       std::tuple<llvm::Value *, llvm::Value *, MemberPath>;
   using RetirementsByStorage =
@@ -1280,6 +1272,186 @@ class EscapeCheck {
     return Original && Original->isOne();
   }
 
+  struct PointerProjection {
+    llvm::Value *Base, *Generation, *Array, *ArrayGeneration, *Element;
+    int64_t Bytes;
+  };
+
+  static std::optional<PointerProjection>
+  pointerProjection(llvm::Value *Slot, llvm::Value *Generation) {
+    auto *Position = llvm::dyn_cast<llvm::PHINode>(Slot);
+    auto *Stamp = llvm::dyn_cast<llvm::PHINode>(Generation);
+    if (!Position || !Stamp || Position->getParent() != Stamp->getParent())
+      return std::nullopt;
+    for (unsigned I = 0; I != Position->getNumIncomingValues(); ++I) {
+      auto *Child =
+          llvm::dyn_cast<llvm::CallBase>(Position->getIncomingValue(I));
+      if (!Child)
+        continue;
+      auto Bundle = Child->getOperandBundle(StorageProjectionBundle);
+      if (!Bundle)
+        continue;
+      auto *Read = generationRead(
+          Stamp->getIncomingValueForBlock(Position->getIncomingBlock(I)),
+          Child);
+      if (!Read || !readsBirth(*Read))
+        return std::nullopt;
+      return PointerProjection{
+          Bundle->Inputs[0].get(),
+          Bundle->Inputs[1].get(),
+          Child->getArgOperand(0),
+          Bundle->Inputs[2].get(),
+          Child->getArgOperand(2),
+          llvm::cast<llvm::ConstantInt>(Bundle->Inputs[3].get())
+              ->getSExtValue()};
+    }
+    return std::nullopt;
+  }
+
+  static bool fromArgument(llvm::Value *V, llvm::StringRef Tag,
+                           unsigned Argument) {
+    auto *I = llvm::dyn_cast<llvm::Instruction>(V);
+    const auto *Source = I ? I->getMetadata(Tag) : nullptr;
+    return Source && callSetting(*Source, 0) == Argument;
+  }
+
+  // An offset is usable only with a caller-proved array registration. The
+  // value and the array ancestry must both come from the same formal.
+  std::optional<int64_t>
+  argumentDisplacement(llvm::Value *Slot, llvm::Value *Generation,
+                       llvm::Function &F, unsigned Argument,
+                       llvm::Value *Element,
+                       std::optional<llvm::DominatorTree> &Tree) const {
+    int64_t Bytes = 0;
+    for (unsigned Depth = 0; Depth != 16; ++Depth) {
+      resolveSavedGeneration(Slot, Generation, F, Tree);
+      if (fromArgument(Slot, IncomingPointerStorage, Argument))
+        return Bytes;
+      auto Projection = pointerProjection(Slot, Generation);
+      if (!Projection || Projection->Element != Element ||
+          llvm::AddOverflow(Bytes, Projection->Bytes, Bytes))
+        break;
+      auto &P = *Projection;
+      resolveSavedGeneration(P.Array, P.ArrayGeneration, F, Tree);
+      if (!fromArgument(P.Array, IncomingArrayStorage, Argument))
+        break;
+      Slot = P.Base;
+      Generation = P.Generation;
+    }
+    return std::nullopt;
+  }
+
+  std::optional<MemberPath>
+  referenceSelection(llvm::Value *Slot, llvm::Value *Generation,
+                     llvm::Function &F, unsigned Argument,
+                     std::optional<llvm::DominatorTree> &Tree) const {
+    resolveSavedGeneration(Slot, Generation, F, Tree);
+    MemberPath Path;
+    for (unsigned Depth = 0; Depth != 32; ++Depth) {
+      if (fromArgument(Slot, IncomingReferenceStorage, Argument)) {
+        std::reverse(Path.begin(), Path.end());
+        return Path;
+      }
+      auto *Child = llvm::dyn_cast<llvm::CallBase>(Slot);
+      if (!Child || !Child->getCalledFunction() ||
+          Child->getCalledFunction()->getName() != "cpn.slot.child")
+        break;
+      auto [Base, Offset] = slot(Child->getArgOperand(1));
+      if (Base != F.getArg(Argument))
+        break;
+      Path.emplace_back(Offset, Child->getArgOperand(2));
+      Slot = Child->getArgOperand(0);
+    }
+    return std::nullopt;
+  }
+
+  // A callee sees offsets relative to the object supplied as its argument.
+  static std::optional<MemberPath> relativePath(MemberPathRef Path,
+                                                MemberPathRef Prefix) {
+    if (Path.take_front(Prefix.size()) != Prefix)
+      return std::nullopt;
+    MemberPath Relative(Path.drop_front(Prefix.size()));
+    if (!Prefix.empty())
+      for (auto &Member : Relative)
+        if (llvm::SubOverflow(Member.first, Prefix.back().first, Member.first))
+          return std::nullopt;
+    return Relative;
+  }
+
+  static StorageRegistration containingRegistration(StorageRegistration Key) {
+    auto &Path = std::get<2>(Key);
+    Path.pop_back();
+    if (Path.empty())
+      std::get<1>(Key) = nullptr;
+    return Key;
+  }
+
+  static std::optional<uint64_t> registrationSize(llvm::Value *Slot) {
+    if (auto *Child = llvm::dyn_cast<llvm::CallBase>(Slot)) {
+      if (auto *Size =
+              llvm::dyn_cast<llvm::ConstantInt>(Child->getArgOperand(4)))
+        return Size->getZExtValue();
+      return std::nullopt;
+    }
+    std::optional<uint64_t> Size;
+    for (auto *Use : Slot->users()) {
+      auto *Begin = llvm::dyn_cast<llvm::CallBase>(Use);
+      auto *F = Begin ? Begin->getCalledFunction() : nullptr;
+      if (!F || F->getName() != "cpn.slot.begin" ||
+          Begin->getArgOperand(0) != Slot)
+        continue;
+      auto *Bytes = llvm::dyn_cast<llvm::ConstantInt>(Begin->getArgOperand(4));
+      if (!Bytes || (Size && *Size != Bytes->getZExtValue()))
+        return std::nullopt;
+      Size = Bytes->getZExtValue();
+    }
+    return Size;
+  }
+
+  std::optional<StorageRegistration>
+  resolvedRegistration(llvm::Value *Slot, llvm::Value *Generation,
+                       std::optional<llvm::DominatorTree> &Tree) const {
+    std::optional<StorageRegistration> Array;
+    std::optional<uint64_t> Size;
+    llvm::Value *Element = nullptr;
+    int64_t Bytes = 0;
+    for (unsigned Depth = 0; Depth != 16; ++Depth) {
+      resolveSavedGeneration(Slot, Generation, Root, Tree);
+      if (auto Key = storageRegistration(Slot)) {
+        if (!Array)
+          return Key;
+        auto &Path = std::get<2>(*Key);
+        const auto &ArrayPath = std::get<2>(*Array);
+        const int64_t Start = ArrayPath.empty() ? 0 : ArrayPath.back().first;
+        if (Path.empty() || Path.back().second != Element ||
+            containingRegistration(*Key) != *Array ||
+            llvm::AddOverflow(Path.back().first, Bytes, Path.back().first) ||
+            Path.back().first < Start ||
+            uint64_t(Path.back().first) - uint64_t(Start) >= *Size)
+          break;
+        return Key;
+      }
+      auto Projection = pointerProjection(Slot, Generation);
+      if (!Projection || (Element && Projection->Element != Element) ||
+          llvm::AddOverflow(Bytes, Projection->Bytes, Bytes))
+        break;
+      auto &P = *Projection;
+      resolveSavedGeneration(P.Array, P.ArrayGeneration, Root, Tree);
+      auto Known = storageRegistration(P.Array);
+      if (!Known || (Array && *Array != *Known))
+        break;
+      if (!Size)
+        Size = registrationSize(P.Array);
+      if (!Size)
+        break;
+      Array = std::move(Known);
+      Element = P.Element;
+      Slot = P.Base;
+      Generation = P.Generation;
+    }
+    return std::nullopt;
+  }
+
   // A successful parent check fixes the epoch in which the compiler selected
   // the child. Follow the check's success edge only through instructions that
   // cannot change that registration.
@@ -1333,6 +1505,24 @@ class EscapeCheck {
       Cursor = BB->getTerminator()->getIterator();
     }
     return std::nullopt;
+  }
+
+  std::optional<llvm::CallBase *> originalCapture(llvm::Value *Slot,
+                                                  llvm::Value *Generation,
+                                                  size_t Depth) const {
+    auto *Read = generationRead(Generation, Slot);
+    if (!Read || !readsBirth(*Read))
+      return std::nullopt;
+    std::optional<llvm::CallBase *> Birth = Read;
+    while (Depth-- && Birth) {
+      auto *Selection = llvm::dyn_cast<llvm::CallBase>(Slot);
+      if (!Selection || !Selection->getCalledFunction() ||
+          Selection->getCalledFunction()->getName() != "cpn.slot.child")
+        return std::nullopt;
+      Slot = Selection->getArgOperand(0);
+      Birth = checkedParentBirth(*Selection, Slot);
+    }
+    return Birth;
   }
 
   bool
@@ -1445,13 +1635,18 @@ class EscapeCheck {
   }
 
   using ArgumentRetirementCache =
-      std::map<std::pair<llvm::Function *, unsigned>, bool>;
+      std::map<std::tuple<llvm::Function *, unsigned, int64_t, llvm::Value *,
+                          MemberPath>,
+               bool>;
 
   bool retiresArgumentOnReturn(llvm::Function &F, unsigned Argument,
+                               int64_t Bytes, llvm::Value *Element,
+                               MemberPathRef Path,
                                ArgumentRetirementCache &Cache,
                                unsigned &Budget) const {
     // A recursive edge supplies no independent proof of retirement.
-    auto [Summary, First] = Cache.try_emplace({&F, Argument}, false);
+    auto [Summary, First] = Cache.try_emplace(
+        {&F, Argument, Bytes, Element, MemberPath(Path)}, false);
     if (!First)
       return Summary->second;
     llvm::SmallVector<llvm::BasicBlock *> Work{&F.getEntryBlock()};
@@ -1468,7 +1663,8 @@ class EscapeCheck {
           return false;
         --Budget;
         if (const auto *Reference = I.getMetadata(RetiredReference);
-            Reference && callSetting(*Reference, 0) == Argument) {
+            Reference && Path.empty() && !Bytes &&
+            callSetting(*Reference, 0) == Argument) {
           Retired = Ends = true;
           break;
         }
@@ -1479,12 +1675,22 @@ class EscapeCheck {
                 Forward->getOperandBundle(StorageRetirementBundle);
             Retirement &&
             llvm::cast<llvm::ConstantInt>(Retirement->Inputs[2].get())
-                ->isOne() &&
-            isArgumentRegistration(Forward->getArgOperand(0),
-                                   Retirement->Inputs[5].get(), F, Argument,
-                                   Dominance)) {
-          Retired = Ends = true;
-          break;
+                ->isOne()) {
+          auto *Slot = Forward->getArgOperand(0);
+          auto *Generation = Retirement->Inputs[5].get();
+          if (Path.empty() &&
+              argumentDisplacement(Slot, Generation, F, Argument, Element,
+                                   Dominance) == Bytes) {
+            Retired = Ends = true;
+            break;
+          }
+          if (!Bytes && !Element)
+            if (auto Selected = referenceSelection(Slot, Generation, F,
+                                                   Argument, Dominance);
+                Selected && llvm::ArrayRef(*Selected) == Path) {
+              Retired = Ends = true;
+              break;
+            }
         }
         auto Bundle = Forward->getOperandBundle(StorageArgumentBundle);
         if (!Bundle)
@@ -1492,16 +1698,46 @@ class EscapeCheck {
         auto Callees = retirementCallees(*Forward);
         if (Callees.empty())
           continue;
-        for (size_t J = 0; J < Bundle->Inputs.size(); J += 3) {
+        for (size_t J = 0; J < Bundle->Inputs.size();
+             J += StorageArgumentFields) {
           unsigned Position =
               llvm::cast<llvm::ConstantInt>(Bundle->Inputs[J].get())
                   ->getZExtValue();
-          if ((Forward->getArgOperand(Position) == F.getArg(Argument) ||
-               isArgumentRegistration(Bundle->Inputs[J + 1].get(),
-                                      Bundle->Inputs[J + 2].get(), F, Argument,
-                                      Dominance)) &&
+          auto *Slot = Bundle->Inputs[J + 1].get();
+          auto *Generation = Bundle->Inputs[J + 2].get();
+          if (!Bytes && !Element) {
+            auto Selected =
+                referenceSelection(Slot, Generation, F, Argument, Dominance);
+            auto Suffix =
+                Selected ? relativePath(Path, *Selected) : std::nullopt;
+            if (Suffix && llvm::all_of(Callees, [&](auto *Callee) {
+                  return retiresArgumentOnReturn(*Callee, Position, 0, nullptr,
+                                                 *Suffix, Cache, Budget);
+                })) {
+              Retired = Ends = true;
+              break;
+            }
+          }
+          if (!Path.empty())
+            continue;
+          auto Offset =
+              Forward->getArgOperand(Position) == F.getArg(Argument)
+                  ? std::optional<int64_t>(0)
+                  : argumentDisplacement(Slot, Generation, F, Argument, Element,
+                                         Dominance);
+          auto *ForwardedElement = Element;
+          if (ForwardedElement) {
+            auto *Array = Bundle->Inputs[J + 3].get();
+            auto *Stamp = Bundle->Inputs[J + 4].get();
+            resolveSavedGeneration(Array, Stamp, F, Dominance);
+            if (!fromArgument(Array, IncomingArrayStorage, Argument))
+              ForwardedElement = nullptr;
+          }
+          int64_t Remaining;
+          if (Offset && !llvm::SubOverflow(Bytes, *Offset, Remaining) &&
               llvm::all_of(Callees, [&](auto *Callee) {
-                return retiresArgumentOnReturn(*Callee, Position, Cache,
+                return retiresArgumentOnReturn(*Callee, Position, Remaining,
+                                               ForwardedElement, {}, Cache,
                                                Budget);
               })) {
             Retired = Ends = true;
@@ -1524,6 +1760,8 @@ class EscapeCheck {
 
   void verifyCheckedStorage(const Token &At) const {
     llvm::SmallVector<llvm::CallBase *> Uses;
+    llvm::SmallVector<llvm::CallBase *> Calls;
+    std::map<StorageRegistration, std::set<StorageRegistration>> Subobjects;
     RetirementsByStorage Retirements;
     ArgumentRetirementCache ArgumentRetirements;
     std::optional<llvm::DominatorTree> Dominance;
@@ -1534,39 +1772,100 @@ class EscapeCheck {
           if (!Call)
             continue;
           if (Call->getMetadata(CheckedStorageUse) ||
+              Call->getMetadata(OriginalStorageUse) ||
               Call->getMetadata(ConstructStorageUse) ||
-              Call->getMetadata(ExtentStorageUse))
+              Call->getMetadata(ExtentStorageUse)) {
             Uses.push_back(Call);
-          if (auto *F = Call->getCalledFunction();
-              F && F->getName() == "cpn.slot.retire")
-            if (auto Key = storageRegistration(Call->getArgOperand(0)))
-              Retirements[*Key].push_back(Call);
-          auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
-          if (!Bundle)
-            continue;
-          auto Callees = retirementCallees(*Call);
-          if (Callees.empty())
-            continue;
-          for (size_t I = 0; I < Bundle->Inputs.size(); I += 3) {
-            auto *Slot = Bundle->Inputs[I + 1].get();
-            auto *Generation = Bundle->Inputs[I + 2].get();
-            resolveSavedGeneration(Slot, Generation, Root, Dominance);
-            auto Key = storageRegistration(Slot);
-            if (!Key || !llvm::isa<llvm::AllocaInst>(std::get<0>(*Key)))
-              continue;
-            unsigned Argument =
-                llvm::cast<llvm::ConstantInt>(Bundle->Inputs[I].get())
-                    ->getZExtValue();
-            unsigned Budget = 2048;
-            if (llvm::all_of(Callees, [&](auto *Callee) {
-                  return retiresArgumentOnReturn(*Callee, Argument,
-                                                 ArgumentRetirements, Budget);
-                }))
-              Retirements[*Key].push_back(Call);
+            if (auto Key = resolvedRegistration(
+                    Call->getArgOperand(0), Call->getArgOperand(1), Dominance);
+                Key && !std::get<2>(*Key).empty())
+              Subobjects[containingRegistration(*Key)].insert(*Key);
           }
+          if (auto *F = Call->getCalledFunction()) {
+            if (F->getName() == "cpn.slot.child")
+              if (auto Key = storageRegistration(Call))
+                Subobjects[containingRegistration(*Key)].insert(*Key);
+            if (auto Effect = Call->getOperandBundle(StorageRetirementBundle))
+              if (auto Key =
+                      resolvedRegistration(Call->getArgOperand(0),
+                                           Effect->Inputs[5].get(), Dominance))
+                Retirements[*Key].push_back(Call);
+          }
+          if (Call->getOperandBundle(StorageArgumentBundle))
+            Calls.push_back(Call);
         }
     if (Uses.empty())
       return;
+    unsigned OffsetChecks = 4096;
+    for (auto *Call : Calls) {
+      auto Bundle = *Call->getOperandBundle(StorageArgumentBundle);
+      auto Callees = retirementCallees(*Call);
+      if (Callees.empty())
+        continue;
+      for (size_t I = 0; I < Bundle.Inputs.size(); I += StorageArgumentFields) {
+        auto Key = resolvedRegistration(Bundle.Inputs[I + 1].get(),
+                                        Bundle.Inputs[I + 2].get(), Dominance);
+        if (!Key)
+          continue;
+        unsigned Argument =
+            llvm::cast<llvm::ConstantInt>(Bundle.Inputs[I].get())
+                ->getZExtValue();
+        auto Retires = [&](int64_t Bytes, llvm::Value *Element,
+                           MemberPathRef Path = {}) {
+          unsigned Budget = 2048;
+          return llvm::all_of(Callees, [&](auto *Callee) {
+            return retiresArgumentOnReturn(*Callee, Argument, Bytes, Element,
+                                           Path, ArgumentRetirements, Budget);
+          });
+        };
+        bool EndsBase = Retires(0, nullptr);
+        if (EndsBase)
+          Retirements[*Key].push_back(Call);
+        auto &Path = std::get<2>(*Key);
+        if (!OffsetChecks)
+          continue;
+        if (!EndsBase) {
+          llvm::SmallVector<const StorageRegistration *> Parents{&*Key};
+          while (!Parents.empty() && OffsetChecks) {
+            auto Parent = Subobjects.find(*Parents.pop_back_val());
+            if (Parent == Subobjects.end())
+              continue;
+            for (const auto &Child : Parent->second) {
+              if (!OffsetChecks)
+                break;
+              --OffsetChecks;
+              auto Relative = relativePath(std::get<2>(Child), Path);
+              if (Relative && Retires(0, nullptr, *Relative))
+                Retirements[Child].push_back(Call);
+              else
+                Parents.push_back(&Child);
+            }
+          }
+        }
+        if (Path.empty())
+          continue;
+        auto Array = resolvedRegistration(
+            Bundle.Inputs[I + 3].get(), Bundle.Inputs[I + 4].get(), Dominance);
+        if (!Array || containingRegistration(*Key) != *Array)
+          continue;
+        auto Siblings = Subobjects.find(*Array);
+        if (Siblings == Subobjects.end())
+          continue;
+        auto [Position, Element] = Path.back();
+        for (const auto &Sibling : Siblings->second) {
+          auto [Offset, Type] = std::get<2>(Sibling).back();
+          int64_t Bytes;
+          if (Element != Type || (EndsBase && Offset == Position) ||
+              llvm::SubOverflow(Offset, Position, Bytes))
+            continue;
+          if (!OffsetChecks)
+            break;
+          --OffsetChecks;
+          if (Retires(Bytes, Element))
+            Retirements[Sibling].push_back(Call);
+        }
+      }
+    }
     if (!Dominance)
       Dominance.emplace(Root);
     for (auto *Use : Uses) {
@@ -1575,22 +1874,21 @@ class EscapeCheck {
       const bool Saved = llvm::isa<llvm::LoadInst>(Slot);
       if (Saved)
         resolveSavedGeneration(Slot, Generation, Root, Dominance);
-      auto Key = storageRegistration(Slot);
+      auto Key = resolvedRegistration(Slot, Generation, Dominance);
       if (!Key)
         continue;
       auto &[Parent, Object, Path] = *Key;
-      auto *Capture = generationRead(Generation, Slot);
+      auto *Read = generationRead(Generation, Slot);
       const auto *Construct = Use->getMetadata(ConstructStorageUse);
       if (const auto *Extent =
               Construct ? Construct : Use->getMetadata(ExtentStorageUse)) {
         if (!Path.empty()) {
           Token Source{At.Text, callSetting(*Extent, 0),
                        callSetting(*Extent, 1)};
-          if (Capture && readsBirth(*Capture) &&
-              Dominance->dominates(Capture, Use)) {
+          if (Read && readsBirth(*Read) && Dominance->dominates(Read, Use)) {
             auto Ancestors = endingOperations(*Key, Retirements, false);
             if (!Ancestors.empty() &&
-                !mayReachBeforeRetirement(Capture, *Use, Ancestors))
+                !mayReachBeforeRetirement(Read, *Use, Ancestors))
               fail(Source,
                    "storage view designates an ended containing generation");
           }
@@ -1600,22 +1898,26 @@ class EscapeCheck {
         }
         continue;
       }
-      if (!Capture || Retirements.empty())
+      if (Retirements.empty())
         continue;
-      if (!Saved) {
-        if (Path.empty() || !readsBirth(*Capture))
+      llvm::Instruction *Capture = Read;
+      if (auto Projection = pointerProjection(Slot, Generation)) {
+        if (Path.empty())
           continue;
-        auto *Child = Slot;
-        std::optional<llvm::CallBase *> Birth = Capture;
-        for (size_t I = Path.size(); I != 0 && Birth; --I) {
-          auto &Selection = *llvm::cast<llvm::CallBase>(Child);
-          Child = Selection.getArgOperand(0);
-          Birth = checkedParentBirth(Selection, Child);
-        }
+        resolveSavedGeneration(Projection->Array, Projection->ArrayGeneration,
+                               Root, Dominance);
+        auto Birth = originalCapture(
+            Projection->Array, Projection->ArrayGeneration, Path.size() - 1);
+        Capture = Birth ? *Birth : llvm::cast<llvm::Instruction>(Generation);
+      } else if (Use->getMetadata(OriginalStorageUse)) {
+        Capture = nullptr;
+      } else if (!Saved) {
+        auto Birth = originalCapture(Slot, Generation, Path.size());
         if (!Birth)
           continue;
         Capture = *Birth;
-      }
+      } else if (!Capture)
+        continue;
       if (Capture && !Dominance->dominates(Capture, Use))
         continue;
       auto Ended = endingOperations(*Key, Retirements, true);
@@ -1633,8 +1935,11 @@ class EscapeCheck {
         continue;
       if (mayReachBeforeRetirement(Capture, *Use, Ended))
         continue;
-      const auto &Location = *Use->getMetadata(CheckedStorageUse);
-      Token Source{At.Text, callSetting(Location, 0), callSetting(Location, 1)};
+      const auto *Location = Use->getMetadata(CheckedStorageUse);
+      if (!Location)
+        Location = Use->getMetadata(OriginalStorageUse);
+      Token Source{At.Text, callSetting(*Location, 0),
+                   callSetting(*Location, 1)};
       fail(Source, "ended object generation");
     }
   }
@@ -1918,10 +2223,14 @@ void Context::checkBorrowEscapes() {
         I.setMetadata(ExtentStorageUse, nullptr);
         I.setMetadata(RetiredReference, nullptr);
         I.setMetadata(IncomingPointerStorage, nullptr);
+        I.setMetadata(IncomingArrayStorage, nullptr);
+        I.setMetadata(IncomingReferenceStorage, nullptr);
         if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
           auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
           if (!Bundle)
             Bundle = Call->getOperandBundle(StorageRetirementBundle);
+          if (!Bundle)
+            Bundle = Call->getOperandBundle(StorageProjectionBundle);
           if (Bundle) {
             auto *Native = llvm::CallBase::removeOperandBundle(
                 Call, Bundle->getTagID(), Call->getIterator());

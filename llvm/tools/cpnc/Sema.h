@@ -11,8 +11,13 @@ inline constexpr char StorageViewType[] = "$cpn.storage";
 inline constexpr char StorageIdentityType[] = "$cpn.storage_identity";
 inline constexpr char StorageArgumentBundle[] = "cpn.storage.arguments";
 inline constexpr char StorageRetirementBundle[] = "cpn.storage.retire";
+inline constexpr char StorageProjectionBundle[] = "cpn.storage.projection";
 inline constexpr char IncomingPointerStorage[] = "cpn.storage.incoming.pointer";
+inline constexpr char IncomingArrayStorage[] = "cpn.storage.incoming.array";
+inline constexpr char IncomingReferenceStorage[] =
+    "cpn.storage.incoming.reference";
 inline constexpr char RetiredReference[] = "cpn.storage.reference.retire";
+inline constexpr unsigned StorageArgumentFields = 5;
 inline bool memoryIdentity(llvm::StringRef T) {
   return T == StorageIdentityType;
 }
@@ -323,6 +328,7 @@ struct Context {
                    const Node *SymbolOwner = nullptr);
 
   std::map<std::string, Node> TypeQueries;
+  std::map<std::pair<SourcePosition, std::string>, const Node *> ArrayExtents;
   uint64_t ExpandedTypeQueries = 0;
   std::map<std::string, Family> Families;
   std::map<std::string, TypeApplication> TypeApplications;
@@ -440,6 +446,7 @@ inline bool callableFlag(llvm::StringRef T, llvm::StringRef Flag) {
   return T.take_back(T.size() - (T.rfind(')') + 1)).contains(Flag);
 }
 std::string rebindTypeNames(llvm::StringRef, const Node &, const Node &);
+size_t arrayExtentStart(llvm::StringRef);
 struct CallableTypeParts {
   llvm::StringRef Result, Parameters, Flags;
 };
@@ -619,7 +626,7 @@ public:
   void copyStoredBounds(Value, llvm::Value *);
   void saveBounds(llvm::Value *, Value);
   void offsetRegistration(Value &, llvm::Value *, const std::string &,
-                          const Token &);
+                          const Token &, std::optional<int64_t>);
   Value binary(const Node &, Value, Value);
   std::string commonIntegerType(const std::string &, const std::string &,
                                 const Token &);
@@ -739,7 +746,7 @@ public:
   void exitWhole();
   static bool usesWhole(const Node &);
   llvm::Value *slotFor(Value);
-  Value subobject(Value, Value);
+  Value subobject(Value, Value, llvm::ArrayRef<llvm::OperandBundleDef> = {});
   void dropChild(Value, Value, bool AsBase = false);
   Value storageCall(const Node &, const std::vector<Node> &);
   void track(Value &, llvm::GlobalVariable *GlobalSlot = nullptr);

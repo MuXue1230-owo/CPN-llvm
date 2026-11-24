@@ -2373,6 +2373,19 @@ class CompilerTests(unittest.TestCase):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
 
     def test_constant_aggregate_values_fields_and_array_extents(self):
+        self.assertEqual(
+            self.program("""
+          constexpr i32[2] shape(1,2);
+          consteval i32 extent(char token){if(token=='['){return 2;} return 1;}
+          generic<const i32 N> consteval i32 bound(){return N;}
+          i32 main(){
+              i32[shape[0]+1][extent('[')][bound<2>()] values;
+              values[1][1][1]=42;
+              return values[1][1][1];
+          }
+        """),
+            42,
+        )
         self.assertLess(
             self.program("""
           struct Holder{i32* p;};struct Data{i32[2] a;i32 after;};
@@ -2405,6 +2418,22 @@ class CompilerTests(unittest.TestCase):
         ):
             with self.subTest(source=source):
                 self.assertEqual(self.compile(source, "--check").returncode, 1)
+        for extent in ("true", "'a'"):
+            with self.subTest(extent=extent):
+                checked = self.compile(f"i32[{extent}] values;", "--check")
+                self.assertEqual(checked.returncode, 1, checked.stderr)
+                self.assertIn(
+                    "array extent requires a compile-time integer", checked.stderr
+                )
+        for source in (
+            "generic<type T> void unused(){ i32[missing()] values; }",
+            "generic<type T> struct Unused { i32[missing()] values; };",
+            "i32 main(){ if constexpr(false){ i32[missing()] values; } return 42; }",
+        ):
+            with self.subTest(source=source):
+                checked = self.compile(source, "--check")
+                self.assertEqual(checked.returncode, 1, checked.stderr)
+                self.assertIn("unknown name 'missing'", checked.stderr)
 
     def test_constexpr_constructor_uses_canonical_plan(self):
         self.assertEqual(
@@ -2788,15 +2817,15 @@ class CompilerTests(unittest.TestCase):
             ),
             42,
         )
-        self.assertLess(
-            self.program(
-                source
-                + """
+        stale = self.compile(
+            source
+            + """
               i32 main(){i32 x(3);Release release(&end);release(x);return x;}
-            """
-            ),
-            0,
+            """,
+            "--check",
         )
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
         for extra in (
             "void test(){function<void(i32&)>* p(&end);}",
             "void keep(i32& value){} void test(){Release p(&keep);}",
@@ -3438,10 +3467,61 @@ class CompilerTests(unittest.TestCase):
             "auto q(p+1);destroy(a[1]);return *q;",
             "p++;destroy(a[1]);return *p;",
             "auto q(p+1);auto cap(storage_of(a[1]));destroy(a[1]);construct_at<i32>(cap,5);return *q;",
+            "destroy(a[1]);return *(p+1);",
+            "destroy(*(p+1));return a[1];",
         ):
-            self.assertLess(
-                self.program("i32 main(){i32[2] a(7,8);i32* p(&a[0]);" + body + "}"), 0
-            )
+            with self.subTest(body=body):
+                stale = self.compile(
+                    "i32 main(){i32[2] a(7,8);i32* p(&a[0]);" + body + "}",
+                    "--check",
+                )
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("ended object generation", stale.stderr)
+        helpers = """
+            void next(i32* p){destroy(*(p+1));}
+            void previous(i32* p){destroy(*(p-1));}
+            void relay(i32* p){next(p+1);}
+            i32 main(){
+                i32[3] a(42,42,42);
+                auto p(&a[0]);
+                RETIRE();
+                return OBSERVATION;
+            }
+        """
+        for call, dead, live in (
+            ("next(p)", "a[1]", "a[0]"),
+            ("previous(p+2)", "a[1]", "a[2]"),
+            ("relay(p)", "*(p+2)", "a[1]"),
+        ):
+            with self.subTest(call=call):
+                source = helpers.replace("RETIRE()", call)
+                stale = self.compile(source.replace("OBSERVATION", dead), "--check")
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("ended object generation", stale.stderr)
+                self.assertEqual(self.program(source.replace("OBSERVATION", live)), 42)
+        dynamic = """
+            void retire(i32* p,isize distance){destroy(*(p+distance));}
+            i32 read(isize distance){
+                i32[2] a(1,42);
+                retire(&a[0],distance);
+                return a[1];
+            }
+            i32 main(){return read(INPUT);}
+        """
+        self.assertEqual(self.program(dynamic.replace("INPUT", "0")), 42)
+        self.assertEqual(self.program(dynamic.replace("INPUT", "1")), -signal.SIGILL)
+        self.assertEqual(
+            self.program("""
+                i32 main(){
+                    i32[2] a(1,7);
+                    auto slot(storage_of(a[1]));
+                    destroy(a[1]);
+                    auto fresh(construct_at<i32>(slot,42));
+                    return *(fresh+0);
+                }
+            """),
+            42,
+        )
 
     def test_goto_drops_only_exited_objects_in_reverse(self):
         self.assertEqual(
@@ -7637,6 +7717,47 @@ class CompilerTests(unittest.TestCase):
             self.program(conditional_helper.replace("read(false)", "read(true)")),
             -signal.SIGILL,
         )
+        whole_object = """
+            void finish(i32& value){destroy(value);}
+            i32 main(){i32 value(42);finish(value);return value;}
+        """
+        stale = self.compile(whole_object, "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        static_array = """
+            i32[2] values(1,42);
+            void finish(i32[2]& array){destroy(array[0]);}
+            i32 main(){finish(values);return EXPR;}
+        """
+        stale = self.compile(static_array.replace("EXPR", "values[0]"), "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        self.assertEqual(self.program(static_array.replace("EXPR", "values[1]")), 42)
+        aggregate_reference = """
+            struct Pair {i32 pad(0);i32[2] values(1,42);};
+            void finish(i32[2]& values){destroy(values[0]);}
+            void relay(Pair& pair){finish(pair.values);}
+            i32 main(){
+                Pair pair;
+                CALL;
+                return EXPR;
+            }
+        """
+        for call in (
+            "finish(pair.values)",
+            "relay(pair)",
+            "function<void(Pair&)>* call(&relay); call(pair)",
+        ):
+            with self.subTest(call=call):
+                source = aggregate_reference.replace("CALL", call)
+                stale = self.compile(
+                    source.replace("EXPR", "pair.values[0]"), "--check"
+                )
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("ended object generation", stale.stderr)
+                self.assertEqual(
+                    self.program(source.replace("EXPR", "pair.values[1]")), 42
+                )
         pointer_helper = (
             helper.replace("i32& value", "i32* value")
             .replace("destroy(value)", "destroy(*value)")
