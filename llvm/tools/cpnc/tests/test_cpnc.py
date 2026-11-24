@@ -4271,8 +4271,8 @@ class CompilerTests(unittest.TestCase):
             """),
             42,
         )
-        self.assertEqual(
-            self.program("""
+        stale_cell = self.compile(
+            """
                 i32 main(){
                     i32 first(1);i32 second(42);
                     i32* pointer(&first);
@@ -4283,9 +4283,11 @@ class CompilerTests(unittest.TestCase):
                     if(**fresh==42){return **bound;}
                     return 0;
                 }
-            """),
-            -signal.SIGILL,
+            """,
+            "--check",
         )
+        self.assertEqual(stale_cell.returncode, 1, stale_cell.stderr)
+        self.assertIn("ended object generation", stale_cell.stderr)
         ended = self.compile(
             "i32 f(){i32 value(1); i32* p(&value); destroy(p); return *p;}",
             "--check",
@@ -4338,9 +4340,8 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("null pointer access", known_null.stderr)
 
     def test_pointer_receiver_calls_validate_the_bound_generation(self):
-        self.assertEqual(
-            self.program(
-                """
+        checked = self.compile(
+            """
                 struct Cell {i32 read() const{return 42;}};
                 i32 main(){
                     Cell old;
@@ -4351,11 +4352,12 @@ class CompilerTests(unittest.TestCase):
                     if(current->read()==42){return previous->read();}
                     return 0;
                 }
-                """,
-                "--preset=Release",
-            ),
-            -signal.SIGILL,
+            """,
+            "--check",
+            "--preset=Release",
         )
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        self.assertIn("ended object generation", checked.stderr)
 
     def test_manual_storage_generation(self):
         self.assertEqual(
@@ -5952,12 +5954,49 @@ class CompilerTests(unittest.TestCase):
         """),
             42,
         )
-        self.assertLess(
+        for retirement in ("destroy(a);", "if(change){destroy(a);}else{abandon(a);}"):
+            checked = self.compile(
+                """
+                i32 read(bool change){
+                    i32 a(1);auto old(&a);auto storage(storage_of(a));
+                    RETIRE
+                    construct_at<i32>(storage,42);return *old;
+                }
+                """.replace("RETIRE", retirement),
+                "--check",
+            )
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            self.assertIn("ended object generation", checked.stderr)
+        dynamic = """
+            i32 read(bool change){
+                i32 a(42);auto old(&a);auto storage(storage_of(a));
+                if(change){destroy(a);construct_at<i32>(storage,1);}
+                return *old;
+            }
+            i32 main(){return read(DECISION);}
+        """
+        self.assertEqual(self.program(dynamic.replace("DECISION", "false")), 42)
+        self.assertEqual(
+            self.program(dynamic.replace("DECISION", "true")), -signal.SIGILL
+        )
+        self.assertEqual(
             self.program("""
-            i32 main(){i32 a(1);auto old(&a);auto storage(storage_of(a));
-                destroy(a);construct_at<i32>(storage,42);return *old;}
-        """),
-            0,
+                i32 main(){
+                    i32 a(1);auto old(&a);auto storage(storage_of(a));
+                    destroy(a);old=construct_at<i32>(storage,42);return *old;
+                }
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                void redirect(i32*& cell,i32& target){cell=&target;}
+                i32 main(){
+                    i32 a(1);i32 next(42);auto old(&a);
+                    destroy(a);redirect(old,next);return *old;
+                }
+            """),
+            42,
         )
 
     def test_first_assignment_construction_frontier(self):
@@ -7346,16 +7385,22 @@ class CompilerTests(unittest.TestCase):
             }"""),
             42,
         )
-        for expr in ("*old", "values[0]"):
-            with self.subTest(expr=expr):
-                self.assertLess(
-                    self.program(
-                        "i32 main(){i32[2] values(10,20);auto old(&values[0]);"
-                        "destroy(values[0]);construct_at<i32>(storage_of(values[0]),42);"
-                        "return " + expr + ";}"
-                    ),
-                    0,
-                )
+        replaced = """
+            i32 main(){
+                i32[2] values(10,42);
+                auto old(&values[0]);
+                auto next(&values[1]);
+                destroy(values[0]);construct_at<i32>(storage_of(values[0]),1);
+                return EXPR;
+            }
+        """
+        stale = self.compile(replaced.replace("EXPR", "*old"), "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        self.assertEqual(self.program(replaced.replace("EXPR", "*next")), 42)
+        self.assertEqual(
+            self.program(replaced.replace("EXPR", "values[0]")), -signal.SIGILL
+        )
 
     def test_storage_view_after_ending_complete_object(self):
         self.assertEqual(

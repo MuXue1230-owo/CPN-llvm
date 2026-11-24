@@ -228,7 +228,11 @@ void Frame::dropChild(Value Parent, Value V, bool AsBase) {
 void Frame::ensureLive(const Value &V, const Token &At) {
   const auto &Storage = V.PointerCell ? V.PointerCell->Storage : V.Storage;
   auto *Generation = V.PointerCell ? V.PointerCell->Generation : V.Generation;
-  if (auto State = Active.find(Storage); State != Active.end()) {
+  // A reloaded generation can select a new pointee after a write through an
+  // alias. Its saved initializer does not establish the reaching generation.
+  if (auto State = Active.find(Storage);
+      State != Active.end() &&
+      !llvm::isa_and_nonnull<llvm::LoadInst>(Generation)) {
     if (State->second == 0)
       fail(At, "ended object generation");
     auto Stamp = StorageGenerations.find(Generation);
@@ -242,12 +246,14 @@ void Frame::ensureLive(const Value &V, const Token &At) {
   auto *Validation =
       B.CreateCall(U.M.getFunction("cpn.borrow.valid"),
                    {Slot, Generation ? Generation : B.getInt64(0)});
-  if (!Generation && llvm::isa<llvm::GlobalVariable>(Slot)) {
+  if ((Generation && llvm::isa<llvm::LoadInst>(Slot)) ||
+      (!Generation && llvm::isa<llvm::GlobalVariable>(Slot))) {
     const Token &Source = At.Text.empty() && F ? F->Decl.At : At;
     llvm::Metadata *Location[] = {
         llvm::ConstantAsMetadata::get(B.getInt32(Source.Line)),
         llvm::ConstantAsMetadata::get(B.getInt32(Source.Column))};
-    Validation->setMetadata("cpn.storage.original.use",
+    Validation->setMetadata(Generation ? "cpn.storage.saved.use"
+                                       : "cpn.storage.original.use",
                             llvm::MDNode::get(U.C, Location));
   }
   guard(B.CreateNot(Validation));

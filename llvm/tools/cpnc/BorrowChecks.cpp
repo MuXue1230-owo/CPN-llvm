@@ -1,6 +1,7 @@
 #include "Sema.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/Support/MathExtras.h"
 
@@ -9,6 +10,7 @@ namespace {
 constexpr llvm::StringRef BorrowMetadata = "cpn.borrow.call";
 constexpr llvm::StringRef TemporaryEnd = "cpn.borrow.temporary.end";
 constexpr llvm::StringRef OriginalStorageUse = "cpn.storage.original.use";
+constexpr llvm::StringRef SavedStorageUse = "cpn.storage.saved.use";
 enum CallField {
   Line,
   Column,
@@ -922,6 +924,202 @@ class EscapeCheck {
                               Exact);
   }
 
+  // A local pointer's sidecar has a known registration and cannot be written
+  // via an alias when every use of its address is visible here.
+  std::pair<llvm::Value *, llvm::Value *>
+  savedGeneration(const llvm::CallBase &Use,
+                  const llvm::DominatorTree &Dominance) const {
+    auto *SlotLoad = llvm::dyn_cast<llvm::LoadInst>(Use.getArgOperand(0));
+    auto *StampLoad = llvm::dyn_cast<llvm::LoadInst>(Use.getArgOperand(1));
+    if (!SlotLoad || !StampLoad || !SlotLoad->isSimple() ||
+        !StampLoad->isSimple())
+      return {};
+    const auto Locator = slot(SlotLoad->getPointerOperand());
+    const auto Stamp = slot(StampLoad->getPointerOperand());
+    auto *Field = llvm::dyn_cast<llvm::CallBase>(Locator.Base);
+    auto *Callee = Field ? Field->getCalledFunction() : nullptr;
+    if (!Callee || Callee->getName() != "cpn.pointer.field" ||
+        Locator.Base != Stamp.Base)
+      return {};
+    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Field->getArgOperand(0));
+    if (!Object || !Object->getAllocatedType()->isPointerTy() ||
+        !Object->getMetadata("cpn.object") || Object->getNumUses() > 128)
+      return {};
+    llvm::Value *Values[] = {nullptr, nullptr};
+    bool Written[] = {false, false};
+    for (auto *Access : Object->users()) {
+      if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(Access);
+          Load && Load->isSimple())
+        continue;
+      if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(Access);
+          Store && Store->isSimple() && Store->getPointerOperand() == Object &&
+          Store->getValueOperand() != Object)
+        continue;
+      auto *Call = llvm::dyn_cast<llvm::CallBase>(Access);
+      auto *F = Call ? Call->getCalledFunction() : nullptr;
+      if (F && F->getName() == "cpn.slot.begin" &&
+          Call->getArgOperand(1) == Object) {
+        // A storage view can expose the pointer cell indirectly through the
+        // registration even when its own address is never passed anywhere.
+        auto *Registration =
+            llvm::dyn_cast<llvm::AllocaInst>(Call->getArgOperand(0));
+        if (!Registration ||
+            !llvm::all_of(Registration->users(), [](const auto *User) {
+              const auto *Call = llvm::dyn_cast<llvm::CallBase>(User);
+              const auto *F = Call ? Call->getCalledFunction() : nullptr;
+              if (!F)
+                return false;
+              const auto Name = F->getName();
+              return Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
+                     Name == "cpn.generation" || Name == "cpn.borrow.valid" ||
+                     Name == "cpn.slot.retire" || Name == "cpn.slot.release";
+            }))
+          return {};
+        continue;
+      }
+      if (!F || F->getName() != "cpn.pointer.field" ||
+          Call->getArgOperand(0) != Object || Call->getNumUses() > 128)
+        return {};
+      for (auto *Address : Call->users()) {
+        auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(Address);
+        if (!GEP || !GEP->hasAllConstantIndices())
+          return {};
+        auto Location = slot(GEP);
+        if (Location.Base != Call || Location.Offset < 0 ||
+            uint64_t(Location.Offset) % DL.getPointerSize() ||
+            GEP->getNumUses() > 128)
+          return {};
+        for (auto *User : GEP->users()) {
+          if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(User);
+              Load && Load->isSimple())
+            continue;
+          auto *Store = llvm::dyn_cast<llvm::StoreInst>(User);
+          if (!Store || !Store->isSimple() ||
+              Store->getPointerOperand() != GEP ||
+              (!Store->getValueOperand()->getType()->isPointerTy() &&
+               !Store->getValueOperand()->getType()->isIntegerTy(64)))
+            return {};
+          if (Location.Offset != Locator.Offset &&
+              Location.Offset != Stamp.Offset)
+            continue;
+          unsigned I = Location.Offset == Locator.Offset ? 0 : 1;
+          auto *Value = Store->getValueOperand();
+          if (Values[I] && Values[I] != Value)
+            return {};
+          Values[I] = Value;
+          Written[I] |=
+              Dominance.dominates(Store, I == 0 ? SlotLoad : StampLoad);
+        }
+      }
+    }
+    if (Written[0] && Written[1])
+      return {Values[0], Values[1]};
+    return {};
+  }
+
+  bool mayReachBeforeRetirement(
+      llvm::CallBase &Capture, const llvm::Instruction &Use,
+      llvm::ArrayRef<const llvm::CallBase *> Retirements) const {
+    llvm::SmallVector<llvm::BasicBlock *> Work{Capture.getParent()};
+    llvm::SmallPtrSet<llvm::BasicBlock *, 32> Visited;
+    unsigned Budget = 4096;
+    while (!Work.empty()) {
+      auto *BB = Work.pop_back_val();
+      if (!Visited.insert(BB).second)
+        continue;
+      auto Cursor = BB == Capture.getParent() ? std::next(Capture.getIterator())
+                                              : BB->begin();
+      for (; Cursor != BB->end(); ++Cursor) {
+        if (!Budget-- || &*Cursor == &Use)
+          return true;
+        if (llvm::is_contained(Retirements, &*Cursor))
+          break;
+      }
+      if (Cursor != BB->end())
+        continue;
+      if (auto *Next = successor(BB))
+        Work.push_back(Next);
+      else
+        llvm::append_range(Work, llvm::successors(BB));
+    }
+    return false;
+  }
+
+  // A child lookup selects its parent's registration, byte position and type.
+  // A new parent generation already invalidates any saved child generation.
+  using StorageRegistration = std::tuple<llvm::AllocaInst *, llvm::AllocaInst *,
+                                         int64_t, llvm::Value *>;
+  std::optional<StorageRegistration> storageRegistration(llvm::Value *V) const {
+    if (auto *A = llvm::dyn_cast_or_null<llvm::AllocaInst>(V))
+      return StorageRegistration{A, nullptr, 0, nullptr};
+    auto *Child = llvm::dyn_cast_or_null<llvm::CallBase>(V);
+    auto *F = Child ? Child->getCalledFunction() : nullptr;
+    if (!F || F->getName() != "cpn.slot.child")
+      return std::nullopt;
+    auto *Parent = llvm::dyn_cast<llvm::AllocaInst>(Child->getArgOperand(0));
+    auto [Base, Offset] = slot(Child->getArgOperand(1));
+    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Base);
+    auto *Type = Child->getArgOperand(2);
+    if (!Parent || !Object || !llvm::isa<llvm::GlobalVariable>(Type))
+      return std::nullopt;
+    return StorageRegistration{Parent, Object, Offset, Type};
+  }
+
+  void verifySavedStorage(const Token &At) const {
+    llvm::SmallVector<const llvm::CallBase *> Uses;
+    std::map<StorageRegistration, llvm::SmallVector<const llvm::CallBase *, 2>>
+        Retirements;
+    for (const auto &BB : Root)
+      if (Reachable.contains(&BB))
+        for (const auto &I : BB) {
+          const auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+          if (!Call)
+            continue;
+          if (Call->getMetadata(SavedStorageUse))
+            Uses.push_back(Call);
+          if (auto *F = Call->getCalledFunction();
+              F && F->getName() == "cpn.slot.retire")
+            if (auto Key = storageRegistration(Call->getArgOperand(0)))
+              Retirements[*Key].push_back(Call);
+        }
+    if (Uses.empty() || Retirements.empty())
+      return;
+    llvm::DominatorTree Dominance(Root);
+    for (const auto *Use : Uses) {
+      auto [Slot, Generation] = savedGeneration(*Use, Dominance);
+      auto *Capture = llvm::dyn_cast_or_null<llvm::CallBase>(Generation);
+      const auto *Callee = Capture ? Capture->getCalledFunction() : nullptr;
+      auto Key = storageRegistration(Slot);
+      if (!Callee || Callee->getName() != "cpn.generation" ||
+          Capture->getArgOperand(0) != Slot || !Key ||
+          !Dominance.dominates(Capture, Use))
+        continue;
+      auto [Parent, Object, Offset, Type] = *Key;
+      llvm::SmallVector<const llvm::CallBase *, 4> Ended;
+      if (auto It = Retirements.find(*Key); It != Retirements.end())
+        llvm::append_range(Ended, It->second);
+      if (Object)
+        if (auto It = Retirements.find({Parent, nullptr, 0, nullptr});
+            It != Retirements.end())
+          llvm::append_range(Ended, It->second);
+      if (Ended.empty() ||
+          llvm::none_of(Parent->users(), [&](const auto *User) {
+            const auto *Begin = llvm::dyn_cast<llvm::CallBase>(User);
+            const auto *F = Begin ? Begin->getCalledFunction() : nullptr;
+            return F && F->getName() == "cpn.slot.begin" &&
+                   Begin->getArgOperand(0) == Parent &&
+                   (!Object || Begin->getArgOperand(1) == Object) &&
+                   Dominance.dominates(Begin, Capture);
+          }))
+        continue;
+      if (mayReachBeforeRetirement(*Capture, *Use, Ended))
+        continue;
+      const auto &Location = *Use->getMetadata(SavedStorageUse);
+      Token Source{At.Text, callSetting(Location, 0), callSetting(Location, 1)};
+      fail(Source, "ended object generation");
+    }
+  }
+
   void verifyOriginalStorage(const Token &At) const {
     auto retirement = [](const llvm::Instruction &I) -> llvm::Value * {
       return I.getMetadata("cpn.storage.original.retire")
@@ -1037,6 +1235,7 @@ public:
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefGetters,
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefConstructors) const {
     verifyOriginalStorage(At);
+    verifySavedStorage(At);
     auto IsAutomatic = [&](llvm::Value *V) {
       return llvm::isa<llvm::AllocaInst>(V) || Automatic.contains(V);
     };
