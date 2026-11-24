@@ -8,6 +8,7 @@ using namespace cpn;
 namespace {
 constexpr llvm::StringRef BorrowMetadata = "cpn.borrow.call";
 constexpr llvm::StringRef TemporaryEnd = "cpn.borrow.temporary.end";
+constexpr llvm::StringRef OriginalStorageUse = "cpn.storage.original.use";
 enum CallField {
   Line,
   Column,
@@ -921,6 +922,75 @@ class EscapeCheck {
                               Exact);
   }
 
+  void verifyOriginalStorage(const Token &At) const {
+    auto retirement = [](const llvm::Instruction &I) -> llvm::Value * {
+      return I.getMetadata("cpn.storage.original.retire")
+                 ? llvm::cast<llvm::CallBase>(I).getArgOperand(0)
+                 : nullptr;
+    };
+    llvm::SmallPtrSet<llvm::Value *, 4> Retired;
+    std::map<llvm::Value *, llvm::SmallVector<const llvm::CallBase *, 4>> Uses;
+    // Use source emission order for the required diagnostic.
+    for (auto &BB : Root) {
+      if (!Reachable.contains(&BB))
+        continue;
+      for (const auto &I : BB) {
+        if (auto *Slot = retirement(I))
+          Retired.insert(Slot);
+        if (I.getMetadata(OriginalStorageUse)) {
+          const auto &Call = llvm::cast<llvm::CallBase>(I);
+          Uses[Call.getArgOperand(0)].push_back(&Call);
+        }
+      }
+    }
+    const llvm::CallBase *First = nullptr;
+    for (const auto &[Slot, Accesses] : Uses) {
+      if (!Retired.contains(Slot))
+        continue;
+      // The original generation can only expire. Following the paths on
+      // which its slot has not retired handles joins with different exits.
+      llvm::SmallPtrSet<llvm::BasicBlock *, 32> Visited;
+      llvm::SmallPtrSet<const llvm::Instruction *, 8> MayBeLive;
+      llvm::SmallVector<llvm::BasicBlock *> Work{&Root.getEntryBlock()};
+      while (!Work.empty()) {
+        auto *BB = Work.pop_back_val();
+        if (!Visited.insert(BB).second)
+          continue;
+        bool Ended = false;
+        for (const auto &I : *BB) {
+          if (retirement(I) == Slot) {
+            Ended = true;
+            break;
+          }
+          if (I.getMetadata(OriginalStorageUse) &&
+              llvm::cast<llvm::CallBase>(I).getArgOperand(0) == Slot)
+            MayBeLive.insert(&I);
+        }
+        if (!Ended) {
+          if (auto *Next = successor(BB))
+            Work.push_back(Next);
+          else
+            llvm::append_range(Work, llvm::successors(BB));
+        }
+      }
+      for (const auto *Access : Accesses) {
+        if (MayBeLive.contains(Access))
+          continue;
+        auto Location = [](const llvm::CallBase &C) {
+          const auto &D = *C.getMetadata(OriginalStorageUse);
+          return std::pair(callSetting(D, 0), callSetting(D, 1));
+        };
+        if (!First || Location(*Access) < Location(*First))
+          First = Access;
+      }
+    }
+    if (First) {
+      const auto &Location = *First->getMetadata(OriginalStorageUse);
+      Token Source{At.Text, callSetting(Location, 0), callSetting(Location, 1)};
+      fail(Source, "ended object generation");
+    }
+  }
+
 public:
   EscapeCheck(Context &U, Function &D, llvm::Function &F,
               const std::map<llvm::Value *, llvm::Type *> &Globals,
@@ -966,6 +1036,7 @@ public:
   verify(const Token &At,
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefGetters,
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefConstructors) const {
+    verifyOriginalStorage(At);
     auto IsAutomatic = [&](llvm::Value *V) {
       return llvm::isa<llvm::AllocaInst>(V) || Automatic.contains(V);
     };

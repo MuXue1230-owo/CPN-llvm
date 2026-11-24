@@ -1909,6 +1909,104 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_constrained_overload_results_bind_member_syntax(self):
+        self.assertEqual(
+            self.program("""
+                struct Range { bool operator>(i32 n) const {return n==0;} };
+                struct Less { Range operator<(i32 n) const {return Range();} };
+                struct Relation { Less get; };
+                struct Generic { generic<const i32 N> i32 get() const {return N;} };
+                namespace number {
+                    alias Wide=i32;
+                    constraint Integer<type A> { requires(SameType<A,Wide>); };
+                    constraint Toggle<type A,const bool Enabled> {
+                        requires(Enabled);
+                        requires(Integer<A>);
+                    };
+                    generic<type A> requires(Toggle<A,true>) Relation choose(const<A>& a) {
+                        return Relation();
+                    }
+                    generic<type A> requires(!Toggle<A,true>) Generic choose(const<A>& a) {
+                        return Generic();
+                    }
+                    generic<type A,const bool Flag> requires(Flag && SameType<A,Wide>)
+                    Relation direct(A a){return Relation();}
+                    generic<type A,const bool Flag> requires(!Flag || !SameType<A,Wide>)
+                    Generic direct(A a){return Generic();}
+                    generic<type A> requires(Integer<A> || SameType<A,bool>)
+                    Generic ranked(A a){return Generic();}
+                    generic<type B> requires(Integer<B> && ObjectType<B>)
+                    Relation ranked(B a){return Relation();}
+                }
+                generic<type T> requires(
+                    (SameType<T,bool> && 1/0==0) || SameType<T,i32>)
+                Relation protected_division(T arg){return Relation();}
+                generic<type T> requires(!SameType<T,i32>)
+                Generic protected_division(T arg){return Generic();}
+                i32 main(){
+                    const number::Wide value(0);
+                    if (!(number::choose(value).get < 1 > (0)) ||
+                        !(number::direct<i32,true>(0).get < 2 > (0)) ||
+                        !(protected_division(i32(0)).get < 3 > (0)) ||
+                        !(number::ranked(i32(0)).get < 4 > (0))) {return 0;}
+                    return number::choose(true).get<24>() +
+                           number::direct<i32,false>(0).get<11>() +
+                           number::ranked(true).get<7>();
+                }
+            """),
+            42,
+        )
+        bad = self.compile(
+            "generic<type T> requires(SameType<T,bool> && 1/0==0) i32 f(T x){return 1;}"
+            "generic<type T> requires(SameType<T,i32>) i32 f(T x){return 2;}"
+            "i32 main(){return f(true);}",
+            "--check",
+        )
+        self.assertEqual(bad.returncode, 1, bad.stderr)
+        self.assertIn("division by zero", bad.stderr)
+
+    def test_free_overloads_bind_type_and_constant_template_arguments(self):
+        self.assertEqual(
+            self.program("""
+                generic<type T> i32 size_or_value(){return i32(sizeof(T));}
+                generic<const i32 N> i32 size_or_value(){return N;}
+                namespace lib {
+                    alias Wide=i64;
+                    generic<const i32 N> i32 size_or_value(){return N;}
+                    generic<type T> i32 size_or_value(){return i32(sizeof(T));}
+                }
+                i32 main(){
+                    return size_or_value<i32>() + size_or_value<10>() +
+                           lib::size_or_value<lib::Wide>() + lib::size_or_value<20>();
+                }
+            """),
+            42,
+        )
+
+    def test_consteval_constraints_confirm_relational_member_binding(self):
+        source = """
+            struct Range {bool operator>(i32 v) const {return v==0;}};
+            struct Less {Range operator<(i32 v) const {return Range();}};
+            struct Relation {Less get;};
+            struct Generic {generic<const i32 N> i32 get() const {return N;}};
+            consteval bool odd(i32 x) {return x%2!=0;}
+            generic<const i32 N> requires(!odd(N)) Relation choose(){return Relation();}
+            generic<const i32 N> requires(odd(N)) Generic choose(){return Generic();}
+            generic<type T> bool from_generic(T argument){
+                return choose<6>().get < 3 > (0);
+            }
+            i32 main(){
+                auto selected(choose<4>());
+                if (!(choose<2>().get < 1 > (0)) || !(selected.get < 2 > (0)) ||
+                    !from_generic(i32(0))) {return 0;}
+                return choose<3>().get<42>();
+            }
+        """
+        checked = self.compile(source, "--check")
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stderr.count("chained relational comparison"), 3)
+        self.assertEqual(self.program(source), 42)
+
     def test_member_overload_argument_kinds_follow_caller_declarations(self):
         source = """
             enum Tag:i32 {case Answer(11)};
@@ -7018,6 +7116,7 @@ class CompilerTests(unittest.TestCase):
             constexpr i32 second(24);
             extern "C" define const i32 exposed(7);
             constexpr i32 original_sum(18+second);
+            i32 read_second(){return second;}
             i32 main(){
                 if(original_sum!=42){return 3;}
                 auto a(storage_of(first));
@@ -7036,8 +7135,33 @@ class CompilerTests(unittest.TestCase):
         for preset in ("Debug", "Release"):
             with self.subTest(preset=preset):
                 self.assertEqual(self.program(source, "--preset", preset), 42)
-        stale = source.replace("return *current+*another+*linked;", "return second;")
-        self.assertEqual(self.program(stale), -signal.SIGILL)
+        stale = self.compile(
+            source.replace("return *current+*another+*linked;", "return second;"),
+            "--check",
+        )
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        dynamic = source.replace(
+            "return *current+*another+*linked;", "return read_second();"
+        )
+        self.assertEqual(self.program(dynamic), -signal.SIGILL)
+        branching = """
+            const i32 stored(42);
+            i32 read(bool retire){
+                if (retire) {destroy(stored);}
+                return stored;
+            }
+            i32 main(){return read(false);}
+        """
+        self.assertEqual(self.program(branching), 42)
+        all_ended = self.compile(
+            branching.replace(
+                "{destroy(stored);}", "{destroy(stored);}else{destroy(stored);}"
+            ),
+            "--check",
+        )
+        self.assertEqual(all_ended.returncode, 1, all_ended.stderr)
+        self.assertIn("ended object generation", all_ended.stderr)
         invalid = self.compile(
             "i32 main(){i32 local; auto view(storage_of(local));"
             "transfer_storage(view,view);return 0;}",

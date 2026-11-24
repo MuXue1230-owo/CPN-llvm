@@ -239,9 +239,18 @@ void Frame::ensureLive(const Value &V, const Token &At) {
   auto *Slot = V.PointerCell ? V.PointerCell->Slot : V.Slot;
   if (!IR || !Slot)
     return;
-  guard(B.CreateNot(
+  auto *Validation =
       B.CreateCall(U.M.getFunction("cpn.borrow.valid"),
-                   {Slot, Generation ? Generation : B.getInt64(0)})));
+                   {Slot, Generation ? Generation : B.getInt64(0)});
+  if (!Generation && llvm::isa<llvm::GlobalVariable>(Slot)) {
+    const Token &Source = At.Text.empty() && F ? F->Decl.At : At;
+    llvm::Metadata *Location[] = {
+        llvm::ConstantAsMetadata::get(B.getInt32(Source.Line)),
+        llvm::ConstantAsMetadata::get(B.getInt32(Source.Column))};
+    Validation->setMetadata("cpn.storage.original.use",
+                            llvm::MDNode::get(U.C, Location));
+  }
+  guard(B.CreateNot(Validation));
 }
 void Frame::retireStorage(const Value &V, bool Destroy, bool Explicit) {
   bool KnownEnded =

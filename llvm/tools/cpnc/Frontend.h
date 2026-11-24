@@ -27,6 +27,10 @@ struct Diagnostic {
   throw Diagnostic{At, Message};
 }
 struct ResourceExhausted : Diagnostic {};
+using RelationalMembers = std::set<std::pair<unsigned, unsigned>>;
+struct RelationalMemberBinding {
+  Token At;
+};
 enum class ConfigScope { Project, File, Declaration, Block, Expression };
 enum class Severity { Info, Warning, Anomaly, Error, None };
 struct Options {
@@ -54,6 +58,7 @@ struct Options {
   Severity Minimum = Severity::Warning;
   std::set<std::string> ExplicitConfiguration;
   std::set<std::string> Promote, Suppress;
+  std::string *BufferedDiagnostics = nullptr;
   void diagnose(const Token &, Severity, llvm::StringRef Code,
                 llvm::StringRef Message) const;
   void warn(const Token &, llvm::StringRef) const;
@@ -167,7 +172,8 @@ bool effectsFit(const EffectBound &Source, const EffectBound &Target);
 std::string parameterEffects(const std::set<unsigned> &NoEscape,
                              const std::set<unsigned> &Borrowed,
                              const std::set<unsigned> &Consumes);
-std::vector<Node> parse(llvm::StringRef, const Options &);
+std::vector<Node> parse(llvm::StringRef, const Options &,
+                        const RelationalMembers * = nullptr);
 Node parseExpression(llvm::StringRef, const Options &);
 std::string scopeKey(llvm::StringRef Prefix, llvm::StringRef Name,
                      llvm::function_ref<bool(const std::string &)> Contains);

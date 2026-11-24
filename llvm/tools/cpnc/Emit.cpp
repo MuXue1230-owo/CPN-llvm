@@ -1692,6 +1692,10 @@ Value Frame::call(const Node &C, const std::vector<Node> &Args,
         }
       }
     }
+    if (C.Settings.count("$confirm_member_family") &&
+        U.lookupPath(Receiver.Type, C.At, /*Method=*/false) &&
+        methodOwner(Receiver.Type, C.At).empty())
+      throw RelationalMemberBinding{C.At};
   } else if (C.K != Node::Name)
     fail(C.At, "callable expression required");
   auto Name = C.Text;

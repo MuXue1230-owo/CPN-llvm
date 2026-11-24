@@ -135,7 +135,6 @@ int main(int argc, char **argv) {
     if (O.StaticIdentityNamespace.empty())
       O.StaticIdentityNamespace = O.RootID;
     auto Source = read(Path);
-    auto AST = parse(Source, O);
     LLVMInitializeX86TargetInfo();
     LLVMInitializeX86Target();
     LLVMInitializeX86TargetMC();
@@ -148,12 +147,35 @@ int main(int argc, char **argv) {
     TargetOptions TO;
     std::unique_ptr<TargetMachine> TM(
         Target->createTargetMachine(TT, "generic", "", TO, Reloc::PIC_));
-    LLVMContext C;
-    Module M(O.RootID, C);
-    M.setSourceFileName(O.LogicalSource);
-    M.setTargetTriple(TT);
-    M.setDataLayout(TM->createDataLayout());
-    compile(M, AST, O);
+    std::unique_ptr<LLVMContext> IRContext;
+    std::unique_ptr<Module> IRModule;
+    RelationalMembers BoundRelationalMembers;
+    for (;;) {
+      std::string Notes;
+      auto Attempt = O;
+      Attempt.BufferedDiagnostics = &Notes;
+      try {
+        auto AST = parse(Source, Attempt, &BoundRelationalMembers);
+        IRModule.reset();
+        IRContext = std::make_unique<LLVMContext>();
+        IRModule = std::make_unique<Module>(O.RootID, *IRContext);
+        IRModule->setSourceFileName(O.LogicalSource);
+        IRModule->setTargetTriple(TT);
+        IRModule->setDataLayout(TM->createDataLayout());
+        compile(*IRModule, AST, Attempt);
+      } catch (const RelationalMemberBinding &Binding) {
+        if (!BoundRelationalMembers.emplace(Binding.At.Line, Binding.At.Column)
+                 .second)
+          fail(Binding.At, "could not bind member expression syntax");
+        continue;
+      } catch (...) {
+        errs() << Notes;
+        throw;
+      }
+      errs() << Notes;
+      break;
+    }
+    auto &M = *IRModule;
     if (verifyModule(M, &errs()))
       fail({}, "invalid generated LLVM module");
     if (O.Check)

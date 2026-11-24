@@ -1,3 +1,4 @@
+#include "ConstraintLogic.h"
 #include "Frontend.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/SaveAndRestore.h"
@@ -113,6 +114,8 @@ int precedence(const std::string &S) {
 class Parser {
   std::shared_ptr<std::vector<Token>> Tokens;
   size_t Pos = 0;
+  const RelationalMembers *BoundRelationalMembers = nullptr;
+  unsigned GenericDepth = 0;
   std::string Namespace;
   std::set<std::string> Types, HiddenTypes, TypeParameters;
   // The owner is the declaration identity, which survives lexical shadowing
@@ -147,18 +150,34 @@ class Parser {
     }
   };
   using Receivers = std::map<std::string, ReceiverType>;
+  using Site = std::pair<unsigned, unsigned>;
+  static Site sourceSite(const Token &At) { return {At.Line, At.Column}; }
   Receivers NominalReceivers, ValueReceivers, FieldReceivers;
-  std::map<std::pair<unsigned, unsigned>, ReceiverType> ReceiverDeclarations;
-  std::map<std::pair<unsigned, unsigned>, ReceiverType> ParameterTypes;
-  std::map<std::pair<unsigned, unsigned>, ReceiverType> NominalExpressions;
+  std::map<Site, ReceiverType> ReceiverDeclarations, ParameterTypes,
+      TypeArguments;
+  std::map<Site, ReceiverType> NominalExpressions;
   std::map<std::pair<unsigned, unsigned>, std::string>
       QualifiedMemberExpressions;
+  struct RequirementSite {
+    std::string Scope;
+    llvm::SmallVector<Node, 4> Parameters;
+    llvm::SmallVector<Node, 2> Conditions;
+    Token DefinedAt;
+    bool Pure = true;
+  };
+  std::map<std::string, std::shared_ptr<const RequirementSite>>
+      NamedRequirements;
   struct CallShape {
     size_t Required;
     std::optional<size_t> Maximum;
     ReceiverType Result;
     std::vector<ReceiverType> Parameters;
     std::optional<size_t> ResultDeduction;
+    std::shared_ptr<const RequirementSite> Requirements;
+    std::map<std::string, llvm::SmallVector<size_t, 2>> Deductions;
+    std::optional<std::vector<std::tuple<size_t, ReferenceKind, bool>>>
+        DirectPattern;
+    size_t TypeBinders = 0;
     bool Generic = false;
     bool Instance = false, Const = false;
     ReferenceKind Receiver = ReferenceKind::None;
@@ -232,7 +251,7 @@ class Parser {
           C.K == Node::Enumeration || C.K == Node::Union)
         Types.insert(Key);
       if (C.K == Node::Function && !C.Generics.empty())
-        publishMemberFamily(Key, C.Generics);
+        publishCallableFamily(Key, C.Generics);
       else if (!C.Generics.empty() || C.K == Node::Constraint)
         Families[Key] = C.Generics;
       if (C.K == Node::Alias)
@@ -243,9 +262,9 @@ class Parser {
   }
   std::map<std::string, Node> TypeQueries;
   std::map<std::string, std::vector<Node>> Families;
-  std::set<std::string> ConflictingMemberSchemas;
-  void publishMemberFamily(const std::string &Key,
-                           const std::vector<Node> &Parameters) {
+  std::set<std::string> ConflictingCallableSchemas;
+  void publishCallableFamily(const std::string &Key,
+                             const std::vector<Node> &Parameters) {
     auto &Previous = Families[Key];
     if (!Previous.empty() &&
         (Previous.size() != Parameters.size() ||
@@ -253,7 +272,7 @@ class Parser {
                      [](const Node &L, const Node &R) {
                        return L.K == R.K && L.Pack == R.Pack;
                      })))
-      ConflictingMemberSchemas.insert(Key);
+      ConflictingCallableSchemas.insert(Key);
     Previous = Parameters;
   }
   void publishCallResult(const std::string &Key, const ReceiverType &Result,
@@ -267,6 +286,45 @@ class Parser {
         Category != Function.Settings.end())
       Shape.Receiver = referenceKind(Category->second);
     const auto Params = llvm::ArrayRef(Function.Params);
+    if (Shape.Generic && llvm::all_of(Function.Generics, [](const Node &G) {
+          return G.K == Node::TypeParam && !G.Pack && G.Children.empty();
+        })) {
+      Shape.TypeBinders = Function.Generics.size();
+      Shape.DirectPattern.emplace();
+      for (const auto &P : Params) {
+        const auto &Type = Scope.ParameterTypes.at(sourceSite(P.At));
+        auto Binder = llvm::find_if(Function.Generics, [&](const Node &G) {
+          return G.Text == Type.TypeParameter;
+        });
+        if (P.Pack || !P.Children.empty() || !Type.Layers.empty() ||
+            Binder == Function.Generics.end() ||
+            StringRef(P.Type).starts_with("forward ")) {
+          Shape.DirectPattern.reset();
+          break;
+        }
+        Shape.DirectPattern->emplace_back(Binder - Function.Generics.begin(),
+                                          Type.Reference, Type.Readonly);
+      }
+    }
+    if (Shape.Generic && !Function.TemplateArgs.empty()) {
+      auto R = std::make_shared<RequirementSite>();
+      R->Scope = Scope.Namespace;
+      R->Parameters.append(Function.Generics.begin(), Function.Generics.end());
+      R->Conditions.push_back(Function.TemplateArgs.front());
+      R->DefinedAt = Function.At;
+      Shape.Requirements = std::move(R);
+      for (auto [I, P] : llvm::enumerate(Params)) {
+        const auto &Type = Scope.ParameterTypes.at(sourceSite(P.At));
+        StringRef Pattern(P.Type);
+        while (Pattern.consume_back("&")) {
+        }
+        if (Pattern.consume_front("const<"))
+          Pattern.consume_back(">");
+        if (!P.Pack && !Type.TypeParameter.empty() &&
+            Pattern == Type.TypeParameter)
+          Shape.Deductions[Pattern.str()].push_back(I);
+      }
+    }
     if (llvm::none_of(Params, [](const Node &P) { return P.Pack; })) {
       Shape.Maximum = Params.size();
       auto Defaulted = llvm::find_if(
@@ -297,6 +355,12 @@ class Parser {
                  Existing.Result == Result &&
                  Existing.Parameters == Shape.Parameters &&
                  Existing.ResultDeduction == Shape.ResultDeduction &&
+                 Existing.DirectPattern == Shape.DirectPattern &&
+                 Existing.TypeBinders == Shape.TypeBinders &&
+                 ((!Existing.Requirements && !Shape.Requirements) ||
+                  (Existing.Requirements && Shape.Requirements &&
+                   sourceSite(Existing.Requirements->DefinedAt) ==
+                       sourceSite(Shape.Requirements->DefinedAt))) &&
                  Existing.Generic == Shape.Generic &&
                  Existing.Instance == Shape.Instance &&
                  Existing.Const == Shape.Const &&
@@ -338,6 +402,288 @@ class Parser {
     Type.Scalar = std::move(Type.PointeeScalar);
     Type.PointeeScalar.clear();
     return lvalue(std::move(Type));
+  }
+  using BooleanBindings = std::map<std::string, bool>;
+  static std::string typeIdentity(const ReceiverType &T) {
+    if (T.Dependent || T.QualificationUnknown || T.CallableResult)
+      return {};
+    auto Identity = T.ExactNominal ? T.Owner : T.Scalar;
+    if (T.Layers == "*" && T.PointeeReadonly) {
+      Identity = T.ExactNominal ? T.Owner : T.PointeeScalar;
+      if (Identity.empty())
+        return {};
+      if (*T.PointeeReadonly)
+        Identity = "const<" + Identity + ">";
+      Identity += '*';
+    } else if (!T.Layers.empty()) {
+      return {};
+    }
+    if (Identity.empty() || Identity == "integer" || Identity == "real")
+      return {};
+    if (T.Readonly)
+      Identity = "const<" + Identity + ">";
+    if (T.Reference != ReferenceKind::None)
+      Identity += T.Reference == ReferenceKind::Lvalue ? "&" : "&&";
+    return Identity;
+  }
+  static const Node &argumentFor(const Node &N, bool Type) {
+    return N.K == Node::GenericArgument ? N.Children[Type ? 0 : 1] : N;
+  }
+  const RequirementSite *namedRequirement(const RequirementSite &At,
+                                          StringRef Name) const {
+    auto Key = scopeKey(At.Scope, Name, [&](const std::string &K) {
+      auto I = NamedRequirements.find(K);
+      return I != NamedRequirements.end() &&
+             sourceSite(I->second->DefinedAt) < sourceSite(At.DefinedAt);
+    });
+    return Key.empty() ? nullptr : NamedRequirements.at(Key).get();
+  }
+  ReceiverType requirementType(const Node &Argument,
+                               const Receivers &Bindings) const {
+    const auto &N = argumentFor(Argument, true);
+    auto Found = TypeArguments.find(sourceSite(N.At));
+    if (N.K != Node::TypeArg || Found == TypeArguments.end())
+      return {};
+    auto Type = Found->second;
+    if (!Type.Dependent)
+      return Type;
+    auto Bound = Bindings.find(Type.TypeParameter);
+    if (Bound == Bindings.end() || !Type.Layers.empty())
+      return {};
+    auto Result = Bound->second;
+    if (Type.Reference != ReferenceKind::None) {
+      if (Result.Reference != ReferenceKind::None)
+        return {};
+      Result.Reference = Type.Reference;
+    }
+    Result.Readonly |= Type.Readonly;
+    return Result;
+  }
+  std::optional<bool> requirementValue(const Node &N,
+                                       const RequirementSite &Site,
+                                       const Receivers &Types,
+                                       const BooleanBindings &Values,
+                                       unsigned &Budget) const {
+    if (!Budget)
+      return std::nullopt;
+    --Budget;
+    auto Evaluate = [&](const Node &Child) {
+      return requirementValue(Child, Site, Types, Values, Budget);
+    };
+    if (N.K == Node::Unary && N.Text == "!") {
+      if (auto Inner = Evaluate(N.Children.front()))
+        return !*Inner;
+    } else if (N.K == Node::Conditional) {
+      if (auto Condition = Evaluate(N.Children.front()))
+        return Evaluate(N.Children[*Condition ? 1 : 2]);
+    } else if (N.K == Node::Binary) {
+      if (N.Text == "&&" || N.Text == "||" || N.Text == "==" ||
+          N.Text == "!=") {
+        auto Left = Evaluate(N.Children.front());
+        if (!Left)
+          return std::nullopt;
+        if ((N.Text == "&&" && !*Left) || (N.Text == "||" && *Left))
+          return Left;
+        auto Right = Evaluate(N.Children.back());
+        if (!Right || N.Text == "&&" || N.Text == "||")
+          return Right;
+        return (*Left == *Right) == (N.Text == "==");
+      }
+    } else if (N.K == Node::Name) {
+      if (N.TemplateArgs.empty()) {
+        if (N.Text == "true" || N.Text == "false")
+          return N.Text == "true";
+        if (auto I = Values.find(N.Text); I != Values.end())
+          return I->second;
+      }
+      if (N.Text == "SameType" && N.TemplateArgs.size() == 2) {
+        auto L = typeIdentity(requirementType(N.TemplateArgs[0], Types));
+        auto R = typeIdentity(requirementType(N.TemplateArgs[1], Types));
+        if (!L.empty() && !R.empty())
+          return L == R;
+        return std::nullopt;
+      }
+      if (N.Text == "ObjectType" && N.TemplateArgs.size() == 1) {
+        auto T = requirementType(N.TemplateArgs.front(), Types);
+        if (!typeIdentity(T).empty())
+          return T.Scalar != "void" && T.Scalar != "never" &&
+                 T.Reference == ReferenceKind::None;
+        return std::nullopt;
+      }
+      if (const auto *Found = namedRequirement(Site, N.Text)) {
+        const auto &Named = *Found;
+        if (!Named.Pure || Named.Parameters.size() != N.TemplateArgs.size() ||
+            llvm::any_of(Named.Parameters,
+                         [](const Node &P) { return P.Pack; }))
+          return std::nullopt;
+        Receivers BoundTypes;
+        BooleanBindings BoundValues;
+        for (auto [I, P] : llvm::enumerate(Named.Parameters)) {
+          const auto &Argument = N.TemplateArgs[I];
+          if (Argument.Pack)
+            return std::nullopt;
+          if (P.K == Node::TypeParam)
+            BoundTypes[P.Text] = requirementType(Argument, Types);
+          else if (P.Type == "bool")
+            if (auto Value = Evaluate(argumentFor(Argument, false)))
+              BoundValues[P.Text] = *Value;
+        }
+        for (const auto &Condition : Named.Conditions) {
+          auto Value = requirementValue(Condition, Named, BoundTypes,
+                                        BoundValues, Budget);
+          if (!Value || !*Value)
+            return Value;
+        }
+        return true;
+      }
+    }
+    return std::nullopt;
+  }
+  std::optional<bool>
+  callRequirement(const CallShape &Shape, const Node &Callee,
+                  llvm::ArrayRef<ReceiverType> Actual) const {
+    if (!Shape.Requirements)
+      return true;
+    const auto &Site = *Shape.Requirements;
+    if (llvm::any_of(Callee.TemplateArgs,
+                     [](const Node &A) { return A.Pack; }) ||
+        llvm::any_of(Site.Parameters, [](const Node &P) { return P.Pack; }))
+      return std::nullopt;
+    Receivers Types;
+    BooleanBindings Values;
+    unsigned Budget = 128;
+    RequirementSite Caller;
+    Caller.Scope = Namespace;
+    Caller.DefinedAt = Callee.At;
+    for (auto [Index, Param] : llvm::enumerate(Site.Parameters)) {
+      if (Index < Callee.TemplateArgs.size()) {
+        const auto &Argument = Callee.TemplateArgs[Index];
+        if (Param.K == Node::TypeParam)
+          Types[Param.Text] = requirementType(Argument, {});
+        else if (Param.Type == "bool")
+          if (auto Value = requirementValue(argumentFor(Argument, false),
+                                            Caller, {}, {}, Budget))
+            Values[Param.Text] = *Value;
+        continue;
+      }
+      if (Param.K != Node::TypeParam)
+        continue;
+      auto Source = Shape.Deductions.find(Param.Text);
+      if (Source == Shape.Deductions.end())
+        continue;
+      ReceiverType Binding;
+      std::string Identity;
+      for (auto I : Source->second) {
+        if (I >= Actual.size())
+          continue;
+        auto Deduced = Actual[I];
+        Deduced.Readonly = false;
+        Deduced.Reference = ReferenceKind::None;
+        auto Key = typeIdentity(Deduced);
+        if (Key.empty() || (!Identity.empty() && Identity != Key)) {
+          Identity.clear();
+          break;
+        }
+        Identity = std::move(Key);
+        Binding = std::move(Deduced);
+      }
+      if (!Identity.empty())
+        Types.emplace(Param.Text, std::move(Binding));
+    }
+    return requirementValue(Site.Conditions.front(), Site, Types, Values,
+                            Budget);
+  }
+  using Formula = ConstraintLogic::Formula;
+  std::optional<Formula> constraintFormula(const Node &N,
+                                           const RequirementSite &At,
+                                           const Receivers &Bindings,
+                                           ConstraintLogic &Logic,
+                                           unsigned Depth) const {
+    Logic.chargeVisit(Depth);
+    auto Build = [&](const Node &Child) {
+      return constraintFormula(Child, At, Bindings, Logic, Depth + 1);
+    };
+    if (N.K == Node::Unary && N.Text == "!") {
+      if (auto Value = Build(N.Children.front()))
+        return Logic.negate(*Value);
+    } else if (N.K == Node::Binary && (N.Text == "&&" || N.Text == "||")) {
+      auto L = Build(N.Children.front());
+      if (!L || *L == (N.Text == "&&" ? 0u : 1u))
+        return L;
+      if (auto R = Build(N.Children.back()))
+        return N.Text == "&&" ? Logic.conjunction(*L, *R)
+                              : Logic.disjunction(*L, *R);
+    } else if (N.K == Node::Name) {
+      if (N.Text == "true" || N.Text == "false")
+        return N.Text == "true";
+      if (builtinPredicate(N.Text)) {
+        std::string Key = N.Text;
+        bool Symbolic = false;
+        for (const auto &A : N.TemplateArgs) {
+          auto Type = typeIdentity(requirementType(A, Bindings));
+          if (Type.empty() || A.Pack)
+            return std::nullopt;
+          Symbolic |= StringRef(Type).contains("$constraint.");
+          Key += "(" + Type + ")";
+        }
+        if (Symbolic)
+          return Logic.variable(Key);
+        unsigned Budget = 128;
+        if (auto Value = requirementValue(N, At, Bindings, {}, Budget))
+          return unsigned(*Value);
+      } else if (const auto *Named = namedRequirement(At, N.Text)) {
+        if (!Named->Pure || Named->Parameters.size() != N.TemplateArgs.size())
+          return std::nullopt;
+        Receivers Nested;
+        for (auto [I, P] : llvm::enumerate(Named->Parameters)) {
+          if (P.K != Node::TypeParam || P.Pack || N.TemplateArgs[I].Pack)
+            return std::nullopt;
+          Nested[P.Text] = requirementType(N.TemplateArgs[I], Bindings);
+        }
+        Formula Result = 1;
+        for (const auto &Clause : Named->Conditions) {
+          auto F = constraintFormula(Clause, *Named, Nested, Logic, Depth + 1);
+          if (!F)
+            return std::nullopt;
+          Result = Logic.conjunction(Result, *F);
+          if (!Result)
+            break;
+        }
+        return Result;
+      }
+    }
+    return std::nullopt;
+  }
+  std::optional<Formula> constraintFormula(const CallShape &Shape,
+                                           ConstraintLogic &Logic) const {
+    if (!Shape.Requirements)
+      return 1;
+    const auto &At = *Shape.Requirements;
+    Receivers Bindings;
+    for (auto [I, P] : llvm::enumerate(At.Parameters))
+      Bindings[P.Text] = scalarReceiver("$constraint." + std::to_string(I));
+    return constraintFormula(At.Conditions.front(), At, Bindings, Logic, 0);
+  }
+  bool strongerRequirements(const CallShape &L, const CallShape &R,
+                            const Token &At) const {
+    if (!L.Requirements || !L.DirectPattern ||
+        L.DirectPattern != R.DirectPattern || L.TypeBinders != R.TypeBinders ||
+        L.Instance != R.Instance || L.Const != R.Const ||
+        L.Receiver != R.Receiver)
+      return false;
+    unsigned Steps = 0;
+    ConstraintLogic Logic([&](unsigned Depth) {
+      if (Depth > 128 || ++Steps > 2048)
+        throw ResourceExhausted{
+            {At, "constraint syntax binding resource exhausted"}};
+    });
+    try {
+      auto A = constraintFormula(L, Logic), B = constraintFormula(R, Logic);
+      return A && B && Logic.stronger(*A, *B);
+    } catch (const ResourceExhausted &) {
+      // Semantic binding owns the configured solver budget and its diagnostics.
+      return false;
+    }
   }
   struct ConversionEvidence {
     unsigned Minimum = 0;
@@ -451,6 +797,8 @@ class Parser {
       struct Candidate {
         ReceiverType Result;
         llvm::SmallVector<ConversionEvidence, 4> Ranks;
+        const CallShape *Shape;
+        bool RequirementsHold;
       };
       llvm::SmallVector<ReceiverType, 4> Types;
       if (!Expanded)
@@ -461,7 +809,12 @@ class Parser {
         if ((Callee.ExplicitApplication && !Overload.Generic) ||
             (!Expanded && !Overload.accepts(Args.size())))
           continue;
-        Candidate C{Overload.Result};
+        auto Requirement = Expanded ? std::optional<bool>{}
+                                    : callRequirement(Overload, Callee, Types);
+        if (Requirement && !*Requirement)
+          continue;
+        Candidate C{
+            Overload.Result, {}, &Overload, Requirement.value_or(false)};
         if (!Expanded && !Callee.ExplicitApplication &&
             Overload.ResultDeduction &&
             *Overload.ResultDeduction < Types.size()) {
@@ -508,15 +861,22 @@ class Parser {
         C.Ranks.push_back(ReceiverRank);
         Viable.push_back(std::move(C));
       }
+      if (!Viable.empty() && llvm::all_of(Viable, [&](const Candidate &C) {
+            return C.Result == Viable.front().Result;
+          }))
+        return Viable.front().Result;
       const ReceiverType *Uniform = nullptr;
-      auto Better = [](const Candidate &A, const Candidate &B) {
+      auto Better = [&](const Candidate &A, const Candidate &B) {
         bool Strict = false;
+        bool Dominates = true;
         for (size_t I = 0; I < A.Ranks.size(); ++I) {
           if (!A.Ranks[I].Exact || A.Ranks[I].Minimum > B.Ranks[I].Minimum)
-            return false;
+            Dominates = false;
           Strict |= A.Ranks[I].Minimum < B.Ranks[I].Minimum;
         }
-        return Strict;
+        return (Dominates && Strict) ||
+               (A.RequirementsHold && A.Shape != B.Shape &&
+                strongerRequirements(*A.Shape, *B.Shape, Callee.At));
       };
       for (const auto &C : Viable) {
         if (llvm::any_of(Viable,
@@ -653,6 +1013,39 @@ class Parser {
       }
     }
     return {};
+  }
+  bool canConfirmMember(const Node &Receiver) const {
+    if (!BoundRelationalMembers)
+      return false;
+    if (!GenericDepth)
+      return true;
+    // A plain free call with no runtime arguments and only fixed explicit
+    // arguments has the same receiver type in every instantiation.
+    if (!CurrentReceiver.Owner.empty() || Receiver.K != Node::Call ||
+        Receiver.Children.size() != 1)
+      return false;
+    const auto &Callee = Receiver.Children.front();
+    if (Callee.K != Node::Name || !Callee.ExplicitApplication ||
+        Callee.TemplateArgs.empty() || ValueReceivers.count(Callee.Text) ||
+        NominalExpressions.count(sourceSite(Callee.At)) ||
+        StringRef(Callee.Text).contains('<') ||
+        scopeKey(Namespace, Callee.Text, [&](const std::string &K) {
+          return CallResults.count(K);
+        }).empty())
+      return false;
+    return llvm::all_of(Callee.TemplateArgs, [&](const Node &Argument) {
+      if (Argument.Pack)
+        return false;
+      if (Argument.K == Node::TypeArg) {
+        auto Shape = TypeArguments.find(sourceSite(Argument.At));
+        return Shape != TypeArguments.end() &&
+               !typeIdentity(Shape->second).empty();
+      }
+      return Argument.K == Node::Number || Argument.K == Node::Real ||
+             Argument.K == Node::Character ||
+             (Argument.K == Node::Name &&
+              (Argument.Text == "true" || Argument.Text == "false"));
+    });
   }
   std::optional<std::string> memberFamily(const Node &N, const Token &Member,
                                           bool Pointer) const {
@@ -856,7 +1249,7 @@ class Parser {
           closeAngle();
         } else if (UnresolvedIndexType ||
                    (Application &&
-                    ConflictingMemberSchemas.count(ArgumentSchema)))
+                    ConflictingCallableSchemas.count(ArgumentSchema)))
           Args = deferredTemplateArgs();
         else
           Args = templateArgs(ArgumentSchema, &Canonical, BitArgumentsAreTypes);
@@ -935,6 +1328,15 @@ class Parser {
     } else
       expect(">");
   }
+  Node typeArgument() {
+    Node A(Node::TypeArg, peek());
+    if (!A.At.Text.empty() && llvm::isDigit(A.At.Text.front()))
+      fail(A.At, "expected a type argument");
+    ReceiverType Shape;
+    A.Type = type(nullptr, &Shape);
+    TypeArguments[sourceSite(A.At)] = std::move(Shape);
+    return A;
+  }
   std::vector<Node> templateArgs(const std::string &Name,
                                  std::string *Canonical = nullptr,
                                  std::optional<bool> ArgumentIsType = {}) {
@@ -957,13 +1359,9 @@ class Parser {
                    : ArgumentIsType.value_or(integerLibraryName(Name, true) ||
                                              floatingSpecialName(Name) ||
                                              known(peek().Text));
-      if (T) {
-        Node A(Node::TypeArg, peek());
-        if (!A.At.Text.empty() && llvm::isDigit(A.At.Text.front()))
-          fail(A.At, "expected a type argument");
-        A.Type = type();
-        Out.push_back(A);
-      } else {
+      if (T)
+        Out.push_back(typeArgument());
+      else {
         if (is("const") && peek(1).Text == "<")
           fail(peek(), "expected a constant argument");
         Out.push_back(expr(1, true));
@@ -1019,8 +1417,7 @@ class Parser {
     Parser TypeParse(*this);
     std::optional<Node> Type, Value;
     try {
-      Node Candidate(Node::TypeArg, At);
-      Candidate.Type = TypeParse.type();
+      auto Candidate = TypeParse.typeArgument();
       if (TypeParse.argumentDelimiter())
         Type = std::move(Candidate);
     } catch (const Diagnostic &) {
@@ -1046,6 +1443,7 @@ class Parser {
         std::tie(peek().Line, peek().Column))
       fail(At, "ambiguous generic argument boundary");
     TypeQueries.merge(TypeParse.TypeQueries);
+    TypeArguments.merge(TypeParse.TypeArguments);
     Node Both(Node::GenericArgument, At);
     Both.Children.push_back(std::move(*Type));
     Both.Children.push_back(std::move(*Value));
@@ -1361,10 +1759,11 @@ class Parser {
           N = std::move(C);
         } else {
           Node M(Node::Member, Id);
-          if (is("<")) {
+          if (is("<") && (!BoundRelationalMembers ||
+                          !BoundRelationalMembers->count(sourceSite(Id)))) {
             auto Schema = memberFamily(N, Id, Ptr);
             if (Schema && !Schema->empty()) {
-              M.TemplateArgs = ConflictingMemberSchemas.count(*Schema)
+              M.TemplateArgs = ConflictingCallableSchemas.count(*Schema)
                                    ? deferredTemplateArgs()
                                    : templateArgs(*Schema);
               M.ExplicitApplication = true;
@@ -1373,6 +1772,8 @@ class Parser {
               if (auto Arguments = deferredMemberApplication()) {
                 M.TemplateArgs = std::move(*Arguments);
                 M.ExplicitApplication = true;
+                if (canConfirmMember(N))
+                  M.Settings["$confirm_member_family"] = "";
               }
             }
           }
@@ -2233,7 +2634,7 @@ class Parser {
       auto Key = Receiver.Owner + "::" + D.Text;
       OwnMembers.insert(Key);
       if (!D.Generics.empty() && D.K == Node::Function)
-        publishMemberFamily(Key, D.Generics);
+        publishCallableFamily(Key, D.Generics);
       if (D.K == Node::Field)
         FieldReceivers[Key] = ValueReceivers.at(D.Text);
       R.Children.push_back(std::move(D));
@@ -2249,7 +2650,7 @@ class Parser {
       auto Key = Receiver.Owner + "::" + Member.Text;
       OwnMembers.insert(Key);
       if (Member.K == Node::Function && !Member.Generics.empty())
-        publishMemberFamily(Key, Member.Generics);
+        publishCallableFamily(Key, Member.Generics);
       if (Member.K == Node::Function)
         publishCallResult(
             Key,
@@ -2303,6 +2704,7 @@ class Parser {
       // The normal parse owns diagnostics for headers.
       return;
     }
+    TypeArguments.merge(Index.TypeArguments);
     importRecordMembers(Index, Header, Receiver, true);
   }
 
@@ -2367,6 +2769,7 @@ class Parser {
       Node N(Node::Constraint, name());
       auto Saved = Types;
       N.Generics = generic();
+      llvm::SaveAndRestore GenericScope(GenericDepth, GenericDepth + 1);
       Families[N.Text] = N.Generics;
       expect("{");
       while (!eat("}")) {
@@ -2410,6 +2813,18 @@ class Parser {
         N.Children.push_back(Rule);
       }
       expect(";");
+      auto Required = std::make_shared<RequirementSite>();
+      Required->Scope = Namespace;
+      Required->DefinedAt = N.At;
+      Required->Parameters.append(N.Generics.begin(), N.Generics.end());
+      for (const auto &Rule : N.Children) {
+        if (Rule.Text != "requires") {
+          Required->Pure = false;
+          break;
+        }
+        Required->Conditions.push_back(Rule.Children.front());
+      }
+      NamedRequirements[Namespace + N.Text] = std::move(Required);
       Types = std::move(Saved);
       return N;
     }
@@ -2432,6 +2847,7 @@ class Parser {
     std::vector<Node> G;
     if (eat("generic"))
       G = generic();
+    llvm::SaveAndRestore GenericScope(GenericDepth, GenericDepth + !G.empty());
     Node Requires;
     if (!G.empty() && eat("requires"))
       Requires = condition();
@@ -2625,7 +3041,7 @@ class Parser {
     if (Eval)
       F.Settings["mode"] = "consteval";
     if (!G.empty() && Q.empty())
-      Families[Id.Text] = G;
+      publishCallableFamily(Id.Text, G);
     if (Requires.K != Node::Empty)
       F.TemplateArgs.push_back(std::move(Requires));
     llvm::SaveAndRestore ReceiverBindings(ValueReceivers);
@@ -2669,8 +3085,10 @@ class Parser {
   }
 
 public:
-  explicit Parser(std::vector<Token> T)
-      : Tokens(std::make_shared<std::vector<Token>>(std::move(T))) {
+  explicit Parser(std::vector<Token> T,
+                  const RelationalMembers *Bound = nullptr)
+      : Tokens(std::make_shared<std::vector<Token>>(std::move(T))),
+        BoundRelationalMembers(Bound) {
     Types.insert({"std::Unit", "std::AccessError", "std::Ref",
                   "std::ScalarError", "std::Result"});
     Types.insert({"std::mem::StorageView", "std::mem::StorageIdentity"});
@@ -2706,8 +3124,9 @@ public:
   }
 };
 } // namespace
-std::vector<Node> cpn::parse(StringRef S, const Options &O) {
-  return Parser(lex(S, O)).unit();
+std::vector<Node> cpn::parse(StringRef S, const Options &O,
+                             const RelationalMembers *Bound) {
+  return Parser(lex(S, O), Bound).unit();
 }
 Node cpn::parseExpression(StringRef S, const Options &O) {
   return Parser(lex(S, O, true)).expression();

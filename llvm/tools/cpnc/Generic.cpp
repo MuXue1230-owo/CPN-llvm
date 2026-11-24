@@ -1,3 +1,4 @@
+#include "ConstraintLogic.h"
 #include "Sema.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
@@ -708,65 +709,17 @@ std::string constantIdentity(const Value &);
 // Comparing A with B checks whether A && !B is unsatisfiable, without
 // identifying different arithmetic predicates using their concrete results.
 class ConstraintOrdering {
-  using Formula = unsigned;
+  using Formula = ConstraintLogic::Formula;
   using Symbols = std::map<std::string, std::string>;
-  using Decision = std::tuple<unsigned, Formula, Formula>;
   Frame Probe;
   const Token &At;
-  std::map<std::string, unsigned> Atoms;
-  std::vector<Decision> Nodes{{}, {}};
-  std::map<Decision, Formula> Unique;
-  std::map<std::pair<Formula, Formula>, Formula> Conjunctions;
-  std::map<Formula, Formula> Negations;
+  ConstraintLogic Logic;
   std::set<std::string> Expanding;
 
   void charge(unsigned Depth) {
     Probe.U.chargeSolver(At);
-    if (Depth > 512 || Nodes.size() - 2 > Probe.Opt.MaxNormalNodes)
+    if (Depth > 512 || Logic.nodeCount() > Probe.Opt.MaxNormalNodes)
       throw ResourceExhausted{{At, "constraint ordering resource exhausted"}};
-  }
-  Formula node(unsigned Atom, Formula False, Formula True) {
-    if (False == True)
-      return False;
-    Decision Key{Atom, False, True};
-    auto [I, New] = Unique.try_emplace(Key, Nodes.size());
-    if (New)
-      Nodes.push_back(Key);
-    return I->second;
-  }
-  Formula variable(const std::string &Key) {
-    auto I = Atoms.try_emplace(Key, Atoms.size()).first;
-    return node(I->second, 0, 1);
-  }
-  Formula negate(Formula F, unsigned Depth = 0) {
-    if (F < 2)
-      return 1 - F;
-    if (auto I = Negations.find(F); I != Negations.end())
-      return I->second;
-    charge(Depth);
-    auto [Atom, False, True] = Nodes[F];
-    auto Result = node(Atom, negate(False, Depth + 1), negate(True, Depth + 1));
-    Negations.emplace(F, Result);
-    return Result;
-  }
-  Formula conjunction(Formula L, Formula R, unsigned Depth = 0) {
-    if (L > R)
-      std::swap(L, R);
-    if (L == 0 || L == R)
-      return L;
-    if (L == 1)
-      return R;
-    if (auto I = Conjunctions.find({L, R}); I != Conjunctions.end())
-      return I->second;
-    charge(Depth);
-    auto [LA, LF, LT] = Nodes[L];
-    auto [RA, RF, RT] = Nodes[R];
-    unsigned Top = std::min(LA, RA);
-    auto False = conjunction(LA == Top ? LF : L, RA == Top ? RF : R, Depth + 1);
-    auto True = conjunction(LA == Top ? LT : L, RA == Top ? RT : R, Depth + 1);
-    auto Result = node(Top, False, True);
-    Conjunctions.emplace(std::pair(L, R), Result);
-    return Result;
   }
   std::string spelling(StringRef Text, const Symbols &Bindings) {
     std::string Key;
@@ -894,8 +847,8 @@ class ConstraintOrdering {
     // share identity with the same application even before its length is known.
     if (!F.Decl.Generics.empty() && F.Decl.Generics.back().Pack) {
       if (llvm::any_of(N.TemplateArgs, [](const Node &A) { return A.Pack; }))
-        return variable(F.Prefix + F.Decl.Text + ":" +
-                        atomKey(N, Caller, Depth));
+        return Logic.variable(F.Prefix + F.Decl.Text + ":" +
+                              atomKey(N, Caller, Depth));
       auto Fixed = F.Decl.Generics.size() - 1;
       auto Count =
           N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0;
@@ -927,7 +880,7 @@ class ConstraintOrdering {
     llvm::SaveAndRestore Env(Probe.Env, F.Enclosing);
     for (auto [I, P] : llvm::enumerate(F.Decl.Generics)) {
       if (I >= Explicit.size() && P.Children.empty())
-        return variable("constraint:" + Application + ">/missing");
+        return Logic.variable("constraint:" + Application + ">/missing");
       auto Term = I < Explicit.size()
                       ? std::move(Explicit[I])
                       : bindArgument(P, P.Children.front(), Arguments);
@@ -965,9 +918,9 @@ class ConstraintOrdering {
       Formula Requirement = Rule.Text == "requires"
                                 ? build(Rule.Children.front(), Arguments,
                                         Depth + 1, Reached && Result == 1)
-                                : variable("requirement:" + Application + ">/" +
-                                           std::to_string(I));
-      Result = conjunction(Result, Requirement);
+                                : Logic.variable("requirement:" + Application +
+                                                 ">/" + std::to_string(I));
+      Result = Logic.conjunction(Result, Requirement);
     }
     return Result;
   }
@@ -977,7 +930,8 @@ class ConstraintOrdering {
     if (N.K == Node::Name && (N.Text == "true" || N.Text == "false"))
       return N.Text == "true";
     if (N.K == Node::Unary && N.Text == "!")
-      return negate(build(N.Children.front(), Bindings, Depth + 1, Reached));
+      return Logic.negate(
+          build(N.Children.front(), Bindings, Depth + 1, Reached));
     if (N.K == Node::Binary && (N.Text == "&&" || N.Text == "||")) {
       bool And = N.Text == "&&";
       auto L = build(N.Children.front(), Bindings, Depth + 1, Reached);
@@ -985,8 +939,7 @@ class ConstraintOrdering {
         return L;
       auto R = build(N.Children.back(), Bindings, Depth + 1,
                      Reached && L == (And ? 1u : 0u));
-      return And ? conjunction(L, R)
-                 : negate(conjunction(negate(L), negate(R)));
+      return And ? Logic.conjunction(L, R) : Logic.disjunction(L, R);
     }
     if (N.K == Node::Name)
       if (const auto *F = Probe.constraint(N.Text))
@@ -994,7 +947,8 @@ class ConstraintOrdering {
     if (auto V = evaluate(N, Bindings, Reached); V && V->Type == "bool")
       return llvm::cast<llvm::ConstantInt>(V->IR)->isOne();
     auto Key = atomKey(N, Bindings, Depth);
-    return variable(builtinPredicate(N.Text) ? Key : Key + "@" + policyKey());
+    return Logic.variable(builtinPredicate(N.Text) ? Key
+                                                   : Key + "@" + policyKey());
   }
   Formula buildFamily(const Family &F, llvm::ArrayRef<Node> Requirements) {
     Probe.Prefix = F.Prefix;
@@ -1014,19 +968,20 @@ class ConstraintOrdering {
     for (const auto &R : Requirements) {
       if (Result == 0)
         break;
-      Result = conjunction(Result, build(R, Parameters, 0, Result == 1));
+      Result = Logic.conjunction(Result, build(R, Parameters, 0, Result == 1));
     }
     return Result;
   }
 
 public:
   ConstraintOrdering(Context &U, const Token &At)
-      : Probe(U, nullptr, nullptr), At(At) {}
+      : Probe(U, nullptr, nullptr), At(At),
+        Logic([this](unsigned Depth) { charge(Depth); }) {}
   bool stronger(const Family &A, llvm::ArrayRef<Node> Left, const Family &B,
                 llvm::ArrayRef<Node> Right) {
     auto L = buildFamily(A, Left);
     auto R = buildFamily(B, Right);
-    return L != R && conjunction(L, negate(R)) == 0;
+    return Logic.stronger(L, R);
   }
 };
 

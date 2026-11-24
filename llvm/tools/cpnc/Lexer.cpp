@@ -122,9 +122,16 @@ void Options::diagnose(const Token &T, Severity Level, StringRef Code,
   auto Text = Code.empty() ? Message.str() : (Code + ": " + Message).str();
   if (Promote.count(Category) || Promote.count(Code.str()))
     fail(T, Text);
-  if (Level >= Minimum && !Suppress.count(Code.str()))
+  if (Level < Minimum || Suppress.count(Code.str()))
+    return;
+  if (BufferedDiagnostics) {
+    llvm::raw_string_ostream Out(*BufferedDiagnostics);
+    Out << Input << ":" << T.Line << ":" << T.Column << ": " << Category << ": "
+        << Text << "\n";
+  } else {
     llvm::errs() << Input << ":" << T.Line << ":" << T.Column << ": "
                  << Category << ": " << Text << "\n";
+  }
 }
 void Options::warn(const Token &T, StringRef Message) const {
   diagnose(T, Severity::Warning, "", Message);
