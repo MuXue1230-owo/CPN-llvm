@@ -3765,6 +3765,29 @@ class CompilerTests(unittest.TestCase):
     def test_structural_result_categories_effects_and_special_members(self):
         self.assertEqual(
             self.program("""
+                constraint Item<type T> {expression(T& x){x.item -> i32&;}};
+                generic<type T> requires(Item<T>) i32 inspect(T& value){
+                    alias Member=decltype(value.item);
+                    if constexpr(SameType<Member,i32&>){return value.item;}
+                    else{return 0;}
+                }
+                struct Value{i32 item(42);};
+                i32 main(){Value value;return inspect(value);}
+            """),
+            42,
+        )
+        for usage in (
+            "alias Member=decltype(value.item);",
+            "if constexpr(SameType<decltype(value.item),i32&>){return 1;}",
+        ):
+            checked = self.compile(
+                "generic<type T> i32 unused(T& value){" + usage + "return 0;}",
+                "--check",
+            )
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            self.assertIn("dependent operation", checked.stderr)
+        self.assertEqual(
+            self.program("""
             namespace checks {
                 constraint Borrow<type T>{
                     expression(T& v){v.get()->i32& noexcept;}
@@ -4607,6 +4630,32 @@ class CompilerTests(unittest.TestCase):
         """),
             42,
         )
+        self.assertEqual(
+            self.program("""
+                generic<type T> T value(){return T();}
+                generic<type... Ts> i32 result(){return 42;}
+                generic<type... Ts> struct Types{};
+                generic<type... Ts> struct Wrapped{
+                    alias Result=decltype(result<Ts...>());
+                    alias Elements=Types<decltype(value<Ts>())...>;
+                };
+                i32 sum(){return 0;}
+                i32 sum(i32 left,i32 right){return left+right;}
+                generic<type... Ts> i32 inspect(Ts... values){
+                    alias Viewed=decltype(sum(values...));
+                    if constexpr(SameType<Viewed,i32>){return sum(values...);}
+                    else{return 1;}
+                }
+                i32 main(){
+                    if constexpr(SameType<Wrapped<i8,i64>::Result,i32> &&
+                                 SameType<Wrapped<i8,i64>::Elements,Types<i8,i64>> &&
+                                 SameType<Wrapped<>::Elements,Types<>>){
+                        return inspect(19,23)+inspect();
+                    }else{return 2;}
+                }
+            """),
+            42,
+        )
         for source, diagnostic in [
             ("generic<type... Ts,type U> void f(){}", "last parameter"),
             ("generic<type... Ts=i32> void f(){}", "cannot have a default"),
@@ -4632,6 +4681,15 @@ class CompilerTests(unittest.TestCase):
                 "generic<type... Ts> struct Types{}; "
                 "generic<type T> struct Unused{alias Bad=Types<T...>;};",
                 "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type... Ts> i32 result(){return 0;} "
+                "generic<type T> struct Unused{alias Bad=decltype(result<T...>());};",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type T> struct Unused{alias Bad=decltype(missing());};",
+                "unknown name 'missing'",
             ),
             (
                 "generic<type T> void f(function<void(T...)>* fn){}",

@@ -580,7 +580,8 @@ std::string Frame::resolve(std::string S, const Token &At) {
           splitArguments(StringRef(S).slice(S.find('<') + 1, S.size() - 1));
       if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack) {
         auto Fixed = Fam.Decl.Generics.size() - 1;
-        Fam = expand(Fam, Parts.size() > Fixed ? Parts.size() - Fixed : 0, At);
+        Fam =
+            expand(U, Fam, Parts.size() > Fixed ? Parts.size() - Fixed : 0, At);
       }
       for (size_t I = 0; I < Parts.size(); ++I) {
         if (I >= Fam.Decl.Generics.size())
@@ -1525,8 +1526,9 @@ void Context::attachGenericBody(Function &F, const Family &FamilyDecl) {
   auto Bindings = FamilyDecl.BodyBindings;
   if (Body.Generics.back().Pack) {
     Family Source{Body, FamilyDecl.Prefix, *FamilyDecl.BodySite, Bindings};
-    auto Expanded = expand(
-        Source, Public.Generics.size() - (Body.Generics.size() - 1), Body.At);
+    auto Expanded =
+        expand(*this, Source,
+               Public.Generics.size() - (Body.Generics.size() - 1), Body.At);
     Body = std::move(Expanded.Decl);
     Bindings.PackLengths = std::move(Expanded.Enclosing.PackLengths);
   }

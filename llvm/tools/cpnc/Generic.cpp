@@ -55,6 +55,26 @@ StringRef quotedSpelling(StringRef S) {
   return S;
 }
 
+const Node *takeTypeQuery(const Context &U, StringRef &Text) {
+  StringRef Site = Text;
+  if (!Site.consume_front("$decltype."))
+    return nullptr;
+  auto Line = Site.take_while(llvm::isDigit);
+  Site = Site.drop_front(Line.size());
+  if (Line.empty() || !Site.consume_front("."))
+    return nullptr;
+  auto Column = Site.take_while(llvm::isDigit);
+  if (Column.empty())
+    return nullptr;
+  auto End = Site.drop_front(Column.size());
+  auto Key = Text.take_front(Text.size() - End.size());
+  auto Found = U.TypeQueries.find(Key.str());
+  if (Found == U.TypeQueries.end())
+    return nullptr;
+  Text = End;
+  return &Found->second;
+}
+
 std::string substitute(StringRef S, const std::set<std::string> &Names,
                        size_t Index) {
   std::string R;
@@ -114,12 +134,18 @@ struct PackExpansion {
   size_t Count, Index = 0;
 };
 
-void unexpandedNames(StringRef Text, llvm::function_ref<void(StringRef)> Use) {
+void unexpandedNames(const Context &, const Node &,
+                     llvm::function_ref<void(StringRef)>);
+
+void unexpandedNames(const Context &U, StringRef Text,
+                     llvm::function_ref<void(StringRef)> Use) {
   auto Words = [&](StringRef S) {
     const auto *Begin = S.data();
     while (!S.empty()) {
       if (S.front() == '\'' || S.front() == '"')
         S = S.drop_front(quotedSpelling(S).size());
+      else if (auto *Query = takeTypeQuery(U, S))
+        unexpandedNames(U, Query->Children.front(), Use);
       else if (identifierByte(S.front())) {
         auto Name = S.take_while(identifierByte);
         if (S.data() - Begin < 2 || StringRef(S.data() - 2, 2) != "::")
@@ -137,40 +163,43 @@ void unexpandedNames(StringRef Text, llvm::function_ref<void(StringRef)> Use) {
   }
   auto Callable = splitCallableType(Text.take_front(Close + 1));
   if (Callable)
-    unexpandedNames(Callable->Result, Use);
+    unexpandedNames(U, Callable->Result, Use);
   else
     Words(Text.take_front(Open));
   auto List = Callable ? Callable->Parameters : Text.slice(Open + 1, Close);
   for (const auto &Item : splitArguments(List))
     if (!StringRef(Item).ends_with("..."))
-      unexpandedNames(Item, Use);
-  unexpandedNames(Text.drop_front(Close + 1), Use);
+      unexpandedNames(U, Item, Use);
+  unexpandedNames(U, Text.drop_front(Close + 1), Use);
 }
 
-void unexpandedNames(const Node &N, llvm::function_ref<void(StringRef)> Use) {
+void unexpandedNames(const Context &U, const Node &N,
+                     llvm::function_ref<void(StringRef)> Use) {
   if (N.K != Node::Parameter && N.K != Node::Member)
-    unexpandedNames(N.Text, Use);
-  unexpandedNames(N.Type, Use);
+    unexpandedNames(U, N.Text, Use);
+  unexpandedNames(U, N.Type, Use);
   for (const auto &C : N.Children)
     if (!C.Pack)
-      unexpandedNames(C, Use);
+      unexpandedNames(U, C, Use);
   for (const auto &A : N.TemplateArgs)
     if (!A.Pack)
-      unexpandedNames(A, Use);
+      unexpandedNames(U, A, Use);
 }
 
 template <typename Pattern>
-bool usesPack(const Pattern &P, llvm::function_ref<bool(StringRef)> IsPack) {
+bool usesPack(const Context &U, const Pattern &P,
+              llvm::function_ref<bool(StringRef)> IsPack) {
   bool Found = false;
-  unexpandedNames(P, [&](StringRef Name) { Found = Found || IsPack(Name); });
+  unexpandedNames(U, P, [&](StringRef Name) { Found = Found || IsPack(Name); });
   return Found;
 }
 
 template <typename Operand>
-PackReferences referencedPacks(const Operand &Pattern, const PackLengths &Known,
+PackReferences referencedPacks(const Context &U, const Operand &Pattern,
+                               const PackLengths &Known,
                                const PackNames &Deferred) {
   PackReferences References;
-  unexpandedNames(Pattern, [&](StringRef Name) {
+  unexpandedNames(U, Pattern, [&](StringRef Name) {
     if (Deferred.count(Name.str()))
       References.Deferred = true;
     else if (Known.count(Name.str()))
@@ -238,12 +267,20 @@ expandCallableFlags(StringRef Type,
          effectFlags(Effects) + predicateEffectFlags(Predicate);
 }
 
-std::string expandPackLists(StringRef Text, const PackLengths &Known,
-                            const PackNames &Deferred,
-                            const PackExpansion *Expansion, const Token &At) {
+using QueryRewriter =
+    llvm::function_ref<std::string(StringRef, const PackExpansion *)>;
+
+std::string expandPackLists(const Context &U, StringRef Text,
+                            const PackLengths &Known, const PackNames &Deferred,
+                            const PackExpansion *Expansion, const Token &At,
+                            QueryRewriter RewriteQueries) {
   auto Rewrite = [&](StringRef Part) {
-    return Expansion ? substitute(Part, Expansion->Names, Expansion->Index)
-                     : Part.str();
+    auto Spelling = Expansion
+                        ? substitute(Part, Expansion->Names, Expansion->Index)
+                        : Part.str();
+    if (StringRef(Spelling).contains("$decltype."))
+      return RewriteQueries(Spelling, Expansion);
+    return Spelling;
   };
   auto Open = Text.find('<');
   if (!Text.contains("...") || Open == StringRef::npos)
@@ -256,7 +293,8 @@ std::string expandPackLists(StringRef Text, const PackLengths &Known,
   std::string Out;
   if (Callable)
     Out = "function<" +
-          expandPackLists(Callable->Result, Known, Deferred, Expansion, At) +
+          expandPackLists(U, Callable->Result, Known, Deferred, Expansion, At,
+                          RewriteQueries) +
           "(";
   else
     Out = Rewrite(Text.take_front(Open + 1));
@@ -274,10 +312,11 @@ std::string expandPackLists(StringRef Text, const PackLengths &Known,
     StringRef Arg = Spelling;
     if (!Arg.consume_back("...")) {
       Positions.emplace_back(Next++, 1);
-      Append(expandPackLists(Arg, Known, Deferred, Expansion, At));
+      Append(expandPackLists(U, Arg, Known, Deferred, Expansion, At,
+                             RewriteQueries));
       continue;
     }
-    auto References = referencedPacks(Arg, Known, Deferred);
+    auto References = referencedPacks(U, Arg, Known, Deferred);
     if (References.Deferred) {
       Positions.emplace_back(Next++, 1);
       Append(Spelling);
@@ -287,13 +326,14 @@ std::string expandPackLists(StringRef Text, const PackLengths &Known,
     Positions.emplace_back(Next, Use.Count);
     Next += Use.Count;
     for (; Use.Index < Use.Count; ++Use.Index)
-      Append(expandPackLists(Arg, Known, Deferred, &Use, At));
+      Append(
+          expandPackLists(U, Arg, Known, Deferred, &Use, At, RewriteQueries));
   }
   if (Callable)
     Out += ")" + expandCallableFlags(Text.take_front(Close + 1), Positions);
   Out += ">";
-  Out += expandPackLists(Text.drop_front(Close + 1), Known, Deferred, Expansion,
-                         At);
+  Out += expandPackLists(U, Text.drop_front(Close + 1), Known, Deferred,
+                         Expansion, At, RewriteQueries);
   return Out;
 }
 
@@ -861,7 +901,7 @@ class ConstraintOrdering {
       auto Fixed = F.Decl.Generics.size() - 1;
       auto Count =
           N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0;
-      return named(expand(F, Count, N.At), N, Caller, Depth, Reached);
+      return named(expand(Probe.U, F, Count, N.At), N, Caller, Depth, Reached);
     }
 
     struct Argument {
@@ -1154,16 +1194,18 @@ PatternMatch compareSpecializationHeads(Frame &F, const Family &General,
 }
 } // namespace
 bool cpn::containsUnexpandedPack(
-    const Node &Pattern, llvm::function_ref<bool(llvm::StringRef)> IsPack) {
-  return usesPack(Pattern, IsPack);
+    const Context &U, const Node &Pattern,
+    llvm::function_ref<bool(llvm::StringRef)> IsPack) {
+  return usesPack(U, Pattern, IsPack);
 }
 bool cpn::containsUnexpandedPack(
-    llvm::StringRef Pattern, llvm::function_ref<bool(llvm::StringRef)> IsPack) {
-  return usesPack(Pattern, IsPack);
+    const Context &U, llvm::StringRef Pattern,
+    llvm::function_ref<bool(llvm::StringRef)> IsPack) {
+  return usesPack(U, Pattern, IsPack);
 }
 
 void cpn::validateTypePackExpansions(
-    llvm::StringRef Type, const Token &At,
+    const Context &U, llvm::StringRef Type, const Token &At,
     llvm::function_ref<bool(llvm::StringRef)> IsPack) {
   if (!Type.contains("..."))
     return;
@@ -1173,15 +1215,29 @@ void cpn::validateTypePackExpansions(
     return;
   auto Callable = splitCallableType(Type.take_front(Close + 1));
   if (Callable)
-    validateTypePackExpansions(Callable->Result, At, IsPack);
+    validateTypePackExpansions(U, Callable->Result, At, IsPack);
   auto List = Callable ? Callable->Parameters : Type.slice(Open + 1, Close);
   for (const auto &Spelling : splitArguments(List)) {
     StringRef Argument = Spelling;
-    if (Argument.consume_back("...") && !usesPack(Argument, IsPack))
+    if (Argument.consume_back("...") && !usesPack(U, Argument, IsPack))
       fail(At, "pack expansion requires an unexpanded pack binding");
-    validateTypePackExpansions(Argument, At, IsPack);
+    validateTypePackExpansions(U, Argument, At, IsPack);
   }
-  validateTypePackExpansions(Type.drop_front(Close + 1), At, IsPack);
+  validateTypePackExpansions(U, Type.drop_front(Close + 1), At, IsPack);
+}
+
+void cpn::visitTypeQueries(const Context &U, StringRef Text,
+                           llvm::function_ref<void(const Node &)> Visit) {
+  if (!Text.contains("$decltype."))
+    return;
+  while (!Text.empty()) {
+    if (Text.front() == '\'' || Text.front() == '"')
+      Text = Text.drop_front(quotedSpelling(Text).size());
+    else if (auto *Query = takeTypeQuery(U, Text))
+      Visit(*Query);
+    else
+      Text = Text.drop_front();
+  }
 }
 
 std::string cpn::rebindTypeNames(llvm::StringRef Text, const Node &Old,
@@ -1385,7 +1441,8 @@ Frame::deduceGenericArgument(const Family &Fam, const Node &Param,
   return Result;
 }
 
-Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
+Family cpn::expand(Context &U, const Family &Source, size_t Count,
+                   const Token &At) {
   Family Result = Source;
   auto &D = Result.Decl;
   const auto &Pack = D.Generics.back();
@@ -1394,6 +1451,29 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
   PackNames Deferred;
 
   std::function<void(Node &, const PackExpansion *)> transform;
+  auto RewriteQueries = [&](StringRef Text, const PackExpansion *Current) {
+    std::string Spelling;
+    while (!Text.empty()) {
+      if (Text.front() == '\'' || Text.front() == '"') {
+        auto Literal = quotedSpelling(Text);
+        Spelling += Literal;
+        Text = Text.drop_front(Literal.size());
+      } else if (auto *Original = takeTypeQuery(U, Text)) {
+        // The occurrence may represent a different pack element in each
+        // expansion. Its original lexical expression remains reusable.
+        auto Query = *Original;
+        transform(Query.Children.front(), Current);
+        auto Key = "$decltype.0." + std::to_string(++U.ExpandedTypeQueries);
+        Query.Text = Key;
+        U.TypeQueries.emplace(Key, std::move(Query));
+        Spelling += Key;
+      } else {
+        Spelling += Text.front();
+        Text = Text.drop_front();
+      }
+    }
+    return Spelling;
+  };
   auto sequence = [&](std::vector<Node> &Nodes, const PackExpansion *Current) {
     std::vector<Node> Out;
     for (auto N : Nodes) {
@@ -1402,7 +1482,7 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
         Out.push_back(std::move(N));
         continue;
       }
-      auto References = referencedPacks(N, Known, Deferred);
+      auto References = referencedPacks(U, N, Known, Deferred);
       if (References.Deferred) {
         // The nested declaration still owns at least one of the operands.
         // Resolve them together after that declaration binds its pack.
@@ -1433,7 +1513,8 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
     for (const auto &Param : N.Params) {
       if (!Param.Pack)
         continue;
-      auto References = referencedPacks(StringRef(Param.Type), Known, Deferred);
+      auto References =
+          referencedPacks(U, StringRef(Param.Type), Known, Deferred);
       if (References.Deferred)
         Deferred.insert(Param.Text);
       else
@@ -1445,9 +1526,12 @@ Family cpn::expand(const Family &Source, size_t Count, const Token &At) {
     if (N.K == Node::Name && Known.count(N.Text) && !Deferred.count(N.Text) &&
         (!Current || !Current->Names.count(N.Text)))
       fail(N.At, "unexpanded pack in expression");
-    N.Text = expandPackLists(N.Text, Known, Deferred, Current, N.At);
-    N.At.Text = expandPackLists(N.At.Text, Known, Deferred, Current, N.At);
-    N.Type = expandPackLists(N.Type, Known, Deferred, Current, N.At);
+    N.Text = expandPackLists(U, N.Text, Known, Deferred, Current, N.At,
+                             RewriteQueries);
+    N.At.Text = expandPackLists(U, N.At.Text, Known, Deferred, Current, N.At,
+                                RewriteQueries);
+    N.Type = expandPackLists(U, N.Type, Known, Deferred, Current, N.At,
+                             RewriteQueries);
     if (auto E = N.Settings.find("effects"); E != N.Settings.end()) {
       std::string Bound;
       auto Add = [&](StringRef Effect) {
@@ -1502,6 +1586,11 @@ void Context::checkNormalForm(const Node &N) {
     if (++Count > Opt.MaxNormalNodes)
       throw ResourceExhausted{
           {Item.At, "generic normalization resource exhausted"}};
+    visitTypeQueries(*this, Item.Type,
+                     [&](const Node &Query) { Self(Self, Query); });
+    if (Item.K == Node::Name)
+      visitTypeQueries(*this, Item.Text,
+                       [&](const Node &Query) { Self(Self, Query); });
     for (const auto &Child : Item.Children)
       Self(Self, Child);
     for (const auto &Arg : Item.TemplateArgs)
@@ -1547,7 +1636,7 @@ bool Frame::predicate(const Node &N) {
   if (!C.Decl.Generics.empty() && C.Decl.Generics.back().Pack) {
     auto Fixed = C.Decl.Generics.size() - 1;
     C = expand(
-        C, N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0,
+        U, C, N.TemplateArgs.size() > Fixed ? N.TemplateArgs.size() - Fixed : 0,
         N.At);
   }
   llvm::SaveAndRestore Depth(U.SpecializationDepth, U.SpecializationDepth + 1);
@@ -1697,7 +1786,7 @@ void Frame::selectTypeSpecialization(const std::string &Key, Family &Primary,
       }
       if (!Count)
         continue;
-      Spec = expand(Spec, *Count, At);
+      Spec = expand(U, Spec, *Count, At);
     }
     Frame Probe(U, nullptr, nullptr, Spec.Prefix);
     Probe.Opt = Spec.Site.Configuration;

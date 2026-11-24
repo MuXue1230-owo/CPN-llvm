@@ -260,8 +260,8 @@ void Context::bindFamilyMember(const std::string &Name,
       auto MemberArity = D.Generics.size();
       D.Generics.push_back(Binding.Parameters.back());
       Family Source{std::move(D), "", Saved.Site, std::move(Bindings)};
-      auto Expanded =
-          expand(Source, R->Decl.Generics.size() - Fixed, Saved.Definition.At);
+      auto Expanded = expand(*this, Source, R->Decl.Generics.size() - Fixed,
+                             Saved.Definition.At);
       D = std::move(Expanded.Decl);
       D.Generics.resize(MemberArity);
       Bindings = std::move(Expanded.Enclosing);

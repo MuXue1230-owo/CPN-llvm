@@ -323,6 +323,7 @@ struct Context {
                    const Node *SymbolOwner = nullptr);
 
   std::map<std::string, Node> TypeQueries;
+  uint64_t ExpandedTypeQueries = 0;
   std::map<std::string, Family> Families;
   std::map<std::string, TypeApplication> TypeApplications;
   std::map<std::string, std::vector<Family>> Specializations;
@@ -446,12 +447,14 @@ std::optional<CallableTypeParts> splitCallableType(llvm::StringRef);
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
 bool sameGenericValueContracts(const Node &, const Node &);
-bool containsUnexpandedPack(const Node &,
+bool containsUnexpandedPack(const Context &, const Node &,
                             llvm::function_ref<bool(llvm::StringRef)>);
-bool containsUnexpandedPack(llvm::StringRef,
+bool containsUnexpandedPack(const Context &, llvm::StringRef,
                             llvm::function_ref<bool(llvm::StringRef)>);
-void validateTypePackExpansions(llvm::StringRef, const Token &,
+void validateTypePackExpansions(const Context &, llvm::StringRef, const Token &,
                                 llvm::function_ref<bool(llvm::StringRef)>);
+void visitTypeQueries(const Context &, llvm::StringRef,
+                      llvm::function_ref<void(const Node &)>);
 std::optional<std::vector<size_t>>
 matchOwnerBinders(llvm::ArrayRef<Node> Pattern, llvm::ArrayRef<Node> Arguments,
                   llvm::ArrayRef<Node> Formals, llvm::ArrayRef<Node> Binders,
@@ -475,7 +478,7 @@ std::string parameterBinding(const Node &, size_t);
 void normalizeContracts(Node &);
 bool sameContracts(const Node &, const Node &);
 std::vector<std::string> splitArguments(llvm::StringRef);
-Family expand(const Family &, size_t, const Token &);
+Family expand(Context &, const Family &, size_t, const Token &);
 std::string element(const std::string &T);
 bool implicitInteger(Value, const std::string &);
 bool signedType(const std::string &T);

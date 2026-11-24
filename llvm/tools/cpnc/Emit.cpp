@@ -1144,7 +1144,7 @@ Function *Frame::prepareCandidate(const Family &Source, const std::string &Key,
                                   const std::vector<Value> &Args) {
   Family Fam = Source;
   if (!Fam.Decl.Generics.empty() && Fam.Decl.Generics.back().Pack)
-    Fam = expand(Fam, deducePackArity(Fam, N, Args), N.At);
+    Fam = expand(U, Fam, deducePackArity(Fam, N, Args), N.At);
   if (Args.size() > Fam.Decl.Params.size() ||
       (Args.size() < Fam.Decl.Params.size() &&
        Fam.Decl.Params[Args.size()].Children.empty()))

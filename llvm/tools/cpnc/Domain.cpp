@@ -262,15 +262,32 @@ struct Checker {
                     !Field.Settings.count("storage");
            });
   }
+  void visitType(llvm::StringRef Type, const Alternatives &Alts) {
+    visitTypeQueries(U, Type, [&](const Node &Query) {
+      visit(Query.Children.front(), Alts);
+    });
+  }
+
   std::string visit(const Node &N, const Alternatives &Alts) {
     if (Alts.empty())
       return "";
+    visitType(N.Type, Alts);
+    if (N.K == Node::Name)
+      visitType(N.Text, Alts);
+    for (const auto &Argument : N.TemplateArgs) {
+      const auto &Type = Argument.K == Node::GenericArgument
+                             ? Argument.Children.front()
+                             : Argument;
+      if (Type.K == Node::TypeArg)
+        visitType(Type.Type, Alts);
+    }
     if (N.K == Node::Block || N.K == Node::For || N.K == Node::Lambda) {
       llvm::SaveAndRestore Scope(Variables);
       llvm::SaveAndRestore Bindings(LocalBindings);
       llvm::SaveAndRestore Constructor(
           ConstructionOwner, N.K == Node::Lambda ? nullptr : ConstructionOwner);
       for (auto &P : N.Params) {
+        visitType(P.Type, Alts);
         Variables[P.Text] = P.Type;
         LocalBindings.insert(P.Text);
       }
@@ -493,9 +510,13 @@ void Context::checkDomain(const Node &N, const std::string &Prefix,
                                      D.K == Node::Constructor ? SymbolOwner
                                                               : nullptr);
     for (auto &P : D.Params) {
+      if (Dependent)
+        Check.visitType(P.Type, Alts);
       Check.Variables[P.Text] = P.Type;
       Check.LocalBindings.insert(P.Text);
     }
+    if (Dependent)
+      Check.visitType(D.Type, Alts);
     for (const auto &Clause : D.Contracts) {
       llvm::SaveAndRestore Names(Check.Variables);
       if (Clause.Text == "ensures" && D.Type != "void" && D.Type != "never")
@@ -518,6 +539,13 @@ void Context::checkDomain(const Node &N, const std::string &Prefix,
     for (auto &D : N.Children)
       if (D.K == Node::Field)
         Check.Variables[D.Text] = D.Type;
+    if (Dependent) {
+      for (const auto &Base : N.TemplateArgs)
+        Check.visitType(Base.Type, Alts);
+      for (const auto &D : N.Children)
+        if (D.K == Node::Alias || D.K == Node::Field)
+          Check.visitType(D.Type, Alts);
+    }
     for (auto &Clause : N.Contracts) {
       Check.bindPredicateNames(Clause.Children.front(), N, SymbolOwner,
                                OwnerType, true);

@@ -57,12 +57,15 @@ struct Check {
   template <typename Operand>
   bool referencesPack(const Operand &Pattern) const {
     return containsUnexpandedPack(
-        Pattern, [&](llvm::StringRef Name) { return isPack(Name); });
+        U, Pattern, [&](llvm::StringRef Name) { return isPack(Name); });
   }
 
-  void typePacks(llvm::StringRef Type, const Token &At) const {
+  void typeSyntax(llvm::StringRef Type, const Token &At, bool Bind) {
     validateTypePackExpansions(
-        Type, At, [&](llvm::StringRef Name) { return isPack(Name); });
+        U, Type, At, [&](llvm::StringRef Name) { return isPack(Name); });
+    visitTypeQueries(U, Type, [&](const Node &Query) {
+      visit(Query.Children.front(), Bind);
+    });
   }
 
   bool known(const std::string &S) const {
@@ -248,7 +251,7 @@ struct Check {
   }
 
   void generic(const Node &G) {
-    typePacks(G.Type, G.At);
+    typeSyntax(G.Type, G.At, true);
     for (const auto &Default : G.Children)
       visit(Default, true);
     Names[G.Text] = {G.K == Node::TypeParam ? Binding::TypeParameter
@@ -256,9 +259,9 @@ struct Check {
                      nominalType(G.Type), G.Pack};
   }
 
-  void parameters(const std::vector<Node> &Params) {
+  void parameters(const std::vector<Node> &Params, bool Bind) {
     for (const auto &P : Params) {
-      typePacks(P.Type, P.At);
+      typeSyntax(P.Type, P.At, Bind);
       if (P.Pack && !referencesPack(P.Type))
         fail(P.At, "parameter expansion requires a generic pack in its type");
       for (const auto &Default : P.Children)
@@ -271,7 +274,7 @@ struct Check {
   void members(const Node &N) {
     llvm::SaveAndRestore RecordScope(SyntaxOwner, &N);
     for (const auto &Base : N.TemplateArgs)
-      typePacks(Base.Type, Base.At);
+      typeSyntax(Base.Type, Base.At, true);
     for (const auto &Member : N.Children) {
       llvm::SaveAndRestore MemberScope(Names);
       if (nominalRecord(Member)) {
@@ -280,9 +283,9 @@ struct Check {
       }
       for (const auto &G : Member.Generics)
         generic(G);
-      typePacks(Member.Type, Member.At);
+      typeSyntax(Member.Type, Member.At, true);
       if (callable(Member))
-        parameters(Member.Params);
+        parameters(Member.Params, true);
       for (const auto &Condition : Member.TemplateArgs)
         visit(Condition, true);
       for (const auto &C : Member.Children)
@@ -291,13 +294,13 @@ struct Check {
   }
 
   void visit(const Node &N, bool Bind) {
+    Bind |= N.K == Node::If && N.Required;
     if (N.Pack && !referencesPack(N))
       fail(N.At, "pack expansion requires an unexpanded pack binding");
-    typePacks(N.Type, N.At);
+    typeSyntax(N.Type, N.At, Bind);
     if (N.K == Node::Name)
-      typePacks(N.Text, N.At);
+      typeSyntax(N.Text, N.At, Bind);
     const auto &A = N.Children;
-    Bind |= N.K == Node::If && N.Required;
     if (N.K == Node::Lambda) {
       llvm::SaveAndRestore Outer(Names);
       Scope Captured;
@@ -322,7 +325,7 @@ struct Check {
       llvm::SaveAndRestore OwnerScope(Owner, std::string{});
       llvm::SaveAndRestore SyntaxScope(SyntaxOwner,
                                        static_cast<const Node *>(nullptr));
-      parameters(N.Params);
+      parameters(N.Params, Bind);
       for (const auto &C : A)
         visit(C, Bind);
       return;
@@ -348,7 +351,7 @@ struct Check {
     if (N.K == Node::Block || N.K == Node::Tail || N.K == Node::For ||
         N.K == Node::Arm || N.K == Node::Requirement) {
       llvm::SaveAndRestore BlockScope(Names);
-      parameters(N.Params);
+      parameters(N.Params, Bind);
       for (const auto &C : A)
         visit(C, Bind);
       return;
@@ -402,7 +405,7 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
     }
     Ch.generic(G);
   }
-  Ch.typePacks(N.Type, N.At);
+  Ch.typeSyntax(N.Type, N.At, !N.Generics.empty());
   for (auto &Arg : N.Params) {
     if (llvm::StringRef(Arg.Type).starts_with("forward ") &&
         llvm::none_of(N.Generics, [&](auto &G) {
@@ -411,7 +414,7 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
       fail(Arg.At, "forward requires a type parameter");
   }
   if (!nominalRecord(N))
-    Ch.parameters(N.Params);
+    Ch.parameters(N.Params, !N.Generics.empty());
   if (!N.Generics.empty())
     for (const auto &Condition : nominalRecord(N) ? N.Params : N.TemplateArgs)
       Ch.visit(Condition, true);
