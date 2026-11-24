@@ -481,9 +481,54 @@ bool Frame::canProjectOperand(const Node &N, const std::string &Type,
          unconst(unevaluatedType(N, true, T)) == T;
 }
 
+bool Frame::canStagePlacementPrefix(const std::string &T) {
+  auto *Type = U.ir(T);
+  // These operands need only their typed store after evaluation.
+  return Type->isIntegerTy() || Type->isFloatingPointTy();
+}
+
+ResultProjection Frame::stagePlacementPrefix(llvm::Value *Enclosing,
+                                             llvm::ArrayRef<Value> Values,
+                                             llvm::ArrayRef<uint64_t> Offsets,
+                                             llvm::Value *Progress) {
+  if (Values.empty())
+    return {Enclosing};
+  assert(Values.size() == Offsets.size());
+  llvm::SmallVector<llvm::Type *> Types{B.getPtrTy(), B.getPtrTy()};
+  for (const auto &V : Values)
+    Types.push_back(V.IR->getType());
+  auto *StateType = llvm::StructType::get(U.C, Types);
+  llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
+  auto *State = Entry.CreateAlloca(StateType);
+  B.CreateStore(Enclosing, B.CreateStructGEP(StateType, State, 0));
+  B.CreateStore(Progress ? Progress
+                         : llvm::ConstantPointerNull::get(B.getPtrTy()),
+                B.CreateStructGEP(StateType, State, 1));
+  for (auto [I, V] : llvm::enumerate(Values))
+    B.CreateStore(V.IR, B.CreateStructGEP(StateType, State, I + 2));
+
+  auto *FT = llvm::FunctionType::get(B.getVoidTy(), {B.getPtrTy()}, false);
+  auto *Prepare = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
+                                         "cpn.slot.prepare.fields", U.M);
+  llvm::IRBuilder<> Apply(llvm::BasicBlock::Create(U.C, "entry", Prepare));
+  auto Load = [&](unsigned I) {
+    return Apply.CreateLoad(
+        Types[I], Apply.CreateStructGEP(StateType, Prepare->getArg(0), I));
+  };
+  auto *Object = Load(0);
+  for (auto [I, Offset] : llvm::enumerate(Offsets))
+    Apply.CreateStore(Load(I + 2), Apply.CreateGEP(Apply.getInt8Ty(), Object,
+                                                   Apply.getInt64(Offset)));
+  if (Progress)
+    Apply.CreateStore(Apply.getInt64(Values.size()), Load(1));
+  Apply.CreateRetVoid();
+  return {Enclosing, Prepare, State};
+}
+
 Value Frame::constructPrvalue(const Node &N, const std::string &T,
                               llvm::Value *Dest, const Token &At,
-                              llvm::Value *Enclosing) {
+                              ResultProjection Projection) {
+  auto *Enclosing = Projection.Enclosing;
   auto *Storage = Enclosing ? Enclosing : Dest;
   const auto *Request =
       Replacement && Replacement->Address == Storage ? Replacement : nullptr;
@@ -501,14 +546,20 @@ Value Frame::constructPrvalue(const Node &N, const std::string &T,
     llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
     Release.DeferredConstruction = Entry.CreateAlloca(
         llvm::StructType::getTypeByName(U.C, "cpn.deferred.result"));
+    auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
+    llvm::Value *Prepare = Projection.Prepare
+                               ? static_cast<llvm::Value *>(Projection.Prepare)
+                               : Null;
+    auto *State = Projection.State ? Projection.State : Null;
     if (Request)
       B.CreateCall(U.M.getFunction("cpn.slot.defer.result"),
                    {Release.DeferredConstruction, Request->Slot, Request->Birth,
                     Dest, Request->Reservation, B.getInt64(Request->Size),
-                    B.getInt64(Request->Alignment)});
+                    B.getInt64(Request->Alignment), Prepare, State});
     else
-      B.CreateCall(U.M.getFunction("cpn.slot.project.result"),
-                   {Release.DeferredConstruction, Enclosing, Dest});
+      B.CreateCall(
+          U.M.getFunction("cpn.slot.project.result"),
+          {Release.DeferredConstruction, Enclosing, Dest, Prepare, State});
     Scopes.back().Drops.push_back(Release);
   }
   auto Source = eval(N, T, Dest);

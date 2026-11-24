@@ -205,7 +205,7 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
   if (!Admit && admitsResult(Dest))
     Admit = AdmitResult;
   std::vector<Value> Operands;
-  bool ProjectFirst = false;
+  std::optional<size_t> Projected;
   if (Admit) {
     if (!Default)
       for (size_t I = 0; I < Args.size(); ++I) {
@@ -216,21 +216,40 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
         Operands.push_back(constructionOperand(
             convert(eval(Arg, Type), Type, Arg.At), Arg.At));
       }
-    ProjectFirst = !Default && !Args.empty() && Operands.empty() &&
-                   canProjectOperand(Args.front(), C.Types.front(), Ptr);
-    if (!ProjectFirst)
+    const auto I = Operands.size();
+    if (I < Args.size() &&
+        llvm::all_of(
+            llvm::ArrayRef(C.Types).take_front(I),
+            [&](const auto &T) { return canStagePlacementPrefix(T); }) &&
+        canProjectOperand(Args[I], C.Types[I], Ptr))
+      Projected = I;
+    else
       Admit();
   }
   auto *Progress = C.Types.empty()
                        ? nullptr
                        : beginConstructionPrefix({C.Owner, nullptr, Ptr}, &C);
+  ResultProjection Projection;
+  if (Projected) {
+    const auto &DL = U.M.getDataLayout();
+    auto Offset =
+        DL.getStructLayout(U.Records.at(C.Owner).IR)->getElementOffset(2);
+    auto *Layout = DL.getStructLayout(C.Payload);
+    llvm::SmallVector<uint64_t> Offsets;
+    for (size_t I = 0; I < *Projected; ++I)
+      Offsets.push_back(Offset + Layout->getElementOffset(I));
+    Projection = stagePlacementPrefix(Ptr, Operands, Offsets, Progress);
+  }
   for (size_t I = 0; I < C.Types.size(); ++I) {
-    const bool Project = I == 0 && ProjectFirst;
+    if (Projected && I < *Projected)
+      continue;
+    const bool Project = Projected == I;
     auto *Slot = payloadAddress(C, Ptr, I, !Project);
     if (Default)
       construct(C.Types[I], {}, At, Slot);
     else if (Project)
-      constructPrvalue(Args[I], unconst(C.Types[I]), Slot, Args[I].At, Ptr);
+      constructPrvalue(Args[I], unconst(C.Types[I]), Slot, Args[I].At,
+                       Projection);
     else if (I < Operands.size())
       materialize(Operands[I], Args[I].At, Slot);
     else if (!directConstruction(Args[I], C.Types[I], Slot)) {

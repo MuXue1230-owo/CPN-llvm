@@ -1904,14 +1904,15 @@ Frame::directConstruction(const Node &Arg, const std::string &T,
 // at its canonical frontier after resolving whole-object versus member input.
 Initializer Frame::deferInitializer(const Node &Arg,
                                     const std::string &Expected,
-                                    llvm::Value *Enclosing) {
+                                    ResultProjection Projection) {
   llvm::IRBuilderBase::InsertPointGuard Save(B);
   auto *Entry = block("initializer");
   B.SetInsertPoint(Entry);
   auto *Storage = B.CreateAlloca(B.getInt8Ty());
-  auto Result = Enclosing ? constructPrvalue(Arg, unconst(Expected), Storage,
-                                             Arg.At, Enclosing)
-                          : eval(Arg, Expected, Storage);
+  auto Result = Projection.Enclosing
+                    ? constructPrvalue(Arg, unconst(Expected), Storage, Arg.At,
+                                       Projection)
+                    : eval(Arg, Expected, Storage);
   return {Result, Entry, B.GetInsertBlock(), Storage};
 }
 
@@ -2133,7 +2134,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       llvm::Value *Indices[] = {B.getInt32(0), B.getInt64(I)};
       if (I == 0 && ProjectFirst) {
         auto *P = B.CreateGEP(Ty, Ptr, Indices);
-        constructPrvalue(Args[I], unconst(E), P, Args[I].At, Ptr);
+        constructPrvalue(Args[I], unconst(E), P, Args[I].At, {Ptr});
       } else {
         auto *P = B.CreateInBoundsGEP(Ty, Ptr, Indices);
         if (I < Operands.size())
@@ -2258,15 +2259,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Fits)
       for (size_t I = 0; I < Args.size(); ++I)
         Aggregate.Params.push_back(R.Fields[R.Bases.size() + I].Type);
-    // With no earlier setup writes, the first field supplies the frontier
-    // for admitting the entire enclosing extent.
-    const bool ProjectFirst =
-        Admit && Fits && !Args.empty() && !AsBase && !Tail && R.Bases.empty() &&
-        R.Tables.empty() && !R.InvariantSite && It == U.Overloads.end() &&
-        canProjectOperand(Args.front(), Aggregate.Params.front(), Ptr);
-    if (ProjectFirst)
-      Admit = {};
     size_t BeforeAdmission = Args.size();
+    std::optional<size_t> Projected;
     if (Admit && Fits &&
         (It == U.Overloads.end() || llvm::none_of(It->second, [&](auto *D) {
            return D->Params == Aggregate.Params;
@@ -2274,9 +2268,17 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       for (auto [Index, Arg] : llvm::enumerate(Args)) {
         if (!operandNeedsDestination(Arg, Aggregate.Params[Index]))
           continue;
+        // A projection can prepare preceding typed stores at admission.
+        if (!AsBase && !Tail && R.Bases.empty() && R.Tables.empty() &&
+            !R.InvariantSite && It == U.Overloads.end() &&
+            llvm::all_of(
+                llvm::ArrayRef(Aggregate.Params).take_front(Index),
+                [&](const auto &Ty) { return canStagePlacementPrefix(Ty); }) &&
+            canProjectOperand(Arg, Aggregate.Params[Index], Ptr))
+          Projected = Index;
         // A generated aggregate has a fixed field producer at this position.
         // Bind the remaining initializers with the construction cleanup active.
-        if (It == U.Overloads.end() && Args.size() > 1)
+        if (It == U.Overloads.end() && (Args.size() > 1 || Projected))
           BeforeAdmission = Index;
         else {
           Admit();
@@ -2299,9 +2301,11 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       Start();
     std::vector<Initializer> Inputs;
     std::vector<Value> Actual;
+    ResultProjection Projection;
     auto BindInput = [&](size_t I) {
-      if (I == 0 && ProjectFirst) {
-        Inputs.push_back(deferInitializer(Args[I], Aggregate.Params[I], Ptr));
+      if (Projected == I) {
+        Inputs.push_back(
+            deferInitializer(Args[I], Aggregate.Params[I], Projection));
         Actual.push_back(Inputs.back().Result);
         return;
       }
@@ -2323,7 +2327,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       for (auto &S : Tail->Children)
         if (S.K == Node::Init && !Producers.emplace(initSlot(S), &S).second)
           fail(S.At, "duplicate initialization producer");
-    if (Args.size() == 1 && Actual[0].Type == T) {
+    if (Args.size() == 1 && !Actual.empty() && Actual[0].Type == T) {
       // An embedded layer shares virtual bases with its complete object.
       auto Target = AsBase && R.VirtualCount ? Value{} : Obj;
       Actual[0] = runInitializer(Inputs.front(), Admit ? Value{} : Target, At);
@@ -2389,7 +2393,16 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                 constructionOperand(convert(runInitializer(Inputs[I], {}, At),
                                             Aggregate.Params[I], At),
                                     At);
+          if (Projected)
+            Admit = {};
           Start();
+          if (Projected) {
+            auto *Layout = U.M.getDataLayout().getStructLayout(R.IR);
+            llvm::SmallVector<uint64_t> Offsets;
+            for (size_t I = 0; I < Staged; ++I)
+              Offsets.push_back(Layout->getElementOffset(I));
+            Projection = stagePlacementPrefix(Ptr, Actual, Offsets, Progress);
+          }
           for (size_t I = Staged; I < Args.size(); ++I)
             BindInput(I);
         }
@@ -2407,19 +2420,21 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Scopes.back().Names[Field.Decl.Text] = {};
         for (size_t I = AsBase ? R.VirtualCount : 0; I < R.Fields.size(); ++I) {
           auto &Field = R.Fields[I];
-          auto *P = I == 0 && ProjectFirst
-                        ? B.CreateGEP(R.IR, Ptr, {B.getInt32(0), B.getInt32(0)})
+          auto *P = Projected == I
+                        ? B.CreateGEP(R.IR, Ptr, {B.getInt32(0), B.getInt32(I)})
                         : fieldAddress(Obj, I);
           auto Found = Producers.find(Field.Decl.Text);
           if (I >= R.Bases.size() && I - R.Bases.size() < Actual.size()) {
             if (Found != Producers.end())
               fail(At, "duplicate aggregate initialization producer");
             auto Argument = I - R.Bases.size();
-            auto V = Argument < Staged
-                         ? Actual[Argument]
-                         : runInitializer(Inputs[Argument],
-                                          {Field.Type, nullptr, P}, At);
-            materialize(convert(V, Field.Type, At), At, P);
+            if (!Projected || Argument >= *Projected) {
+              auto V = Argument < Staged
+                           ? Actual[Argument]
+                           : runInitializer(Inputs[Argument],
+                                            {Field.Type, nullptr, P}, At);
+              materialize(convert(V, Field.Type, At), At, P);
+            }
           } else {
             llvm::SaveAndRestore Policy(Opt);
             llvm::SaveAndRestore Limit(LookupLimit);
@@ -2435,7 +2450,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
               Producers.erase(Found);
           }
           finishVirtualBase(Obj, I);
-          if (Progress)
+          if (Progress && (!Projected || I >= *Projected))
             B.CreateStore(B.getInt64(I + 1), Progress);
           PendingSlots.erase(Field.Decl.Text);
           Scopes.back().Names[Field.Decl.Text] = {Field.Type, nullptr, P};

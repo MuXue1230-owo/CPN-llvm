@@ -8680,6 +8680,79 @@ class CompilerTests(unittest.TestCase):
             42,
         )
 
+    def test_projected_factory_admits_after_capture_and_commits_scalar_prefix(self):
+        common = """
+            extern "C" void remember(i32* address);
+            extern "C" i32 observe_prefix();
+            struct Child {
+                i32 data;
+                Child(i32 previous){init data(previous+observe_prefix());}
+            };
+            Child prepare(i32[8]& old){
+                i32 previous(old[0]);
+                destroy(old);
+                return Child(previous);
+            }
+        """
+        host = """
+            #include <stdint.h>
+            #include <string.h>
+            extern int32_t rebuild(void);
+            static const void *prefix;
+            void remember(int32_t *address) { prefix = address; }
+            int32_t observe_prefix(void) {
+                int32_t value;
+                memcpy(&value, prefix, sizeof value);
+                return value;
+            }
+            int main(void) { return rebuild(); }
+        """
+        for name, declarations, body in (
+            (
+                "scalar record prefix",
+                "struct Pair {i32 prefix;Child child;};",
+                """
+                auto built(construct_at<Pair>(area,18,prepare(old)));
+                return built->prefix+built->child.data;
+                """,
+            ),
+            (
+                "nested scalar prefixes",
+                """
+                union Pick {default case Empty;case Pair(i32 prefix,Child child);};
+                Pick choose(i32[8]& old){return Pick::Pair(14,prepare(old));}
+                struct Pair {i32 prefix;Pick nested;};
+                """,
+                """
+                auto built(construct_at<Pair>(area,11,choose(old)));
+                match(built->nested){
+                case Pick::Pair(value prefix,ref child){
+                    return built->prefix+prefix+child.data;
+                }
+                case Pick::Empty{return 1;}
+                }
+                """,
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.program(
+                        common
+                        + declarations
+                        + """
+                        extern "C" i32 rebuild(){
+                            i32[8] old;
+                            old[0]=6;
+                            remember(&old[0]);
+                            auto area(storage_of(old));
+                        """
+                        + body
+                        + "}",
+                        host=host,
+                    ),
+                    42,
+                )
+
     def test_constant_aggregate_reconstruction_admits_after_arguments(self):
         self.assertEqual(
             self.program("""

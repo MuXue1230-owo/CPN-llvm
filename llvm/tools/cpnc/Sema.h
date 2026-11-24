@@ -516,6 +516,11 @@ struct Loop {
   std::string Name;
   bool BreakUsed = false;
 };
+struct ResultProjection {
+  llvm::Value *Enclosing = nullptr;
+  llvm::Function *Prepare = nullptr;
+  llvm::Value *State = nullptr;
+};
 struct Initializer {
   Value Result;
   llvm::BasicBlock *Entry, *Exit;
@@ -722,13 +727,18 @@ public:
                                              const std::string &ValueType = "");
   std::string initSlot(const Node &);
   Initializer deferInitializer(const Node &, const std::string &Expected,
-                               llvm::Value *Enclosing = nullptr);
+                               ResultProjection = {});
   Value runInitializer(Initializer &, Value Target, const Token &);
   Value constructionOperand(Value, const Token &);
   bool operandNeedsDestination(const Node &, const std::string &);
   bool canProjectOperand(const Node &, const std::string &, llvm::Value *);
+  bool canStagePlacementPrefix(const std::string &);
+  ResultProjection stagePlacementPrefix(llvm::Value *Enclosing,
+                                        llvm::ArrayRef<Value>,
+                                        llvm::ArrayRef<uint64_t> Offsets,
+                                        llvm::Value *Progress);
   Value constructPrvalue(const Node &, const std::string &, llvm::Value *,
-                         const Token &, llvm::Value *Enclosing = nullptr);
+                         const Token &, ResultProjection = {});
   std::optional<Value>
   directConstruction(const Node &, const std::string &, llvm::Value *,
                      llvm::function_ref<void()> Admit = {});
