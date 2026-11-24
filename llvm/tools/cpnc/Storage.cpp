@@ -89,8 +89,7 @@ enum SlotField {
   Stamp = 7,
   Destructor = 8,
   Capacity = 9,
-  Alignment = 10,
-  Birth = 6
+  Alignment = 10
 };
 llvm::Constant *destructor(Frame &F, const std::string &T) {
   if (auto *D = F.U.cleanupEntry(T))
@@ -121,6 +120,17 @@ void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
   llvm::OperandBundleDef Effects("cpn.storage.retire", Operands);
   F.B.CreateCall(F.U.M.getFunction("cpn.slot.retire"),
                  {Slot, F.B.getInt1(Destroy)}, {Effects});
+}
+
+void markStorageSite(llvm::CallBase &Check, llvm::StringRef Kind,
+                     const Token &Source) {
+  auto &Context = Check.getContext();
+  auto *I32 = llvm::Type::getInt32Ty(Context);
+  llvm::Metadata *Location[] = {
+      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(I32, Source.Line)),
+      llvm::ConstantAsMetadata::get(
+          llvm::ConstantInt::get(I32, Source.Column))};
+  Check.setMetadata(Kind, llvm::MDNode::get(Context, Location));
 }
 } // namespace
 llvm::Value *Frame::slotFor(Value V) {
@@ -246,15 +256,16 @@ void Frame::ensureLive(const Value &V, const Token &At) {
   auto *Validation =
       B.CreateCall(U.M.getFunction("cpn.borrow.valid"),
                    {Slot, Generation ? Generation : B.getInt64(0)});
-  if ((Generation && llvm::isa<llvm::LoadInst>(Slot)) ||
+  auto *Selection = llvm::dyn_cast<llvm::CallBase>(Slot);
+  const bool Child = Selection && Selection->getCalledFunction() ==
+                                      U.M.getFunction("cpn.slot.child");
+  if ((Generation && (llvm::isa<llvm::LoadInst>(Slot) || Child)) ||
       (!Generation && llvm::isa<llvm::GlobalVariable>(Slot))) {
     const Token &Source = At.Text.empty() && F ? F->Decl.At : At;
-    llvm::Metadata *Location[] = {
-        llvm::ConstantAsMetadata::get(B.getInt32(Source.Line)),
-        llvm::ConstantAsMetadata::get(B.getInt32(Source.Column))};
-    Validation->setMetadata(Generation ? "cpn.storage.saved.use"
-                                       : "cpn.storage.original.use",
-                            llvm::MDNode::get(U.C, Location));
+    markStorageSite(*Validation,
+                    Generation ? "cpn.storage.checked.use"
+                               : "cpn.storage.original.use",
+                    Source);
   }
   guard(B.CreateNot(Validation));
 }
@@ -403,8 +414,11 @@ Value Frame::storageViewObserver(Value View, llvm::StringRef Name,
   }
   if (!TracksStorage || !View.Slot || !View.Generation)
     fail(At, "StorageView has no authorized extent");
-  guard(B.CreateNot(B.CreateCall(U.M.getFunction("cpn.extent.valid"),
-                                 {View.Slot, View.Generation})));
+  auto *Extent = B.CreateCall(U.M.getFunction("cpn.extent.valid"),
+                              {View.Slot, View.Generation});
+  if (View.Subobject)
+    markStorageSite(*Extent, "cpn.storage.extent.use", At);
+  guard(B.CreateNot(Extent));
   if (Name == "identity")
     return {StorageIdentityType, View.Generation};
   auto Field = Name == "capacity_bytes" ? Capacity : Alignment;
@@ -425,8 +439,11 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
           State != Active.end() &&
           (State->second > 0 || State->second == LiveGeneration))
         fail(C.At, "storage contains a live generation");
-    guard(B.CreateNot(B.CreateCall(U.M.getFunction("cpn.extent.valid"),
-                                   {S.Slot, S.Generation})));
+    auto *Extent = B.CreateCall(U.M.getFunction("cpn.extent.valid"),
+                                {S.Slot, S.Generation});
+    if (S.Subobject)
+      markStorageSite(*Extent, "cpn.storage.construct.use", C.At);
+    guard(B.CreateNot(Extent));
     auto *Current =
         B.CreateCall(U.M.getFunction("cpn.generation"), {S.Slot, B.getFalse()});
     guard(B.CreateTrunc(Current, B.getInt1Ty()));
@@ -475,8 +492,8 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
             B.CreateLoad(B.getPtrTy(),
                          B.CreateStructGEP(U.SlotType, V.Slot, Address))};
     S.borrow(V);
-    S.Generation = B.CreateLoad(B.getInt64Ty(),
-                                B.CreateStructGEP(U.SlotType, V.Slot, Birth));
+    S.Generation =
+        B.CreateCall(U.M.getFunction("cpn.generation"), {V.Slot, B.getTrue()});
     return S;
   }
   if (V.BaseView && V.ExtentType != V.Type &&

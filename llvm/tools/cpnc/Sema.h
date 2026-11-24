@@ -571,7 +571,7 @@ public:
   Frame(Context &, Function *, llvm::Function *, std::string Prefix = "");
   llvm::BasicBlock *block(llvm::StringRef);
   llvm::AllocaInst *allocate(const std::string &, const Token &);
-  Value load(Value);
+  Value load(Value, const Token &At = {});
   Value materialize(Value, const Token &, llvm::Value *Dest = nullptr,
                     bool CheckInvariant = true);
   void transfer(Value, llvm::Value *Dest, SpecialOperation, const Token &,

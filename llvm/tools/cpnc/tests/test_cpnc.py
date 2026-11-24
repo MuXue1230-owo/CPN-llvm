@@ -7256,14 +7256,31 @@ class CompilerTests(unittest.TestCase):
                 return use(Item(1))+p->n;}"""),
             42,
         )
-        self.assertLess(
-            self.program("""
-            struct Pair{i32 n;};i32 main(){
+        views = """
+            struct Pair{i32 n;};
+            i32 read(bool replace){
                 Pair p; auto inner(storage_of(p.n)); auto outer(storage_of(p));
-                destroy(p);construct_at<Pair>(outer);
-                construct_at<i32>(inner,42);return 1;}"""),
-            0,
-        )
+                if(REPLACE){destroy(p);construct_at<Pair>(outer);}
+                return inner.capacity_bytes()==usize(4) ? 42 : 1;
+            }
+            i32 main(){return read(INPUT);}
+        """
+        expired = views.replace("REPLACE", "true").replace("INPUT", "true")
+        for use in (
+            "return inner.capacity_bytes()==usize(4) ? 42 : 1;",
+            "construct_at<i32>(inner,42);return 1;",
+        ):
+            checked = self.compile(
+                expired.replace(
+                    "return inner.capacity_bytes()==usize(4) ? 42 : 1;", use
+                ),
+                "--check",
+            )
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            self.assertIn("ended containing generation", checked.stderr)
+        dynamic = views.replace("REPLACE", "replace")
+        self.assertEqual(self.program(dynamic.replace("INPUT", "false")), 42)
+        self.assertEqual(self.program(dynamic.replace("INPUT", "true")), -signal.SIGILL)
 
     def test_const_static_objects_retain_independent_storage_authority(self):
         source = """
@@ -7317,6 +7334,21 @@ class CompilerTests(unittest.TestCase):
         )
         self.assertEqual(all_ended.returncode, 1, all_ended.stderr)
         self.assertIn("ended object generation", all_ended.stderr)
+        aggregate = """
+            i32[2] stored(1,42);
+            i32 main(){
+                auto old(&stored[0]);
+                auto extent(storage_of(stored[0]));
+                destroy(stored[0]);construct_at<i32>(extent,3);
+                return EXPR;
+            }
+        """
+        for expr in ("stored[0]", "*old"):
+            with self.subTest(expr=expr):
+                checked = self.compile(aggregate.replace("EXPR", expr), "--check")
+                self.assertEqual(checked.returncode, 1, checked.stderr)
+                self.assertIn("ended object generation", checked.stderr)
+        self.assertEqual(self.program(aggregate.replace("EXPR", "stored[1]")), 42)
         invalid = self.compile(
             "i32 main(){i32 local; auto view(storage_of(local));"
             "transfer_storage(view,view);return 0;}",
@@ -7394,13 +7426,68 @@ class CompilerTests(unittest.TestCase):
                 return EXPR;
             }
         """
-        stale = self.compile(replaced.replace("EXPR", "*old"), "--check")
+        for expr in ("*old", "values[0]"):
+            with self.subTest(expr=expr):
+                stale = self.compile(replaced.replace("EXPR", expr), "--check")
+                self.assertEqual(stale.returncode, 1, stale.stderr)
+                self.assertIn("ended object generation", stale.stderr)
+        self.assertEqual(self.program(replaced.replace("EXPR", "*next")), 42)
+        stale = self.compile(
+            """
+            struct Pair {i32 first(1);i32 next(42);};
+            i32 read(bool change){
+                Pair p;
+                auto extent(storage_of(p.first));
+                if(change){destroy(p.first);}else{abandon(p.first);}
+                construct_at<i32>(extent,3);
+                return p.first;
+            }
+            """,
+            "--check",
+        )
         self.assertEqual(stale.returncode, 1, stale.stderr)
         self.assertIn("ended object generation", stale.stderr)
-        self.assertEqual(self.program(replaced.replace("EXPR", "*next")), 42)
+        dynamic = """
+            i32 read(bool change){
+                i32[2] values(42,10);
+                if(change){destroy(values[0]);}
+                return values[0];
+            }
+            i32 main(){return read(DECISION);}
+        """
+        self.assertEqual(self.program(dynamic.replace("DECISION", "false")), 42)
         self.assertEqual(
-            self.program(replaced.replace("EXPR", "values[0]")), -signal.SIGILL
+            self.program(dynamic.replace("DECISION", "true")), -signal.SIGILL
         )
+        self.assertEqual(
+            self.program("""
+                struct Pair {i32 first(42);};
+                i32 main(){
+                    Pair p;
+                    destroy(p.first);
+                    auto extent(storage_of(p));
+                    destroy(p);
+                    return construct_at<Pair>(extent)->first;
+                }
+            """),
+            42,
+        )
+        nested = """
+            struct Box {i32[2] items(1,42);};
+            i32 main(){
+                Box box;
+                auto saved(&box.items[0]);
+                auto extent(storage_of(box.items[0]));
+                destroy(box.items[0]);construct_at<i32>(extent,3);
+                return EXPR;
+            }
+        """
+        for expr in ("*saved", "box.items[0]"):
+            with self.subTest(expr=expr):
+                checked = self.compile(nested.replace("EXPR", expr), "--check")
+                self.assertEqual(checked.returncode, 1, checked.stderr)
+                self.assertIn("ended object generation", checked.stderr)
+        self.assertEqual(self.program(nested.replace("EXPR", "box.items[1]")), 42)
 
     def test_storage_view_after_ending_complete_object(self):
         self.assertEqual(
@@ -7409,6 +7496,33 @@ class CompilerTests(unittest.TestCase):
                        auto replacement(construct_at<i32>(storage_of(n),42));
                        return *replacement;}"""),
             42,
+        )
+        for setup, extent in (
+            ("", "storage_of(values[0])"),
+            ("auto view(storage_of(values[0]));", "view"),
+        ):
+            checked = self.compile(
+                "i32 main(){i32[2] values(10,42);"
+                + setup
+                + "construct_at<i32>("
+                + extent
+                + ",1);return values[1];}",
+                "--check",
+            )
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            self.assertIn("storage contains a live generation", checked.stderr)
+        conditional = """
+            i32 read(bool retire) {
+                i32[2] values(1,2);
+                auto view(storage_of(values[0]));
+                if(retire){destroy(values[0]);}
+                return *construct_at<i32>(view,42);
+            }
+            i32 main(){return read(INPUT);}
+        """
+        self.assertEqual(self.program(conditional.replace("INPUT", "true")), 42)
+        self.assertEqual(
+            self.program(conditional.replace("INPUT", "false")), -signal.SIGILL
         )
 
     def test_static_members_and_modifier_order(self):
@@ -8472,22 +8586,35 @@ class CompilerTests(unittest.TestCase):
         self.assertIn("inactive case in constant evaluation", wrong.stderr)
 
     def test_result_payload_reference_keeps_the_selected_generation(self):
-        self.assertEqual(
-            self.program(
-                """
-                alias R=std::Result<i32,i32>;
-                i32 main() {
-                    R item(R::Ok(7));
-                    auto extent(storage_of(item));
-                    i32& previous(item.value());
+        source = """
+            alias R=std::Result<i32,i32>;
+            i32 read(bool replace) {
+                R item(R::Ok(7));
+                auto extent(storage_of(item));
+                i32& previous(item.value());
+                if (REPLACE) {
                     destroy(item);
                     auto current(construct_at<R>(extent,R::Ok(42)));
                     if (current->value() != 42) { return 1; }
-                    return previous;
                 }
-                """,
-                "--preset=Release",
-            ),
+                return previous;
+            }
+            i32 main(){return read(INPUT);}
+        """
+        checked = self.compile(
+            source.replace("REPLACE", "true").replace("INPUT", "true"),
+            "--check",
+            "--preset=Release",
+        )
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        self.assertIn("ended object generation", checked.stderr)
+        dynamic = source.replace("REPLACE", "replace")
+        self.assertEqual(
+            self.program(dynamic.replace("INPUT", "false"), "--preset=Release"),
+            7,
+        )
+        self.assertEqual(
+            self.program(dynamic.replace("INPUT", "true"), "--preset=Release"),
             -signal.SIGILL,
         )
 

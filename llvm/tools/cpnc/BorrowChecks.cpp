@@ -10,7 +10,9 @@ namespace {
 constexpr llvm::StringRef BorrowMetadata = "cpn.borrow.call";
 constexpr llvm::StringRef TemporaryEnd = "cpn.borrow.temporary.end";
 constexpr llvm::StringRef OriginalStorageUse = "cpn.storage.original.use";
-constexpr llvm::StringRef SavedStorageUse = "cpn.storage.saved.use";
+constexpr llvm::StringRef CheckedStorageUse = "cpn.storage.checked.use";
+constexpr llvm::StringRef ConstructStorageUse = "cpn.storage.construct.use";
+constexpr llvm::StringRef ExtentStorageUse = "cpn.storage.extent.use";
 enum CallField {
   Line,
   Column,
@@ -1018,17 +1020,18 @@ class EscapeCheck {
   }
 
   bool mayReachBeforeRetirement(
-      llvm::CallBase &Capture, const llvm::Instruction &Use,
+      llvm::CallBase *Capture, const llvm::Instruction &Use,
       llvm::ArrayRef<const llvm::CallBase *> Retirements) const {
-    llvm::SmallVector<llvm::BasicBlock *> Work{Capture.getParent()};
+    auto *Start = Capture ? Capture->getParent() : &Root.getEntryBlock();
+    llvm::SmallVector<llvm::BasicBlock *> Work{Start};
     llvm::SmallPtrSet<llvm::BasicBlock *, 32> Visited;
     unsigned Budget = 4096;
     while (!Work.empty()) {
       auto *BB = Work.pop_back_val();
       if (!Visited.insert(BB).second)
         continue;
-      auto Cursor = BB == Capture.getParent() ? std::next(Capture.getIterator())
-                                              : BB->begin();
+      auto Cursor = Capture && BB == Start ? std::next(Capture->getIterator())
+                                           : BB->begin();
       for (; Cursor != BB->end(); ++Cursor) {
         if (!Budget-- || &*Cursor == &Use)
           return true;
@@ -1045,76 +1048,266 @@ class EscapeCheck {
     return false;
   }
 
-  // A child lookup selects its parent's registration, byte position and type.
-  // A new parent generation already invalidates any saved child generation.
-  using StorageRegistration = std::tuple<llvm::AllocaInst *, llvm::AllocaInst *,
-                                         int64_t, llvm::Value *>;
+  // Keep all containing extents in a registration key, including layers that
+  // start at the same physical address.
+  using MemberPath = llvm::SmallVector<std::pair<int64_t, llvm::Value *>, 4>;
+  using StorageRegistration =
+      std::tuple<llvm::Value *, llvm::Value *, MemberPath>;
+  using RetirementsByStorage =
+      std::map<StorageRegistration,
+               llvm::SmallVector<const llvm::CallBase *, 2>>;
   std::optional<StorageRegistration> storageRegistration(llvm::Value *V) const {
-    if (auto *A = llvm::dyn_cast_or_null<llvm::AllocaInst>(V))
-      return StorageRegistration{A, nullptr, 0, nullptr};
-    auto *Child = llvm::dyn_cast_or_null<llvm::CallBase>(V);
-    auto *F = Child ? Child->getCalledFunction() : nullptr;
-    if (!F || F->getName() != "cpn.slot.child")
-      return std::nullopt;
-    auto *Parent = llvm::dyn_cast<llvm::AllocaInst>(Child->getArgOperand(0));
-    auto [Base, Offset] = slot(Child->getArgOperand(1));
-    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Base);
-    auto *Type = Child->getArgOperand(2);
-    if (!Parent || !Object || !llvm::isa<llvm::GlobalVariable>(Type))
-      return std::nullopt;
-    return StorageRegistration{Parent, Object, Offset, Type};
+    llvm::Value *Object = nullptr;
+    MemberPath Path;
+    for (unsigned Depth = 0; Depth != 32; ++Depth) {
+      if (llvm::isa_and_nonnull<llvm::AllocaInst, llvm::GlobalVariable>(V)) {
+        if (Object && llvm::isa<llvm::AllocaInst>(V) !=
+                          llvm::isa<llvm::AllocaInst>(Object))
+          break;
+        std::reverse(Path.begin(), Path.end());
+        return StorageRegistration{V, Object, std::move(Path)};
+      }
+      auto *Child = llvm::dyn_cast_or_null<llvm::CallBase>(V);
+      auto *F = Child ? Child->getCalledFunction() : nullptr;
+      if (!F || F->getName() != "cpn.slot.child")
+        break;
+      auto [Base, Offset] = slot(Child->getArgOperand(1));
+      auto *Type = Child->getArgOperand(2);
+      if (!llvm::isa<llvm::AllocaInst, llvm::GlobalVariable>(Base) ||
+          (Object && Base != Object) || !llvm::isa<llvm::GlobalVariable>(Type))
+        break;
+      Object = Base;
+      Path.emplace_back(Offset, Type);
+      V = Child->getArgOperand(0);
+    }
+    return std::nullopt;
   }
 
-  void verifySavedStorage(const Token &At) const {
-    llvm::SmallVector<const llvm::CallBase *> Uses;
-    std::map<StorageRegistration, llvm::SmallVector<const llvm::CallBase *, 2>>
-        Retirements;
-    for (const auto &BB : Root)
+  static llvm::SmallVector<const llvm::CallBase *, 4>
+  endingOperations(StorageRegistration Key, const RetirementsByStorage &Ended,
+                   bool IncludeSelectedExtent) {
+    llvm::SmallVector<const llvm::CallBase *, 4> Operations;
+    auto *Parent = std::get<0>(Key);
+    auto &Path = std::get<2>(Key);
+    if (!IncludeSelectedExtent && !Path.empty())
+      Path.pop_back();
+    while (!Path.empty()) {
+      if (auto It = Ended.find(Key); It != Ended.end())
+        llvm::append_range(Operations, It->second);
+      Path.pop_back();
+    }
+    if (auto It = Ended.find({Parent, nullptr, {}}); It != Ended.end())
+      llvm::append_range(Operations, It->second);
+    return Operations;
+  }
+
+  static llvm::CallBase *generationRead(llvm::Value *Value, llvm::Value *Slot) {
+    auto *Read = llvm::dyn_cast_or_null<llvm::CallBase>(Value);
+    auto *F = Read ? Read->getCalledFunction() : nullptr;
+    return F && F->getName() == "cpn.generation" &&
+                   Read->getArgOperand(0) == Slot
+               ? Read
+               : nullptr;
+  }
+
+  static bool readsBirth(const llvm::CallBase &Read) {
+    auto *Original = llvm::dyn_cast<llvm::ConstantInt>(Read.getArgOperand(1));
+    return Original && Original->isOne();
+  }
+
+  // A successful parent check fixes the epoch in which the compiler selected
+  // the child. Follow the check's success edge only through instructions that
+  // cannot change that registration.
+  std::optional<llvm::CallBase *>
+  checkedParentBirth(const llvm::CallBase &Child, llvm::Value *Parent) const {
+    auto *BB = Child.getParent();
+    auto Cursor = Child.getIterator();
+    unsigned Budget = 32;
+    while (Budget--) {
+      if (Cursor != BB->begin()) {
+        if ((--Cursor)->mayWriteToMemory())
+          return std::nullopt;
+        continue;
+      }
+      auto *Predecessor = BB->getSinglePredecessor();
+      if (!Predecessor)
+        return std::nullopt;
+      auto *Branch =
+          llvm::dyn_cast<llvm::CondBrInst>(Predecessor->getTerminator());
+      if (Branch && Branch->getSuccessor(1) == BB &&
+          Branch->getSuccessor(0) != BB) {
+        auto *Negated =
+            llvm::dyn_cast<llvm::BinaryOperator>(Branch->getCondition());
+        auto *Invert =
+            Negated && Negated->getOpcode() == llvm::Instruction::Xor
+                ? llvm::dyn_cast<llvm::ConstantInt>(Negated->getOperand(1))
+                : nullptr;
+        const auto *Check =
+            Invert && Invert->isOne()
+                ? llvm::dyn_cast<llvm::CallBase>(Negated->getOperand(0))
+                : nullptr;
+        auto *F = Check ? Check->getCalledFunction() : nullptr;
+        if (F && F->getName() == "cpn.borrow.valid" &&
+            Check->getParent() == Predecessor &&
+            Check->getArgOperand(0) == Parent &&
+            std::none_of(std::next(Check->getIterator()), Branch->getIterator(),
+                         [](const auto &I) { return I.mayWriteToMemory(); })) {
+          auto *Stamp = Check->getArgOperand(1);
+          if (auto *Read = generationRead(Stamp, Parent);
+              Read && readsBirth(*Read))
+            return Read;
+          if (auto *Original = llvm::dyn_cast<llvm::ConstantInt>(Stamp);
+              Original && Original->isZero() &&
+              llvm::isa<llvm::GlobalVariable>(Parent))
+            return nullptr; // The static original is selected at function
+                            // entry.
+          return std::nullopt;
+        }
+      }
+      BB = Predecessor;
+      Cursor = BB->getTerminator()->getIterator();
+    }
+    return std::nullopt;
+  }
+
+  bool initializedWithoutRetirement(llvm::CallBase &Use,
+                                    llvm::Value *Registration,
+                                    llvm::Value *Object) const {
+    struct Position {
+      llvm::BasicBlock *Block;
+      llvm::BasicBlock::iterator Cursor;
+    };
+    llvm::SmallVector<Position> Work{{Use.getParent(), Use.getIterator()}};
+    llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    unsigned Budget = 2048;
+    bool Initialized = false;
+    while (!Work.empty()) {
+      auto [BB, Cursor] = Work.pop_back_val();
+      bool AtBirth = false;
+      while (Cursor != BB->begin()) {
+        if (!Budget--)
+          return false;
+        auto *Call = llvm::dyn_cast<llvm::CallBase>(&*--Cursor);
+        if (!Call || Call->onlyReadsMemory())
+          continue;
+        auto *F = Call->getCalledFunction();
+        if (!F)
+          return false;
+        auto Name = F->getName();
+        if (Name == "cpn.slot.begin" &&
+            Call->getArgOperand(0) == Registration &&
+            Call->getArgOperand(1) == Object) {
+          Initialized = AtBirth = true;
+          break;
+        }
+        // These operations may update internal tables. They do not end a
+        // generation or invoke a source-level cleanup operation.
+        if (Name != "cpn.slot.begin" && Name != "cpn.slot.link" &&
+            Name != "cpn.slot.child" && Name != "cpn.slot.find" &&
+            Name != "cpn.slot.linked" && Name != "cpn.generation" &&
+            Name != "cpn.borrow.valid" && Name != "cpn.extent.valid" &&
+            Name != "cpn.pointer.field")
+          return false;
+      }
+      if (AtBirth)
+        continue;
+      if (BB == &Root.getEntryBlock())
+        return false;
+      for (auto *Pred : llvm::predecessors(BB))
+        if (auto *Next = successor(Pred); Reachable.contains(Pred) &&
+                                          (!Next || Next == BB) &&
+                                          Visited.insert(Pred).second)
+          Work.push_back({Pred, Pred->end()});
+    }
+    return Initialized;
+  }
+
+  void verifyCheckedStorage(const Token &At) const {
+    llvm::SmallVector<llvm::CallBase *> Uses;
+    RetirementsByStorage Retirements;
+    for (auto &BB : Root)
       if (Reachable.contains(&BB))
-        for (const auto &I : BB) {
-          const auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
+        for (auto &I : BB) {
+          auto *Call = llvm::dyn_cast<llvm::CallBase>(&I);
           if (!Call)
             continue;
-          if (Call->getMetadata(SavedStorageUse))
+          if (Call->getMetadata(CheckedStorageUse) ||
+              Call->getMetadata(ConstructStorageUse) ||
+              Call->getMetadata(ExtentStorageUse))
             Uses.push_back(Call);
           if (auto *F = Call->getCalledFunction();
               F && F->getName() == "cpn.slot.retire")
             if (auto Key = storageRegistration(Call->getArgOperand(0)))
               Retirements[*Key].push_back(Call);
         }
-    if (Uses.empty() || Retirements.empty())
+    if (Uses.empty())
       return;
     llvm::DominatorTree Dominance(Root);
-    for (const auto *Use : Uses) {
-      auto [Slot, Generation] = savedGeneration(*Use, Dominance);
-      auto *Capture = llvm::dyn_cast_or_null<llvm::CallBase>(Generation);
-      const auto *Callee = Capture ? Capture->getCalledFunction() : nullptr;
+    for (auto *Use : Uses) {
+      auto *Slot = Use->getArgOperand(0);
+      auto *Generation = Use->getArgOperand(1);
+      const bool Saved = llvm::isa<llvm::LoadInst>(Slot);
+      if (Saved)
+        std::tie(Slot, Generation) = savedGeneration(*Use, Dominance);
       auto Key = storageRegistration(Slot);
-      if (!Callee || Callee->getName() != "cpn.generation" ||
-          Capture->getArgOperand(0) != Slot || !Key ||
-          !Dominance.dominates(Capture, Use))
+      if (!Key)
         continue;
-      auto [Parent, Object, Offset, Type] = *Key;
-      llvm::SmallVector<const llvm::CallBase *, 4> Ended;
-      if (auto It = Retirements.find(*Key); It != Retirements.end())
-        llvm::append_range(Ended, It->second);
-      if (Object)
-        if (auto It = Retirements.find({Parent, nullptr, 0, nullptr});
-            It != Retirements.end())
-          llvm::append_range(Ended, It->second);
-      if (Ended.empty() ||
-          llvm::none_of(Parent->users(), [&](const auto *User) {
+      auto &[Parent, Object, Path] = *Key;
+      auto *Capture = generationRead(Generation, Slot);
+      const auto *Construct = Use->getMetadata(ConstructStorageUse);
+      if (const auto *Extent =
+              Construct ? Construct : Use->getMetadata(ExtentStorageUse)) {
+        if (!Path.empty()) {
+          Token Source{At.Text, callSetting(*Extent, 0),
+                       callSetting(*Extent, 1)};
+          if (Capture && readsBirth(*Capture) &&
+              Dominance.dominates(Capture, Use)) {
+            auto Ancestors = endingOperations(*Key, Retirements, false);
+            if (!Ancestors.empty() &&
+                !mayReachBeforeRetirement(Capture, *Use, Ancestors))
+              fail(Source,
+                   "storage view designates an ended containing generation");
+          }
+          if (Construct && llvm::isa<llvm::AllocaInst>(Parent) &&
+              initializedWithoutRetirement(*Use, Parent, Object))
+            fail(Source, "storage contains a live generation");
+        }
+        continue;
+      }
+      if (!Capture || Retirements.empty())
+        continue;
+      if (!Saved) {
+        if (Path.empty() || !readsBirth(*Capture))
+          continue;
+        auto *Child = Slot;
+        std::optional<llvm::CallBase *> Birth = Capture;
+        for (size_t I = Path.size(); I != 0 && Birth; --I) {
+          auto &Selection = *llvm::cast<llvm::CallBase>(Child);
+          Child = Selection.getArgOperand(0);
+          Birth = checkedParentBirth(Selection, Child);
+        }
+        if (!Birth)
+          continue;
+        Capture = *Birth;
+      }
+      if (Capture && !Dominance.dominates(Capture, Use))
+        continue;
+      auto Ended = endingOperations(*Key, Retirements, true);
+      if (Ended.empty())
+        continue;
+      if (llvm::isa<llvm::AllocaInst>(Parent) &&
+          (!Capture || llvm::none_of(Parent->users(), [&](const auto *User) {
             const auto *Begin = llvm::dyn_cast<llvm::CallBase>(User);
             const auto *F = Begin ? Begin->getCalledFunction() : nullptr;
             return F && F->getName() == "cpn.slot.begin" &&
                    Begin->getArgOperand(0) == Parent &&
                    (!Object || Begin->getArgOperand(1) == Object) &&
                    Dominance.dominates(Begin, Capture);
-          }))
+          })))
         continue;
-      if (mayReachBeforeRetirement(*Capture, *Use, Ended))
+      if (mayReachBeforeRetirement(Capture, *Use, Ended))
         continue;
-      const auto &Location = *Use->getMetadata(SavedStorageUse);
+      const auto &Location = *Use->getMetadata(CheckedStorageUse);
       Token Source{At.Text, callSetting(Location, 0), callSetting(Location, 1)};
       fail(Source, "ended object generation");
     }
@@ -1235,7 +1428,7 @@ public:
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefGetters,
          const llvm::SmallPtrSetImpl<llvm::Function *> &RefConstructors) const {
     verifyOriginalStorage(At);
-    verifySavedStorage(At);
+    verifyCheckedStorage(At);
     auto IsAutomatic = [&](llvm::Value *V) {
       return llvm::isa<llvm::AllocaInst>(V) || Automatic.contains(V);
     };

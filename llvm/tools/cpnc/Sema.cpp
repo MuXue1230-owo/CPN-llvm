@@ -171,9 +171,9 @@ llvm::AllocaInst *Frame::allocate(const std::string &T, const Token &At) {
   Ptr->setMetadata("cpn.object", llvm::MDNode::get(U.C, {}));
   return Ptr;
 }
-cpn::Value Frame::load(cpn::Value V) {
+cpn::Value Frame::load(cpn::Value V, const Token &At) {
   if (!IR && V.Location) {
-    auto Current = V.Location->read(*this, {});
+    auto Current = V.Location->read(*this, At);
     Current.Readonly |= V.Readonly;
     Current.Expiring = V.Expiring;
     Current.Prvalue = V.Prvalue;
@@ -188,7 +188,7 @@ cpn::Value Frame::load(cpn::Value V) {
   }
   if (V.Type != StorageViewType &&
       (!StringRef(V.Type).ends_with("*") || V.PointerCell))
-    ensureLive(V, {});
+    ensureLive(V, At);
   if (V.Address && U.Ready.count(V.Address)) {
     if (!IR)
       fail({}, "dynamic static read is unavailable in a constant expression");

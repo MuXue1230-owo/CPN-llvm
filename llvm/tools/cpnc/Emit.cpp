@@ -537,7 +537,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
     else if (builtinPredicate(Op) || constraint(Op))
       return literal(predicate(N), "bool");
     else
-      return load(lookup(N.At));
+      return load(lookup(N.At), N.At);
   case Node::Index:
     if (!IR) {
       auto Base = eval(A[0]);
@@ -552,7 +552,7 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       return {unconst(element(Base.Type)),
               Array->getAggregateElement(unsigned(I->getZExtValue()))};
     }
-    return load(subscript(N));
+    return load(subscript(N), N.At);
   case Node::Member:
     if (ImplicitThis && N.Definition && A[0].K == Node::Name &&
         A[0].Text == "this") {
