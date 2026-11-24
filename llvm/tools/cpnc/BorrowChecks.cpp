@@ -1,4 +1,5 @@
 #include "Sema.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
@@ -928,64 +929,60 @@ class EscapeCheck {
 
   using SidecarStores = llvm::DenseMap<llvm::Instruction *, llvm::Value *>;
 
-  llvm::Value *
-  reachingSidecarValue(llvm::LoadInst &Load, const SidecarStores &Stores,
-                       const llvm::DominatorTree &Dominance) const {
+  bool
+  visitReachingValues(llvm::LoadInst &Load, const SidecarStores &Stores,
+                      const llvm::DominatorTree &Dominance,
+                      llvm::function_ref<bool(llvm::Value *)> Visit) const {
     using Location = std::pair<llvm::BasicBlock *, llvm::BasicBlock::iterator>;
     llvm::SmallVector<Location, 4> Work{{Load.getParent(), Load.getIterator()}};
     llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
-    llvm::Value *Value = nullptr;
+    bool ReachedStore = false;
     unsigned Budget = 2048;
     while (!Work.empty()) {
       auto [BB, Cursor] = Work.pop_back_val();
       bool Found = false;
       while (Cursor != BB->begin()) {
         if (!Budget--)
-          return nullptr;
+          return false;
         auto It = Stores.find(&*--Cursor);
         if (It == Stores.end())
           continue;
-        if (Value && Value != It->second)
-          return nullptr;
-        Value = It->second;
-        Found = true;
+        if (!Visit(It->second))
+          return false;
+        ReachedStore = Found = true;
         break;
       }
       if (Found)
         continue;
       if (BB == &Load.getFunction()->getEntryBlock())
-        return nullptr;
+        return false;
       for (auto *Pred : llvm::predecessors(BB))
         if (auto *Next = successor(Pred);
             Dominance.isReachableFromEntry(Pred) && (!Next || Next == BB) &&
             Visited.insert(Pred).second)
           Work.emplace_back(Pred, Pred->end());
     }
-    return Value;
+    return ReachedStore;
   }
 
-  // A local pointer's sidecar has a known registration and cannot be written
-  // via an alias when every use of its address is visible here.
-  std::pair<llvm::Value *, llvm::Value *>
-  savedGeneration(llvm::Value *Registration, llvm::Value *Generation,
-                  const llvm::DominatorTree &Dominance) const {
-    auto *SlotLoad = llvm::dyn_cast<llvm::LoadInst>(Registration);
-    auto *StampLoad = llvm::dyn_cast<llvm::LoadInst>(Generation);
-    if (!SlotLoad || !StampLoad || !SlotLoad->isSimple() ||
-        !StampLoad->isSimple())
-      return {};
-    const auto Locator = slot(SlotLoad->getPointerOperand());
-    const auto Stamp = slot(StampLoad->getPointerOperand());
-    auto *Field = llvm::dyn_cast<llvm::CallBase>(Locator.Base);
-    auto *Callee = Field ? Field->getCalledFunction() : nullptr;
-    if (!Callee || Callee->getName() != "cpn.pointer.field" ||
-        Locator.Base != Stamp.Base)
-      return {};
-    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Field->getArgOperand(0));
+  llvm::Value *
+  reachingSidecarValue(llvm::LoadInst &Load, const SidecarStores &Stores,
+                       const llvm::DominatorTree &Dominance) const {
+    llvm::Value *Value = nullptr;
+    bool Uniform =
+        visitReachingValues(Load, Stores, Dominance, [&](llvm::Value *Stored) {
+          if (Value && Value != Stored)
+            return false;
+          Value = Stored;
+          return true;
+        });
+    return Uniform ? Value : nullptr;
+  }
+
+  bool isolatedPointerCell(llvm::AllocaInst *Object) const {
     if (!Object || !Object->getAllocatedType()->isPointerTy() ||
         !Object->getMetadata("cpn.object") || Object->getNumUses() > 128)
-      return {};
-    SidecarStores Stores[2];
+      return false;
     for (auto *Access : Object->users()) {
       if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(Access);
           Load && Load->isSimple())
@@ -1017,12 +1014,115 @@ class EscapeCheck {
                      Name == "cpn.generation" || Name == "cpn.borrow.valid" ||
                      Name == "cpn.slot.retire" || Name == "cpn.slot.release";
             }))
-          return {};
+          return false;
         continue;
       }
       if (!F || F->getName() != "cpn.pointer.field" ||
           Call->getArgOperand(0) != Object || Call->getNumUses() > 128)
-        return {};
+        return false;
+    }
+    return true;
+  }
+
+  using CalleeSet = llvm::SmallVector<llvm::Function *, 4>;
+
+  bool collectCallees(llvm::Value *Value, CalleeSet &Callees,
+                      llvm::SmallPtrSetImpl<llvm::Value *> &Active,
+                      std::optional<llvm::DominatorTree> &Tree,
+                      unsigned &Budget) const {
+    if (!Budget)
+      return false;
+    --Budget;
+    Value = Value->stripPointerCasts();
+    if (auto *F = llvm::dyn_cast<llvm::Function>(Value)) {
+      if (!Definitions.contains(F))
+        return false;
+      if (!llvm::is_contained(Callees, F))
+        Callees.push_back(F);
+      return true;
+    }
+    if (!Active.insert(Value).second)
+      return false;
+    auto Remove = llvm::scope_exit([&] { Active.erase(Value); });
+    auto Add = [&](llvm::Value *Operand) {
+      return collectCallees(Operand, Callees, Active, Tree, Budget);
+    };
+    if (auto *Select = llvm::dyn_cast<llvm::SelectInst>(Value)) {
+      if (auto *Condition =
+              llvm::dyn_cast<llvm::ConstantInt>(Select->getCondition()))
+        return Add(Select->getOperand(Condition->isZero() ? 2 : 1));
+      return Add(Select->getTrueValue()) && Add(Select->getFalseValue());
+    }
+    if (auto *Phi = llvm::dyn_cast<llvm::PHINode>(Value)) {
+      if (!Tree)
+        Tree.emplace(*Phi->getFunction());
+      bool Reached = false;
+      for (unsigned I = 0; I != Phi->getNumIncomingValues(); ++I) {
+        auto *From = Phi->getIncomingBlock(I);
+        auto *Next = successor(From);
+        if (!Tree->isReachableFromEntry(From) ||
+            (Next && Next != Phi->getParent()))
+          continue;
+        if (!Add(Phi->getIncomingValue(I)))
+          return false;
+        Reached = true;
+      }
+      return Reached;
+    }
+    auto *Load = llvm::dyn_cast<llvm::LoadInst>(Value);
+    if (!Load || !Load->isSimple())
+      return false;
+    auto *Cell = llvm::dyn_cast<llvm::AllocaInst>(Load->getPointerOperand());
+    if (!isolatedPointerCell(Cell))
+      return false;
+    SidecarStores Stores;
+    for (auto *User : Cell->users())
+      if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(User))
+        Stores.try_emplace(Store, Store->getValueOperand());
+    if (!Tree)
+      Tree.emplace(*Load->getFunction());
+    return visitReachingValues(*Load, Stores, *Tree, Add);
+  }
+
+  CalleeSet retirementCallees(const llvm::CallBase &Call) const {
+    unsigned Budget = 256;
+    if (auto *F = knownTarget(Call, Budget, nullptr))
+      return Definitions.contains(F) ? CalleeSet{F} : CalleeSet{};
+    CalleeSet Callees;
+    llvm::SmallPtrSet<llvm::Value *, 8> Active;
+    std::optional<llvm::DominatorTree> Tree;
+    Budget = 256;
+    if (!collectCallees(Call.getCalledOperand(), Callees, Active, Tree, Budget))
+      Callees.clear();
+    return Callees;
+  }
+
+  // A local pointer's sidecar has a known registration and cannot be written
+  // via an alias when every use of its address is visible here.
+  std::pair<llvm::Value *, llvm::Value *>
+  savedGeneration(llvm::Value *Registration, llvm::Value *Generation,
+                  const llvm::DominatorTree &Dominance) const {
+    auto *SlotLoad = llvm::dyn_cast<llvm::LoadInst>(Registration);
+    auto *StampLoad = llvm::dyn_cast<llvm::LoadInst>(Generation);
+    if (!SlotLoad || !StampLoad || !SlotLoad->isSimple() ||
+        !StampLoad->isSimple())
+      return {};
+    const auto Locator = slot(SlotLoad->getPointerOperand());
+    const auto Stamp = slot(StampLoad->getPointerOperand());
+    auto *Field = llvm::dyn_cast<llvm::CallBase>(Locator.Base);
+    auto *Callee = Field ? Field->getCalledFunction() : nullptr;
+    if (!Callee || Callee->getName() != "cpn.pointer.field" ||
+        Locator.Base != Stamp.Base)
+      return {};
+    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Field->getArgOperand(0));
+    if (!isolatedPointerCell(Object))
+      return {};
+    SidecarStores Stores[2];
+    for (auto *User : Object->users()) {
+      auto *Call = llvm::dyn_cast<llvm::CallBase>(User);
+      auto *F = Call ? Call->getCalledFunction() : nullptr;
+      if (!F || F->getName() != "cpn.pointer.field")
+        continue;
       for (auto *Address : Call->users()) {
         auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(Address);
         if (!GEP || !GEP->hasAllConstantIndices())
@@ -1389,8 +1489,8 @@ class EscapeCheck {
         auto Bundle = Forward->getOperandBundle(StorageArgumentBundle);
         if (!Bundle)
           continue;
-        auto *Callee = knownTarget(*Forward, Budget, nullptr);
-        if (!Callee || !Definitions.contains(Callee))
+        auto Callees = retirementCallees(*Forward);
+        if (Callees.empty())
           continue;
         for (size_t J = 0; J < Bundle->Inputs.size(); J += 3) {
           unsigned Position =
@@ -1400,7 +1500,10 @@ class EscapeCheck {
                isArgumentRegistration(Bundle->Inputs[J + 1].get(),
                                       Bundle->Inputs[J + 2].get(), F, Argument,
                                       Dominance)) &&
-              retiresArgumentOnReturn(*Callee, Position, Cache, Budget)) {
+              llvm::all_of(Callees, [&](auto *Callee) {
+                return retiresArgumentOnReturn(*Callee, Position, Cache,
+                                               Budget);
+              })) {
             Retired = Ends = true;
             break;
           }
@@ -1441,9 +1544,8 @@ class EscapeCheck {
           auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
           if (!Bundle)
             continue;
-          unsigned TargetBudget = 256;
-          auto *F = knownTarget(*Call, TargetBudget, nullptr);
-          if (!F || !Definitions.contains(F))
+          auto Callees = retirementCallees(*Call);
+          if (Callees.empty())
             continue;
           for (size_t I = 0; I < Bundle->Inputs.size(); I += 3) {
             auto *Slot = Bundle->Inputs[I + 1].get();
@@ -1456,8 +1558,10 @@ class EscapeCheck {
                 llvm::cast<llvm::ConstantInt>(Bundle->Inputs[I].get())
                     ->getZExtValue();
             unsigned Budget = 2048;
-            if (retiresArgumentOnReturn(*F, Argument, ArgumentRetirements,
-                                        Budget))
+            if (llvm::all_of(Callees, [&](auto *Callee) {
+                  return retiresArgumentOnReturn(*Callee, Argument,
+                                                 ArgumentRetirements, Budget);
+                }))
               Retirements[*Key].push_back(Call);
           }
         }

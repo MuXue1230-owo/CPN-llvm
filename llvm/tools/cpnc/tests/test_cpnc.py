@@ -7672,6 +7672,12 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(
             self.program(dispatch.replace("INPUT", "true")), -signal.SIGILL
         )
+        all_targets_end = dispatch.replace(
+            "void observe(i32* value){}", "void observe(i32* value){abandon(*value);}"
+        )
+        checked = self.compile(all_targets_end.replace("INPUT", "false"), "--check")
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        self.assertIn("ended object generation", checked.stderr)
         rebound = """
             void finish(i32* value,i32* other){
                 value=other;
