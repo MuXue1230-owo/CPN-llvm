@@ -733,10 +733,10 @@ public:
   bool operandNeedsDestination(const Node &, const std::string &);
   bool canProjectOperand(const Node &, const std::string &, llvm::Value *);
   bool canStagePlacementPrefix(const std::string &);
-  ResultProjection stagePlacementPrefix(llvm::Value *Enclosing,
-                                        llvm::ArrayRef<Value>,
+  ResultProjection stagePlacementPrefix(Value Enclosing, llvm::ArrayRef<Value>,
                                         llvm::ArrayRef<uint64_t> Offsets,
-                                        llvm::Value *Progress);
+                                        llvm::Value *Progress,
+                                        llvm::Value *InvariantActive = nullptr);
   Value constructPrvalue(const Node &, const std::string &, llvm::Value *,
                          const Token &, ResultProjection = {});
   std::optional<Value>
@@ -759,7 +759,8 @@ public:
   };
   std::vector<PendingInvariantLifetime> InvariantConstructionLifetimes;
   llvm::Value *pushInvariantLifetime(const Value &, const Node *Tail = nullptr,
-                                     bool IsConstruction = true);
+                                     bool IsConstruction = true,
+                                     llvm::Value **Activation = nullptr);
   void popInvariantLifetime(llvm::Value *, bool IsConstruction = true);
   void exitInvariantConstructionLifetimes(
       size_t Depth = 0, const std::set<SourcePosition> *Exited = nullptr);

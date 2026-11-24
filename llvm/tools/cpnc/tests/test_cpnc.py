@@ -8753,6 +8753,64 @@ class CompilerTests(unittest.TestCase):
                     42,
                 )
 
+    def test_projected_record_keeps_old_invariant_and_installs_new_layout(self):
+        self.assertEqual(
+            self.program(
+                """
+                extern "C" void record(i32 digit);
+                struct Child {i32 data;};
+                [[invariant(marker>=0)]] struct Pair {
+                    i32 marker;
+                    Child child;
+                    virtual i32 read() const {return marker;}
+                };
+                Child prepare(Pair& old){
+                    record(1);
+                    i32 previous(old.read());
+                    record(2);
+                    destroy(old);
+                    return Child(previous);
+                }
+                Child clear(i64[8]& old){destroy(old);return Child(21);}
+                extern "C" i32 fresh(){
+                    i64[8] old;
+                    auto area(storage_of(old));
+                    auto built(construct_at<Pair>(area,21,clear(old)));
+                    return built->read()+built->child.data;
+                }
+                extern "C" i32 rebuild(bool invalid){
+                    Pair old(21,Child(1));
+                    if(invalid){old.marker=-1;}
+                    auto area(storage_of(old));
+                    auto built(construct_at<Pair>(area,21,prepare(old)));
+                    return built->read()+built->child.data;
+                }
+                """,
+                host="""
+                #include <stdbool.h>
+                #include <signal.h>
+                #include <stdint.h>
+                #include <stdlib.h>
+                extern int32_t fresh(void);
+                extern int32_t rebuild(bool);
+                static volatile sig_atomic_t trace;
+                void record(int32_t digit) { trace = trace * 10 + digit; }
+                static void rejected(int reason) {
+                    _Exit(reason == SIGILL && trace == 1 ? 42 : 1);
+                }
+                int main(void) {
+                    if (fresh() != 42 || trace != 0) return 2;
+                    if (rebuild(false) != 42 || trace != 12) return 3;
+                    trace = 0;
+                    if (signal(SIGILL, rejected) == SIG_ERR) return 4;
+                    rebuild(true);
+                    return 5;
+                }
+                """,
+            ),
+            42,
+        )
+
     def test_constant_aggregate_reconstruction_admits_after_arguments(self):
         self.assertEqual(
             self.program("""

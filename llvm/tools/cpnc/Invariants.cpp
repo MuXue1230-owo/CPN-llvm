@@ -46,7 +46,7 @@ llvm::GlobalVariable *currentLifetime(llvm::Module &M) {
 
 llvm::StructType *lifetimeEntry(llvm::LLVMContext &C) {
   auto *Ptr = llvm::PointerType::getUnqual(C);
-  return llvm::StructType::get(C, {Ptr, Ptr, Ptr});
+  return llvm::StructType::get(C, {Ptr, Ptr, Ptr, llvm::Type::getInt1Ty(C)});
 }
 
 void markInternal(llvm::Instruction *I) {
@@ -72,7 +72,8 @@ bool Context::hasCheckedInvariant(const Function &F) const {
 }
 
 llvm::Value *Frame::pushInvariantLifetime(const Value &Obj, const Node *Tail,
-                                          bool IsConstruction) {
+                                          bool IsConstruction,
+                                          llvm::Value **Activation) {
   if (!IR || TypeQuery || !checkable(U, Obj.Type))
     return nullptr;
   auto *Current = currentLifetime(U.M);
@@ -84,6 +85,11 @@ llvm::Value *Frame::pushInvariantLifetime(const Value &Obj, const Node *Tail,
   B.CreateStore(Obj.Address, B.CreateStructGEP(Entry, Node, 0));
   B.CreateStore(U.typeID(Obj.Type), B.CreateStructGEP(Entry, Node, 1));
   B.CreateStore(Previous, B.CreateStructGEP(Entry, Node, 2));
+  // Keep the old generation's checks visible during projected evaluation.
+  auto *Active = B.CreateStructGEP(Entry, Node, 3);
+  markInternal(B.CreateStore(B.getInt1(!Activation), Active));
+  if (Activation)
+    *Activation = Active;
   markInternal(B.CreateStore(Node, Current));
   if (IsConstruction) {
     std::optional<SourcePosition> At;
@@ -195,8 +201,11 @@ void Frame::checkMethodInvariant(bool Entry) {
   };
   auto *Same = B.CreateAnd(B.CreateICmpEQ(Self.Address, load(0)),
                            B.CreateICmpEQ(U.typeID(Self.Type), load(1)));
+  auto *Active =
+      B.CreateLoad(B.getInt1Ty(), B.CreateStructGEP(Layout, Node, 3));
+  markInternal(Active);
   Node->addIncoming(load(2), Inspect);
-  B.CreateCondBr(Same, Done, Head);
+  B.CreateCondBr(B.CreateAnd(Same, Active), Done, Head);
   B.SetInsertPoint(Check);
   checkInvariants(Self, true, true);
   B.CreateBr(Done);

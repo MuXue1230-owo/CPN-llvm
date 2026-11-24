@@ -238,7 +238,8 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
     llvm::SmallVector<uint64_t> Offsets;
     for (size_t I = 0; I < *Projected; ++I)
       Offsets.push_back(Offset + Layout->getElementOffset(I));
-    Projection = stagePlacementPrefix(Ptr, Operands, Offsets, Progress);
+    Projection = stagePlacementPrefix({C.Owner, nullptr, Ptr}, Operands,
+                                      Offsets, Progress);
   }
   for (size_t I = 0; I < C.Types.size(); ++I) {
     if (Projected && I < *Projected)

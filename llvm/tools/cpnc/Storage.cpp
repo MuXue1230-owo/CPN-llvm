@@ -487,42 +487,52 @@ bool Frame::canStagePlacementPrefix(const std::string &T) {
   return Type->isIntegerTy() || Type->isFloatingPointTy();
 }
 
-ResultProjection Frame::stagePlacementPrefix(llvm::Value *Enclosing,
+ResultProjection Frame::stagePlacementPrefix(Value Enclosing,
                                              llvm::ArrayRef<Value> Values,
                                              llvm::ArrayRef<uint64_t> Offsets,
-                                             llvm::Value *Progress) {
-  if (Values.empty())
-    return {Enclosing};
+                                             llvm::Value *Progress,
+                                             llvm::Value *InvariantActive) {
+  const bool Tables = !U.Records.at(Enclosing.Type).Tables.empty();
+  if (Values.empty() && !Tables && !InvariantActive)
+    return {Enclosing.Address};
   assert(Values.size() == Offsets.size());
-  llvm::SmallVector<llvm::Type *> Types{B.getPtrTy(), B.getPtrTy()};
+  llvm::SmallVector<llvm::Type *> Types(3, B.getPtrTy());
   for (const auto &V : Values)
     Types.push_back(V.IR->getType());
   auto *StateType = llvm::StructType::get(U.C, Types);
   llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
   auto *State = Entry.CreateAlloca(StateType);
-  B.CreateStore(Enclosing, B.CreateStructGEP(StateType, State, 0));
-  B.CreateStore(Progress ? Progress
-                         : llvm::ConstantPointerNull::get(B.getPtrTy()),
+  auto *Null = llvm::ConstantPointerNull::get(B.getPtrTy());
+  B.CreateStore(Enclosing.Address, B.CreateStructGEP(StateType, State, 0));
+  B.CreateStore(Progress ? Progress : Null,
                 B.CreateStructGEP(StateType, State, 1));
+  B.CreateStore(InvariantActive ? InvariantActive : Null,
+                B.CreateStructGEP(StateType, State, 2));
   for (auto [I, V] : llvm::enumerate(Values))
-    B.CreateStore(V.IR, B.CreateStructGEP(StateType, State, I + 2));
+    B.CreateStore(V.IR, B.CreateStructGEP(StateType, State, I + 3));
 
   auto *FT = llvm::FunctionType::get(B.getVoidTy(), {B.getPtrTy()}, false);
   auto *Prepare = llvm::Function::Create(FT, llvm::GlobalValue::InternalLinkage,
                                          "cpn.slot.prepare.fields", U.M);
-  llvm::IRBuilder<> Apply(llvm::BasicBlock::Create(U.C, "entry", Prepare));
+  Frame Preparation(U, nullptr, Prepare);
+  auto &Apply = Preparation.B;
+  Apply.SetInsertPoint(Preparation.block("entry"));
   auto Load = [&](unsigned I) {
     return Apply.CreateLoad(
         Types[I], Apply.CreateStructGEP(StateType, Prepare->getArg(0), I));
   };
   auto *Object = Load(0);
+  if (Tables)
+    Preparation.installTables({Enclosing.Type, nullptr, Object});
   for (auto [I, Offset] : llvm::enumerate(Offsets))
-    Apply.CreateStore(Load(I + 2), Apply.CreateGEP(Apply.getInt8Ty(), Object,
+    Apply.CreateStore(Load(I + 3), Apply.CreateGEP(Apply.getInt8Ty(), Object,
                                                    Apply.getInt64(Offset)));
   if (Progress)
     Apply.CreateStore(Apply.getInt64(Values.size()), Load(1));
+  if (InvariantActive)
+    Apply.CreateStore(Apply.getTrue(), Load(2));
   Apply.CreateRetVoid();
-  return {Enclosing, Prepare, State};
+  return {Enclosing.Address, Prepare, State};
 }
 
 Value Frame::constructPrvalue(const Node &N, const std::string &T,

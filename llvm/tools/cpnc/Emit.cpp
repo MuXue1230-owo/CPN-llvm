@@ -2269,8 +2269,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
         if (!operandNeedsDestination(Arg, Aggregate.Params[Index]))
           continue;
         // A projection can prepare preceding typed stores at admission.
-        if (!AsBase && !Tail && R.Bases.empty() && R.Tables.empty() &&
-            !R.InvariantSite && It == U.Overloads.end() &&
+        if (!AsBase && !Tail && R.Bases.empty() && It == U.Overloads.end() &&
             llvm::all_of(
                 llvm::ArrayRef(Aggregate.Params).take_front(Index),
                 [&](const auto &Ty) { return canStagePlacementPrefix(Ty); }) &&
@@ -2288,11 +2287,13 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       }
     }
     llvm::Value *Progress = nullptr, *Previous = nullptr;
+    llvm::Value *InvariantActive = nullptr;
     auto Start = [&] {
       if (Admit)
         Admit();
       Progress = beginConstructionPrefix(Obj);
-      Previous = pushInvariantLifetime(Obj, Tail);
+      Previous = pushInvariantLifetime(Obj, Tail, true,
+                                       Projected ? &InvariantActive : nullptr);
       if (!AsBase)
         bindVirtualLayout(Obj);
       enterOwnerLayer(Obj);
@@ -2401,12 +2402,13 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
             llvm::SmallVector<uint64_t> Offsets;
             for (size_t I = 0; I < Staged; ++I)
               Offsets.push_back(Layout->getElementOffset(I));
-            Projection = stagePlacementPrefix(Ptr, Actual, Offsets, Progress);
+            Projection = stagePlacementPrefix(Obj, Actual, Offsets, Progress,
+                                              InvariantActive);
           }
           for (size_t I = Staged; I < Args.size(); ++I)
             BindInput(I);
         }
-        if (R.Bases.size() == (AsBase ? R.VirtualCount : 0))
+        if (!Projected && R.Bases.size() == (AsBase ? R.VirtualCount : 0))
           installTables(Obj);
         auto *SavedObject = PendingObject;
         auto SavedSlots = std::move(PendingSlots);
