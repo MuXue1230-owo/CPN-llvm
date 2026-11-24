@@ -8421,6 +8421,59 @@ class CompilerTests(unittest.TestCase):
                     42,
                 )
 
+    def test_whole_during_factory_local_cleanup_retires_unpublished_result(self):
+        self.assertEqual(
+            self.program("""
+                i32 trace;
+                i8 backing;
+                declare struct Outer;
+                declare void request(Outer* owner);
+                struct Parent {~Parent(){trace=trace*10+1;}};
+                struct Stage {
+                    Outer* owner;
+                    Stage(Outer* incoming){init owner(incoming);}
+                    ~Stage(){request(owner);}
+                };
+                struct Work {
+                    i8 data;
+                    Work(){init data(42);trace=trace*10+2;}
+                    ~Work(){trace=trace*10+3;}
+                };
+                Work prepare(Outer* owner){
+                    destroy(backing);
+                    Stage sentinel(owner);
+                    return Work();
+                }
+                struct Outer:Parent {
+                    Complete base<Parent>;
+                    ~Outer(){
+                        auto extent(storage_of(backing));
+                        construct_at<Work>(extent,prepare(this));
+                        trace=trace*10+9;
+                    }
+                    cleanup{
+                        auto resumed(construct_at<i8>(storage_of(backing),42));
+                        if(*resumed==42){trace=trace*10+4;}
+                    }
+                };
+                void request(Outer* owner){destroy_base<Parent>(owner);}
+                i32 main(){{Outer value;}return trace==2134 ? 42 : 1;}
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program("""
+                configuration {effects.inference=interprocedural;};
+                i32 retired;
+                struct Work {i32 data;~Work(){++retired;}};
+                [[lifecycle_effect(whole)]] void available(){}
+                Work build(){i32 local(42);return Work(local);}
+                [[effects(none)]] Work produce(){return build();}
+                i32 main(){Work item(produce());return item.data;}
+            """),
+            42,
+        )
+
     def test_independent_operands_precede_positional_prvalue_construction(self):
         common = """
             i32 trace;

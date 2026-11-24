@@ -690,30 +690,41 @@ class Inference {
         if (auto *A =
                 llvm::dyn_cast_or_null<llvm::Argument>(Event.Location.first))
           S.Replacements.insert({A->getArgNo(), Event.Type, Event.Cleanup});
-    for (auto *Block : Plan.Reachable)
-      for (auto &I : *Block) {
-        if (I.getMetadata("cpn.internal"))
-          continue;
-        auto &Effects = I.getMetadata(BoundaryScope) ? S.Boundary : S.Effects;
-        addMetadataEffects(I.getMetadata(OperationEffects), Effects);
-        addMetadataEffects(I.getMetadata(BoundaryEffects), S.Boundary);
-        if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
-          if (!Plan.computesWrite(*L))
-            Plan.memory(Effects, "read", L->getPointerOperand());
-          if (L->isVolatile())
-            Effects.insert("volatile");
-          if (L->isAtomic())
-            Effects.insert("atomic");
-        } else if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
-          Plan.memory(Effects, "write", Store->getPointerOperand());
-          if (Store->isVolatile())
-            Effects.insert("volatile");
-          if (Store->isAtomic())
-            Effects.insert("atomic");
-        } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
-          callEffects(Plan, S, Effects, *Call, Interprocedural);
-        }
+    auto Add = [&](llvm::Instruction &I) {
+      if (I.getMetadata("cpn.internal"))
+        return;
+      auto &Effects = I.getMetadata(BoundaryScope) ? S.Boundary : S.Effects;
+      addMetadataEffects(I.getMetadata(OperationEffects), Effects);
+      addMetadataEffects(I.getMetadata(BoundaryEffects), S.Boundary);
+      if (auto *L = llvm::dyn_cast<llvm::LoadInst>(&I)) {
+        if (!Plan.computesWrite(*L))
+          Plan.memory(Effects, "read", L->getPointerOperand());
+        if (L->isVolatile())
+          Effects.insert("volatile");
+        if (L->isAtomic())
+          Effects.insert("atomic");
+      } else if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(&I)) {
+        Plan.memory(Effects, "write", Store->getPointerOperand());
+        if (Store->isVolatile())
+          Effects.insert("volatile");
+        if (Store->isAtomic())
+          Effects.insert("atomic");
+      } else if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+        callEffects(Plan, S, Effects, *Call, Interprocedural);
       }
+    };
+    llvm::SmallVector<llvm::Instruction *, 8> CanceledResult;
+    for (auto *Block : Plan.Reachable)
+      for (auto &I : *Block)
+        if (I.getMetadata("cpn.whole.return.cleanup"))
+          CanceledResult.push_back(&I);
+        else
+          Add(I);
+    // The unpublished result is retired only on a reached Whole edge.
+    if (S.Open || S.Effects.count("whole") || S.Boundary.count("whole") ||
+        (D && D->MayWhole))
+      for (auto *I : CanceledResult)
+        Add(*I);
     return S;
   }
 

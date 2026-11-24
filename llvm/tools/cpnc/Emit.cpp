@@ -2497,8 +2497,10 @@ void Frame::drop(Value V, bool AsBase) {
   }
   if (!V.Storage.empty() && Active.count(V.Storage) && !Active[V.Storage])
     return;
+  // A class with no bases cannot own a Whole request. Its destruction
+  // continues under the surrounding coordinator, if one is active.
   if (U.Whole && !AsBase && U.Records.count(V.Type) &&
-      !U.Records.at(V.Type).Views.empty()) {
+      !U.Records.at(V.Type).Bases.empty()) {
     B.CreateCall(U.coordinator(V.Type), {V.Address});
     return;
   }
@@ -3229,11 +3231,47 @@ void Frame::stmt(const Node &N, StringRef EntryLabel) {
       endExpression();
       throw ConstantTransfer{Node::Return, V, {}};
     }
+    // A result can be canceled when its remaining cleanup transfers control.
+    llvm::Value *BeforeRetirement = nullptr;
+    if (Result && U.Whole && (!F->Effects || F->Effects->count("whole")) &&
+        (!Temps.empty() || llvm::any_of(Scopes, [](const Local &S) {
+           return !S.Drops.empty();
+         })))
+      BeforeRetirement = wholeEpoch();
     endExpression();
     cleanup(1);
-    checkContracts(false, V);
+    if (BeforeRetirement) {
+      auto *Postcondition = block("return.postcondition");
+      auto *Parameters = block("return.parameters");
+      B.CreateCondBr(B.CreateICmpEQ(BeforeRetirement, wholeEpoch()),
+                     Postcondition, Parameters);
+      B.SetInsertPoint(Postcondition);
+      checkContracts(false, V);
+      branch(Parameters);
+      B.SetInsertPoint(Parameters);
+    } else {
+      checkContracts(false, V);
+    }
     cleanupScope(0);
     exitInvariantConstructionLifetimes();
+    if (BeforeRetirement) {
+      auto *Cancel = block("return.whole");
+      auto *Publish = block("return.publish");
+      B.CreateCondBr(B.CreateICmpNE(BeforeRetirement, wholeEpoch()), Cancel,
+                     Publish);
+      B.SetInsertPoint(Cancel);
+      drop({unconst(F->Result), nullptr, Result});
+      B.CreateRetVoid();
+      auto *Cleanup = llvm::MDNode::get(U.C, {});
+      auto Mark = [&](llvm::BasicBlock &Part) {
+        for (auto &I : Part)
+          I.setMetadata("cpn.whole.return.cleanup", Cleanup);
+      };
+      Mark(*Cancel);
+      for (auto I = std::next(Publish->getIterator()); I != IR->end(); ++I)
+        Mark(*I);
+      B.SetInsertPoint(Publish);
+    }
     checkMethodInvariant(false);
     publishPointerResult(V);
     if (V.Type == "void" || Result)
