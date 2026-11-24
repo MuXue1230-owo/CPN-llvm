@@ -472,26 +472,43 @@ void Frame::admitResult(llvm::Value *Address) {
         B.CreateCall(U.M.getFunction("cpn.slot.admit.result"), {Address})));
 }
 
+bool Frame::canProjectOperand(const Node &N, const std::string &Type,
+                              llvm::Value *Enclosing) {
+  const auto T = unconst(Type);
+  return U.aggregate(T) && !(N.K == Node::Unary && N.Text == "&") &&
+         ((Replacement && Replacement->Address == Enclosing) ||
+          admitsResult(Enclosing)) &&
+         unconst(unevaluatedType(N, true, T)) == T;
+}
+
 Value Frame::constructPrvalue(const Node &N, const std::string &T,
-                              llvm::Value *Dest, const Token &At) {
+                              llvm::Value *Dest, const Token &At,
+                              llvm::Value *Enclosing) {
+  auto *Storage = Enclosing ? Enclosing : Dest;
   const auto *Request =
-      Replacement && Replacement->Address == Dest ? Replacement : nullptr;
+      Replacement && Replacement->Address == Storage ? Replacement : nullptr;
+  const bool Project = !Request && Enclosing && admitsResult(Enclosing);
+  const bool Scoped = Request || Project;
   llvm::SaveAndRestore ResultAddress(DeferredResultAddress,
-                                     Request ? Dest : DeferredResultAddress);
+                                     Scoped ? Dest : DeferredResultAddress);
   llvm::SaveAndRestore ReplacementScope(Replacement,
                                         Request ? nullptr : Replacement);
   Value Release;
-  if (Request) {
+  if (Scoped) {
     // A factory can retire the old generation while preparing its result.
     // Forward the final address and validate at the first construction
     // frontier.
     llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
     Release.DeferredConstruction = Entry.CreateAlloca(
         llvm::StructType::getTypeByName(U.C, "cpn.deferred.result"));
-    B.CreateCall(U.M.getFunction("cpn.slot.defer.result"),
-                 {Release.DeferredConstruction, Request->Slot, Request->Birth,
-                  Dest, Request->Reservation, B.getInt64(Request->Size),
-                  B.getInt64(Request->Alignment)});
+    if (Request)
+      B.CreateCall(U.M.getFunction("cpn.slot.defer.result"),
+                   {Release.DeferredConstruction, Request->Slot, Request->Birth,
+                    Dest, Request->Reservation, B.getInt64(Request->Size),
+                    B.getInt64(Request->Alignment)});
+    else
+      B.CreateCall(U.M.getFunction("cpn.slot.project.result"),
+                   {Release.DeferredConstruction, Enclosing, Dest});
     Scopes.back().Drops.push_back(Release);
   }
   auto Source = eval(N, T, Dest);
@@ -502,6 +519,8 @@ Value Frame::constructPrvalue(const Node &N, const std::string &T,
     markStorageSite(*Extent, "cpn.storage.construct.use", Request->At,
                     {Request->Size, Request->Alignment});
     guard(B.CreateNot(Extent));
+  }
+  if (Scoped) {
     assert(Scopes.back().Drops.back().DeferredConstruction ==
            Release.DeferredConstruction);
     Scopes.back().Drops.pop_back();

@@ -162,6 +162,7 @@ class EscapeCheck {
             Name == "cpn.slot.find" || Name == "cpn.slot.child" ||
             Name == "cpn.slot.release" || Name == "cpn.generation" ||
             Name == "cpn.slot.defer.result" ||
+            Name == "cpn.slot.project.result" ||
             Name == "cpn.slot.admit.result" || Name == "cpn.slot.end.result" ||
             Name == "cpn.slot.admit.replacement" ||
             Name == "cpn.borrow.valid" || Name == "cpn.whole.epoch")
@@ -1603,12 +1604,13 @@ class EscapeCheck {
     auto Name = F->getName();
     if (Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
         Name == "cpn.slot.reserve" || Name == "cpn.slot.unreserve" ||
-        Name == "cpn.slot.defer.result" || Name == "cpn.slot.admit.result" ||
-        Name == "cpn.slot.end.result" || Name == "cpn.slot.admit.replacement" ||
-        Name == "cpn.slot.child" || Name == "cpn.slot.find" ||
-        Name == "cpn.slot.linked" || Name == "cpn.generation" ||
-        Name == "cpn.borrow.valid" || Name == "cpn.extent.valid" ||
-        Name == "cpn.pointer.field" || Name == "cpn.static.read" ||
+        Name == "cpn.slot.defer.result" || Name == "cpn.slot.project.result" ||
+        Name == "cpn.slot.admit.result" || Name == "cpn.slot.end.result" ||
+        Name == "cpn.slot.admit.replacement" || Name == "cpn.slot.child" ||
+        Name == "cpn.slot.find" || Name == "cpn.slot.linked" ||
+        Name == "cpn.generation" || Name == "cpn.borrow.valid" ||
+        Name == "cpn.extent.valid" || Name == "cpn.pointer.field" ||
+        Name == "cpn.static.read" ||
         F->getIntrinsicID() == llvm::Intrinsic::trap)
       return true;
     if (Verified.contains(F))

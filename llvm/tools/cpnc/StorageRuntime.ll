@@ -5,8 +5,8 @@
 %cpn.slot = type { ptr, ptr, ptr, ptr, ptr, ptr, i64, i64, ptr, i64, i64, i64, i1 }
 %cpn.reconstruction = type { ptr, ptr }
 ; Previous request, extent slot and birth, result address, reservation,
-; required capacity and alignment, and whether admission succeeded.
-%cpn.deferred.result = type { ptr, ptr, i64, ptr, ptr, i64, i64, i1 }
+; required capacity and alignment, admission state, and the owning request.
+%cpn.deferred.result = type { ptr, ptr, i64, ptr, ptr, i64, i64, i1, ptr }
 @cpn.slots = internal thread_local global ptr null
 @cpn.epoch = internal thread_local global i64 1
 @cpn.reconstructions = internal thread_local global ptr null
@@ -267,6 +267,7 @@ define internal void @cpn.slot.defer.result(ptr %request, ptr %slot, i64 %birth,
   %size.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 5
   %align.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 6
   %admitted.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 7
+  %owner.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 8
   store ptr %slot, ptr %slot.field
   store i64 %birth, ptr %birth.field
   store ptr %result, ptr %result.field
@@ -274,26 +275,59 @@ define internal void @cpn.slot.defer.result(ptr %request, ptr %slot, i64 %birth,
   store i64 %size, ptr %size.field
   store i64 %align, ptr %align.field
   store i1 false, ptr %admitted.field
+  store ptr %request, ptr %owner.field
   store ptr %request, ptr @cpn.deferred.results
   ret void
 }
 
-define internal i1 @cpn.slot.admit.result(ptr %result) {
+define internal ptr @cpn.slot.find.result(ptr %result) {
 entry:
   %head = load ptr, ptr @cpn.deferred.results
   br label %scan
 scan:
   %request = phi ptr [ %head, %entry ], [ %previous, %advance ]
   %ordinary = icmp eq ptr %request, null
-  br i1 %ordinary, label %admitted, label %match
+  br i1 %ordinary, label %missing, label %match
 match:
   %result.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 3
   %destination = load ptr, ptr %result.field
   %same = icmp eq ptr %destination, %result
-  br i1 %same, label %read, label %advance
+  br i1 %same, label %found, label %advance
 advance:
   %previous = load ptr, ptr %request
   br label %scan
+found:
+  %owner.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 8
+  %owner = load ptr, ptr %owner.field
+  ret ptr %owner
+missing:
+  ret ptr null
+}
+
+; A projected field and the returned object share one admission and reservation.
+define internal void @cpn.slot.project.result(ptr %projection, ptr %enclosing, ptr %result) {
+entry:
+  %owner = call ptr @cpn.slot.find.result(ptr %enclosing)
+  %ordinary = icmp eq ptr %owner, null
+  br i1 %ordinary, label %done, label %link
+link:
+  %previous = load ptr, ptr @cpn.deferred.results
+  store ptr %previous, ptr %projection
+  %result.field = getelementptr %cpn.deferred.result, ptr %projection, i32 0, i32 3
+  %owner.field = getelementptr %cpn.deferred.result, ptr %projection, i32 0, i32 8
+  store ptr %result, ptr %result.field
+  store ptr %owner, ptr %owner.field
+  store ptr %projection, ptr @cpn.deferred.results
+  br label %done
+done:
+  ret void
+}
+
+define internal i1 @cpn.slot.admit.result(ptr %result) {
+entry:
+  %request = call ptr @cpn.slot.find.result(ptr %result)
+  %ordinary = icmp eq ptr %request, null
+  br i1 %ordinary, label %admitted, label %read
 read:
   %admitted.field = getelementptr %cpn.deferred.result, ptr %request, i32 0, i32 7
   %ready = load i1, ptr %admitted.field
@@ -321,8 +355,15 @@ rejected:
 }
 
 define internal void @cpn.slot.end.result(ptr %request) {
+entry:
+  %head = load ptr, ptr @cpn.deferred.results
+  %active = icmp eq ptr %head, %request
+  br i1 %active, label %remove, label %done
+remove:
   %previous = load ptr, ptr %request
   store ptr %previous, ptr @cpn.deferred.results
+  br label %done
+done:
   ret void
 }
 

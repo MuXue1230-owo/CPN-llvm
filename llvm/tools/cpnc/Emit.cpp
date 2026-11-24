@@ -1903,12 +1903,15 @@ Frame::directConstruction(const Node &Arg, const std::string &T,
 // Bind in the caller's lexical environment. The plan connects the producer
 // at its canonical frontier after resolving whole-object versus member input.
 Initializer Frame::deferInitializer(const Node &Arg,
-                                    const std::string &Expected) {
+                                    const std::string &Expected,
+                                    llvm::Value *Enclosing) {
   llvm::IRBuilderBase::InsertPointGuard Save(B);
   auto *Entry = block("initializer");
   B.SetInsertPoint(Entry);
   auto *Storage = B.CreateAlloca(B.getInt8Ty());
-  auto Result = eval(Arg, Expected, Storage);
+  auto Result = Enclosing ? constructPrvalue(Arg, unconst(Expected), Storage,
+                                             Arg.At, Enclosing)
+                          : eval(Arg, Expected, Storage);
   return {Result, Entry, B.GetInsertBlock(), Storage};
 }
 
@@ -2077,6 +2080,7 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     const bool AggregateElement = U.aggregate(unconst(E));
     Value V{T, nullptr, Ptr};
     std::vector<Value> Operands;
+    bool ProjectFirst = false;
     if (Admit) {
       auto Source = Args.size() == 1 ? unevaluatedType(Args.front(), true, E)
                                      : std::string();
@@ -2103,11 +2107,14 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Operands.push_back(constructionOperand(Operand, Arg.At));
         }
       }
-      Admit();
+      ProjectFirst = Count && !Args.empty() && Operands.empty() &&
+                     canProjectOperand(Args.front(), E, Ptr);
+      if (!ProjectFirst)
+        Admit();
     }
     auto *Progress = beginConstructionPrefix(V);
     std::optional<Initializer> First;
-    if (Args.size() == 1 && Operands.empty()) {
+    if (Args.size() == 1 && Operands.empty() && !ProjectFirst) {
       First = deferInitializer(
           Args.front(),
           Args.front().K == Node::Unary && Args.front().Text == "&" ? E : "");
@@ -2123,22 +2130,28 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Args.size() > Count)
       fail(At, "too many array initializers");
     for (size_t I = 0; I < Args.size(); ++I) {
-      auto *P = B.CreateInBoundsGEP(Ty, Ptr, {B.getInt32(0), B.getInt64(I)});
-      if (I < Operands.size())
-        materialize(Operands[I], Args[I].At, P);
-      else if (!First)
-        construct(E, {Args[I]}, At, P);
-      else {
-        auto V = runInitializer(*First, {E, nullptr, P}, At);
-        if (V.Type == E)
-          materialize(V, At, P);
+      llvm::Value *Indices[] = {B.getInt32(0), B.getInt64(I)};
+      if (I == 0 && ProjectFirst) {
+        auto *P = B.CreateGEP(Ty, Ptr, Indices);
+        constructPrvalue(Args[I], unconst(E), P, Args[I].At, Ptr);
+      } else {
+        auto *P = B.CreateInBoundsGEP(Ty, Ptr, Indices);
+        if (I < Operands.size())
+          materialize(Operands[I], Args[I].At, P);
+        else if (!First)
+          construct(E, {Args[I]}, At, P);
         else {
-          Node Ref(Node::Name, At);
-          Ref.At.Text = Ref.Text = "$array.initializer";
-          Scopes.emplace_back();
-          Scopes.back().Names[Ref.Text] = V;
-          construct(E, {Ref}, At, P);
-          Scopes.pop_back();
+          auto V = runInitializer(*First, {E, nullptr, P}, At);
+          if (V.Type == E)
+            materialize(V, At, P);
+          else {
+            Node Ref(Node::Name, At);
+            Ref.At.Text = Ref.Text = "$array.initializer";
+            Scopes.emplace_back();
+            Scopes.back().Names[Ref.Text] = V;
+            construct(E, {Ref}, At, P);
+            Scopes.pop_back();
+          }
         }
       }
       if (Progress)
@@ -2245,6 +2258,14 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     if (Fits)
       for (size_t I = 0; I < Args.size(); ++I)
         Aggregate.Params.push_back(R.Fields[R.Bases.size() + I].Type);
+    // With no earlier setup writes, the first field supplies the frontier
+    // for admitting the entire enclosing extent.
+    const bool ProjectFirst =
+        Admit && Fits && !Args.empty() && !AsBase && !Tail && R.Bases.empty() &&
+        R.Tables.empty() && !R.InvariantSite && It == U.Overloads.end() &&
+        canProjectOperand(Args.front(), Aggregate.Params.front(), Ptr);
+    if (ProjectFirst)
+      Admit = {};
     size_t BeforeAdmission = Args.size();
     if (Admit && Fits &&
         (It == U.Overloads.end() || llvm::none_of(It->second, [&](auto *D) {
@@ -2279,6 +2300,11 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     std::vector<Initializer> Inputs;
     std::vector<Value> Actual;
     auto BindInput = [&](size_t I) {
+      if (I == 0 && ProjectFirst) {
+        Inputs.push_back(deferInitializer(Args[I], Aggregate.Params[I], Ptr));
+        Actual.push_back(Inputs.back().Result);
+        return;
+      }
       std::string Expected;
       if (Args[I].K == Node::Unary && Args[I].Text == "&") {
         if (It != U.Overloads.end() && It->second.size() == 1 &&
@@ -2381,7 +2407,9 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
           Scopes.back().Names[Field.Decl.Text] = {};
         for (size_t I = AsBase ? R.VirtualCount : 0; I < R.Fields.size(); ++I) {
           auto &Field = R.Fields[I];
-          auto *P = fieldAddress(Obj, I);
+          auto *P = I == 0 && ProjectFirst
+                        ? B.CreateGEP(R.IR, Ptr, {B.getInt32(0), B.getInt32(0)})
+                        : fieldAddress(Obj, I);
           auto Found = Producers.find(Field.Decl.Text);
           if (I >= R.Bases.size() && I - R.Bases.size() < Actual.size()) {
             if (Found != Producers.end())

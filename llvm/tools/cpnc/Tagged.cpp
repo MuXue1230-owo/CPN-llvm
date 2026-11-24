@@ -165,7 +165,12 @@ const Case *Frame::findCase(const std::string &Name, const Token &At) {
   return It == U.Cases.end() ? nullptr : &It->second;
 }
 llvm::Value *Frame::payloadAddress(const Case &C, llvm::Value *Object,
-                                   unsigned Index) {
+                                   unsigned Index, bool InBounds) {
+  if (!InBounds) {
+    auto *Storage =
+        B.CreateGEP(U.ir(C.Owner), Object, {B.getInt32(0), B.getInt32(2)});
+    return B.CreateGEP(C.Payload, Storage, {B.getInt32(0), B.getInt32(Index)});
+  }
   auto *Storage = B.CreateStructGEP(U.ir(C.Owner), Object, 2);
   return B.CreateStructGEP(C.Payload, Storage, Index);
 }
@@ -200,6 +205,7 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
   if (!Admit && admitsResult(Dest))
     Admit = AdmitResult;
   std::vector<Value> Operands;
+  bool ProjectFirst = false;
   if (Admit) {
     if (!Default)
       for (size_t I = 0; I < Args.size(); ++I) {
@@ -210,15 +216,21 @@ Value Frame::variant(const Case &C, const std::vector<Node> &Args,
         Operands.push_back(constructionOperand(
             convert(eval(Arg, Type), Type, Arg.At), Arg.At));
       }
-    Admit();
+    ProjectFirst = !Default && !Args.empty() && Operands.empty() &&
+                   canProjectOperand(Args.front(), C.Types.front(), Ptr);
+    if (!ProjectFirst)
+      Admit();
   }
   auto *Progress = C.Types.empty()
                        ? nullptr
                        : beginConstructionPrefix({C.Owner, nullptr, Ptr}, &C);
   for (size_t I = 0; I < C.Types.size(); ++I) {
-    auto *Slot = payloadAddress(C, Ptr, I);
+    const bool Project = I == 0 && ProjectFirst;
+    auto *Slot = payloadAddress(C, Ptr, I, !Project);
     if (Default)
       construct(C.Types[I], {}, At, Slot);
+    else if (Project)
+      constructPrvalue(Args[I], unconst(C.Types[I]), Slot, Args[I].At, Ptr);
     else if (I < Operands.size())
       materialize(Operands[I], Args[I].At, Slot);
     else if (!directConstruction(Args[I], C.Types[I], Slot)) {

@@ -721,12 +721,14 @@ public:
                                              const Token &,
                                              const std::string &ValueType = "");
   std::string initSlot(const Node &);
-  Initializer deferInitializer(const Node &, const std::string &Expected);
+  Initializer deferInitializer(const Node &, const std::string &Expected,
+                               llvm::Value *Enclosing = nullptr);
   Value runInitializer(Initializer &, Value Target, const Token &);
   Value constructionOperand(Value, const Token &);
   bool operandNeedsDestination(const Node &, const std::string &);
+  bool canProjectOperand(const Node &, const std::string &, llvm::Value *);
   Value constructPrvalue(const Node &, const std::string &, llvm::Value *,
-                         const Token &);
+                         const Token &, llvm::Value *Enclosing = nullptr);
   std::optional<Value>
   directConstruction(const Node &, const std::string &, llvm::Value *,
                      llvm::function_ref<void()> Admit = {});
@@ -811,7 +813,8 @@ public:
   void dropPayload(Value);
   void transferPayload(Value, llvm::Value *, SpecialOperation, const Token &);
   void beginUnionConstructor();
-  llvm::Value *payloadAddress(const Case &, llvm::Value *, unsigned);
+  llvm::Value *payloadAddress(const Case &, llvm::Value *, unsigned,
+                              bool InBounds = true);
   void match(const Node &);
   void constantMatch(const Node &);
   llvm::Constant *packVariant(const Case &, llvm::Constant *, const Token &);

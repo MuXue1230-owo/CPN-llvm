@@ -8551,6 +8551,135 @@ class CompilerTests(unittest.TestCase):
             with self.subTest(source=source):
                 self.assertEqual(self.program(common + source), 42)
 
+    def test_first_positional_factory_uses_final_subobject_storage(self):
+        common = """
+            struct Child {
+                i32 value;
+                i32* origin;
+                Child(i32 input){init value(input);init origin(&value);}
+                Child(const<Child>& old)=delete;
+                Child(Child&& old)=delete;
+            };
+            Child prepare(i64[8]& old){destroy(old);return Child(21);}
+        """
+        for name, declarations, body in (
+            (
+                "record",
+                "struct Pair {Child first;i32 last;};",
+                """
+                auto built(construct_at<Pair>(area,prepare(old),21));
+                return built->first.origin==&built->first.value
+                    ? built->first.value+built->last : 1;
+                """,
+            ),
+            (
+                "array",
+                "",
+                """
+                auto built(construct_at<Child[2]>(area,prepare(old),Child(21)));
+                return (*built)[0].origin==&(*built)[0].value
+                    ? (*built)[0].value+(*built)[1].value : 1;
+                """,
+            ),
+            (
+                "nested tagged payload",
+                """
+                union Pick {default case Empty;case Pair(Child first,i32 last);};
+                Pick choose(i64[8]& old){return Pick::Pair(prepare(old),21);}
+                struct Nested {Pick first;i32 extra;};
+                """,
+                """
+                function<Pick(i64[8]&)>* choose_case(&choose);
+                auto built(construct_at<Nested>(area,choose_case(old),0));
+                match(built->first){
+                case Pick::Pair(ref first,value last){
+                    return first.origin==&first.value ? first.value+last : 1;
+                }
+                case Pick::Empty{return 1;}
+                }
+                """,
+            ),
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    self.program(
+                        common
+                        + declarations
+                        + """
+                        i32 main(){
+                            i64[8] old;
+                            auto area(storage_of(old));
+                        """
+                        + body
+                        + "}"
+                    ),
+                    42,
+                )
+
+        live = self.compile(
+            """
+            struct Child {i32 value;};
+            struct Pair {Child first;i32 last;};
+            Child prepare(){return Child(21);}
+            i32 main(){
+                i64 old;
+                auto built(construct_at<Pair>(storage_of(old),prepare(),21));
+                return built->first.value+built->last;
+            }
+            """,
+            "--check",
+        )
+        self.assertNotEqual(live.returncode, 0)
+        self.assertIn("storage contains a live generation", live.stderr)
+
+    def test_projected_factory_runs_before_dynamic_capacity_rejection(self):
+        self.assertEqual(
+            self.program(
+                """
+                extern "C" void record(i32 digit);
+                struct Child {
+                    i32 value;
+                    Child(i32 input){init value(input);record(2);}
+                };
+                Child prepare(){record(1);return Child(21);}
+                union Pick {default case Empty;case Pair(Child first,i32 last);};
+                Pick choose(){return Pick::Pair(prepare(),21);}
+                extern "C" i32 rebuild(bool too_small){
+                    i8 small;
+                    i64[8] large;
+                    auto area(too_small ? storage_of(small) : storage_of(large));
+                    destroy(small);
+                    destroy(large);
+                    auto built(construct_at<Pick>(area,choose()));
+                    match(*built){
+                    case Pick::Pair(ref first,value last){return first.value+last;}
+                    case Pick::Empty{return 1;}
+                    }
+                }
+                """,
+                host="""
+                #include <stdbool.h>
+                #include <signal.h>
+                #include <stdint.h>
+                #include <stdlib.h>
+                extern int32_t rebuild(bool);
+                static volatile sig_atomic_t trace;
+                void record(int32_t digit) { trace = trace * 10 + digit; }
+                static void rejected(int reason) {
+                    _Exit(reason == SIGILL && trace == 1 ? 42 : 1);
+                }
+                int main(void) {
+                    if (rebuild(false) != 42 || trace != 12) return 2;
+                    trace = 0;
+                    if (signal(SIGILL, rejected) == SIG_ERR) return 3;
+                    rebuild(true);
+                    return 4;
+                }
+                """,
+            ),
+            42,
+        )
+
     def test_constant_aggregate_reconstruction_admits_after_arguments(self):
         self.assertEqual(
             self.program("""
