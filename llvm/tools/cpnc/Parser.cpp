@@ -132,8 +132,10 @@ class Parser {
     bool ExactNominal = false;
     std::optional<bool> PointeeReadonly;
     std::string PointeeScalar;
+    std::shared_ptr<const std::vector<ReceiverType>> Alternatives;
     bool known() const {
-      return !Owner.empty() || Dependent || CallableResult || !Scalar.empty();
+      return !Owner.empty() || Dependent || CallableResult || !Scalar.empty() ||
+             Alternatives;
     }
     bool operator==(const ReceiverType &Other) const {
       return Owner == Other.Owner && Layers == Other.Layers &&
@@ -144,6 +146,9 @@ class Parser {
              ExactNominal == Other.ExactNominal &&
              PointeeReadonly == Other.PointeeReadonly &&
              PointeeScalar == Other.PointeeScalar &&
+             (Alternatives == Other.Alternatives ||
+              (Alternatives && Other.Alternatives &&
+               *Alternatives == *Other.Alternatives)) &&
              (CallableResult == Other.CallableResult ||
               (CallableResult && Other.CallableResult &&
                *CallableResult == *Other.CallableResult));
@@ -152,6 +157,7 @@ class Parser {
   using Receivers = std::map<std::string, ReceiverType>;
   using Site = std::pair<unsigned, unsigned>;
   static Site sourceSite(const Token &At) { return {At.Line, At.Column}; }
+  std::vector<Site> PolicyContext;
   Receivers NominalReceivers, ValueReceivers, FieldReceivers;
   std::map<Site, ReceiverType> ReceiverDeclarations, ParameterTypes,
       TypeArguments;
@@ -164,7 +170,15 @@ class Parser {
     llvm::SmallVector<Node, 2> Conditions;
     Token DefinedAt;
     bool Pure = true;
+    bool RecordScope = false;
+    std::set<std::string> ShadowedValues;
+    std::vector<Site> Policy;
   };
+  struct DefinitionDomain {
+    RequirementSite Site;
+    const DefinitionDomain *Outer;
+  };
+  const DefinitionDomain *CurrentDomain = nullptr;
   std::map<std::string, std::shared_ptr<const RequirementSite>>
       NamedRequirements;
   struct CallShape {
@@ -180,6 +194,8 @@ class Parser {
     size_t TypeBinders = 0;
     bool Generic = false;
     bool Instance = false, Const = false;
+    bool ConstantPredicate = false;
+    Site Declaration;
     ReferenceKind Receiver = ReferenceKind::None;
     bool accepts(size_t Count) const {
       return Count >= Required && (!Maximum || Count <= *Maximum);
@@ -282,6 +298,13 @@ class Parser {
     Shape.Generic = !Function.Generics.empty();
     Shape.Instance = Member && !Function.Settings.count("static");
     Shape.Const = Function.Const;
+    Shape.Declaration = sourceSite(Function.At);
+    Shape.ConstantPredicate = !Member && !Function.Foreign && !Shape.Generic &&
+                              Function.Settings.count("mode") &&
+                              Function.Settings.at("mode") == "consteval" &&
+                              Result.Scalar == "bool" &&
+                              Result.Layers.empty() &&
+                              Result.Reference == ReferenceKind::None;
     if (auto Category = Function.Settings.find("category");
         Category != Function.Settings.end())
       Shape.Receiver = referenceKind(Category->second);
@@ -312,6 +335,8 @@ class Parser {
       R->Parameters.append(Function.Generics.begin(), Function.Generics.end());
       R->Conditions.push_back(Function.TemplateArgs.front());
       R->DefinedAt = Function.At;
+      R->RecordScope = Member || Function.Settings.count("qualifier");
+      R->Policy = Scope.PolicyContext;
       Shape.Requirements = std::move(R);
       for (auto [I, P] : llvm::enumerate(Params)) {
         const auto &Type = Scope.ParameterTypes.at(sourceSite(P.At));
@@ -362,6 +387,7 @@ class Parser {
                    sourceSite(Existing.Requirements->DefinedAt) ==
                        sourceSite(Shape.Requirements->DefinedAt))) &&
                  Existing.Generic == Shape.Generic &&
+                 Existing.ConstantPredicate == Shape.ConstantPredicate &&
                  Existing.Instance == Shape.Instance &&
                  Existing.Const == Shape.Const &&
                  Existing.Receiver == Shape.Receiver;
@@ -393,6 +419,18 @@ class Parser {
   static ReceiverType lvalue(ReceiverType Type) {
     Type.Reference = ReferenceKind::Lvalue;
     return Type;
+  }
+  static ReceiverType alternatives(llvm::ArrayRef<ReceiverType> Types) {
+    if (Types.empty() ||
+        llvm::any_of(Types, [](const ReceiverType &T) { return !T.known(); }))
+      return {};
+    if (llvm::all_of(Types,
+                     [&](const ReceiverType &T) { return T == Types.front(); }))
+      return Types.front();
+    ReceiverType View;
+    View.Alternatives = std::make_shared<const std::vector<ReceiverType>>(
+        Types.begin(), Types.end());
+    return View;
   }
   static ReceiverType pointee(ReceiverType Type) {
     Type.Layers.pop_back();
@@ -438,13 +476,8 @@ class Parser {
     });
     return Key.empty() ? nullptr : NamedRequirements.at(Key).get();
   }
-  ReceiverType requirementType(const Node &Argument,
-                               const Receivers &Bindings) const {
-    const auto &N = argumentFor(Argument, true);
-    auto Found = TypeArguments.find(sourceSite(N.At));
-    if (N.K != Node::TypeArg || Found == TypeArguments.end())
-      return {};
-    auto Type = Found->second;
+  static ReceiverType substituteRequirementType(const ReceiverType &Type,
+                                                const Receivers &Bindings) {
     if (!Type.Dependent)
       return Type;
     auto Bound = Bindings.find(Type.TypeParameter);
@@ -458,6 +491,14 @@ class Parser {
     }
     Result.Readonly |= Type.Readonly;
     return Result;
+  }
+  ReceiverType requirementType(const Node &Argument,
+                               const Receivers &Bindings) const {
+    const auto &N = argumentFor(Argument, true);
+    auto Found = TypeArguments.find(sourceSite(N.At));
+    if (N.K != Node::TypeArg || Found == TypeArguments.end())
+      return {};
+    return substituteRequirementType(Found->second, Bindings);
   }
   std::optional<bool> requirementValue(const Node &N,
                                        const RequirementSite &Site,
@@ -590,18 +631,136 @@ class Parser {
       if (!Identity.empty())
         Types.emplace(Param.Text, std::move(Binding));
     }
-    return requirementValue(Site.Conditions.front(), Site, Types, Values,
-                            Budget);
+    if (auto Concrete = requirementValue(Site.Conditions.front(), Site, Types,
+                                         Values, Budget))
+      return Concrete;
+    return requirementInDomain(Shape, Callee, Actual, std::move(Types));
   }
   using Formula = ConstraintLogic::Formula;
-  std::optional<Formula> constraintFormula(const Node &N,
-                                           const RequirementSite &At,
-                                           const Receivers &Bindings,
-                                           ConstraintLogic &Logic,
-                                           unsigned Depth) const {
+  struct ValueTerm {
+    std::string Identity, Type;
+    std::optional<bool> Boolean;
+  };
+  using ValueTerms = std::map<std::string, ValueTerm>;
+  std::optional<ValueTerm> requirementTerm(const Node &Argument,
+                                           const ValueTerms &Bindings) const {
+    const auto &N = argumentFor(Argument, false);
+    if (N.K != Node::Name || !N.TemplateArgs.empty() || Argument.Pack)
+      return std::nullopt;
+    if (N.Text == "true" || N.Text == "false")
+      return ValueTerm{N.Text, "bool", N.Text == "true"};
+    if (auto I = Bindings.find(N.Text); I != Bindings.end())
+      return I->second;
+    return std::nullopt;
+  }
+  std::optional<ValueTerm> symbolicTerm(const Node &Argument,
+                                        const RequirementSite &At,
+                                        const ValueTerms &Bindings,
+                                        ConstraintLogic &Logic,
+                                        unsigned Depth) const {
+    Logic.chargeVisit(Depth);
+    if (auto Value = requirementTerm(Argument, Bindings))
+      return Value;
+    const auto &N = argumentFor(Argument, false);
+    if (Argument.Pack)
+      return std::nullopt;
+    if (N.K == Node::Number)
+      return ValueTerm{"literal(" + N.Text + ")", "integer", {}};
+    if (N.K != Node::Unary && N.K != Node::Binary)
+      return std::nullopt;
+    std::string Policy;
+    for (const auto &[Line, Column] : At.Policy)
+      Policy += ":" + std::to_string(Line) + "." + std::to_string(Column);
+    auto L = symbolicTerm(N.Children.front(), At, Bindings, Logic, Depth + 1);
+    if (!L)
+      return std::nullopt;
+    StringRef Op(N.Text);
+    if (N.K == Node::Unary) {
+      if (integer(L->Type) && (Op == "+" || Op == "-"))
+        return ValueTerm{
+            "unary" + N.Text + Policy + "(" + L->Identity + ")", L->Type, {}};
+      return std::nullopt;
+    }
+    auto R = symbolicTerm(N.Children.back(), At, Bindings, Logic, Depth + 1);
+    if (!R || !integer(L->Type) || !integer(R->Type))
+      return std::nullopt;
+    const std::string Key = "binary" + N.Text + Policy + "(" + L->Identity +
+                            ")(" + R->Identity + ")";
+    if (Op == "==" || Op == "!=" || Op == "<" || Op == ">" || Op == "<=" ||
+        Op == ">=")
+      return ValueTerm{Key, "bool", {}};
+    if (Op == "+" || Op == "-" || Op == "*" || Op == "/" || Op == "%") {
+      auto Type = integerCommonType(L->Type, R->Type);
+      if (!Type.empty())
+        return ValueTerm{Key, std::move(Type), {}};
+    }
+    return std::nullopt;
+  }
+  std::optional<Formula> computedAtom(const Node &N, const RequirementSite &At,
+                                      const ValueTerms &Values,
+                                      ConstraintLogic &Logic,
+                                      unsigned Depth) const {
+    const auto &Callee = N.Children.front();
+    if (Callee.K != Node::Name || Callee.ExplicitApplication ||
+        Values.count(Callee.Text) || At.ShadowedValues.count(Callee.Text) ||
+        (At.RecordScope && !StringRef(Callee.Text).starts_with("::")))
+      return std::nullopt;
+    const CallShape *Selected = nullptr;
+    auto Visible = [&](const CallShape &S) {
+      return S.Declaration < sourceSite(At.DefinedAt) &&
+             S.accepts(N.Children.size() - 1);
+    };
+    auto Key = scopeKey(At.Scope, Callee.Text, [&](const std::string &K) {
+      auto Found = CallResults.find(K);
+      return Found != CallResults.end() && llvm::any_of(Found->second, Visible);
+    });
+    if (Key.empty())
+      return std::nullopt;
+    llvm::SmallVector<ValueTerm, 4> Arguments;
+    for (const auto &Argument : llvm::ArrayRef(N.Children).drop_front()) {
+      auto Value = symbolicTerm(Argument, At, Values, Logic, Depth + 1);
+      if (!Value)
+        return std::nullopt;
+      Arguments.push_back(std::move(*Value));
+    }
+    for (const auto &S : CallResults.at(Key)) {
+      if (!Visible(S))
+        continue;
+      if (S.Generic || S.Parameters.size() != Arguments.size() ||
+          llvm::any_of(S.Parameters, [](const ReceiverType &P) {
+            return P.Reference != ReferenceKind::None || P.Scalar.empty() ||
+                   !P.Layers.empty() || P.Dependent;
+          }))
+        return std::nullopt;
+      // Among plain scalar value parameters, an exact signature outranks all
+      // implicit numeric conversions. Unestablished reference or generic
+      // ranks above are left to semantic binding.
+      if (std::equal(S.Parameters.begin(), S.Parameters.end(),
+                     Arguments.begin(),
+                     [](const ReceiverType &P, const ValueTerm &A) {
+                       return P.Scalar == A.Type;
+                     })) {
+        if (Selected || !S.ConstantPredicate)
+          return std::nullopt;
+        Selected = &S;
+      }
+    }
+    if (!Selected)
+      return std::nullopt;
+    std::string Atom = "consteval:" + Key + ":" +
+                       std::to_string(Selected->Declaration.first) + "." +
+                       std::to_string(Selected->Declaration.second);
+    for (const auto &Value : Arguments)
+      Atom += "(" + Value.Identity + ")";
+    return Logic.variable(Atom);
+  }
+  std::optional<Formula>
+  constraintFormula(const Node &N, const RequirementSite &At,
+                    const Receivers &Bindings, ConstraintLogic &Logic,
+                    unsigned Depth, const ValueTerms &Values = {}) const {
     Logic.chargeVisit(Depth);
     auto Build = [&](const Node &Child) {
-      return constraintFormula(Child, At, Bindings, Logic, Depth + 1);
+      return constraintFormula(Child, At, Bindings, Logic, Depth + 1, Values);
     };
     if (N.K == Node::Unary && N.Text == "!") {
       if (auto Value = Build(N.Children.front()))
@@ -613,9 +772,20 @@ class Parser {
       if (auto R = Build(N.Children.back()))
         return N.Text == "&&" ? Logic.conjunction(*L, *R)
                               : Logic.disjunction(*L, *R);
+    } else if (N.K == Node::Call) {
+      return computedAtom(N, At, Values, Logic, Depth);
+    } else if (N.K == Node::Binary) {
+      if (auto Term = symbolicTerm(N, At, Values, Logic, Depth + 1);
+          Term && Term->Type == "bool")
+        return Logic.variable(Term->Identity);
     } else if (N.K == Node::Name) {
       if (N.Text == "true" || N.Text == "false")
         return N.Text == "true";
+      if (auto V = requirementTerm(N, Values); V && V->Type == "bool") {
+        if (V->Boolean)
+          return unsigned(*V->Boolean);
+        return Logic.variable(V->Identity);
+      }
       if (builtinPredicate(N.Text)) {
         std::string Key = N.Text;
         bool Symbolic = false;
@@ -632,17 +802,42 @@ class Parser {
         if (auto Value = requirementValue(N, At, Bindings, {}, Budget))
           return unsigned(*Value);
       } else if (const auto *Named = namedRequirement(At, N.Text)) {
-        if (!Named->Pure || Named->Parameters.size() != N.TemplateArgs.size())
+        if (Named->Parameters.size() != N.TemplateArgs.size())
           return std::nullopt;
         Receivers Nested;
+        ValueTerms NestedValues;
+        std::string Application =
+            "requirement:" + std::to_string(Named->DefinedAt.Line) + "." +
+            std::to_string(Named->DefinedAt.Column);
+        bool KnownArguments = true;
         for (auto [I, P] : llvm::enumerate(Named->Parameters)) {
-          if (P.K != Node::TypeParam || P.Pack || N.TemplateArgs[I].Pack)
+          if (P.Pack || N.TemplateArgs[I].Pack)
             return std::nullopt;
-          Nested[P.Text] = requirementType(N.TemplateArgs[I], Bindings);
+          if (P.K == Node::TypeParam) {
+            auto T = requirementType(N.TemplateArgs[I], Bindings);
+            auto Key = typeIdentity(T);
+            KnownArguments &= !Key.empty();
+            Application += "(type:" + Key + ")";
+            Nested[P.Text] = std::move(T);
+          } else if (auto V = symbolicTerm(N.TemplateArgs[I], At, Values, Logic,
+                                           Depth + 1);
+                     V && V->Type == valueParameterType(P)) {
+            Application += "(value:" + V->Type + ":" + V->Identity + ")";
+            NestedValues[P.Text] = std::move(*V);
+          } else {
+            KnownArguments = false;
+          }
         }
         Formula Result = 1;
-        for (const auto &Clause : Named->Conditions) {
-          auto F = constraintFormula(Clause, *Named, Nested, Logic, Depth + 1);
+        for (auto [Index, Clause] : llvm::enumerate(Named->Conditions)) {
+          std::optional<Formula> F;
+          if (Clause.K == Node::Empty) {
+            if (KnownArguments)
+              F = Logic.variable(Application + "/" + std::to_string(Index));
+          } else {
+            F = constraintFormula(Clause, *Named, Nested, Logic, Depth + 1,
+                                  NestedValues);
+          }
           if (!F)
             return std::nullopt;
           Result = Logic.conjunction(Result, *F);
@@ -651,6 +846,198 @@ class Parser {
         }
         return Result;
       }
+    }
+    return std::nullopt;
+  }
+  std::string valueParameterType(const Node &P) const {
+    auto Found = ParameterTypes.find(sourceSite(P.At));
+    if (Found == ParameterTypes.end())
+      return {};
+    return typeIdentity(Found->second);
+  }
+  struct DefinitionEvidence {
+    Receivers Types;
+    ValueTerms Values;
+    Formula Assumed = 1;
+  };
+  DefinitionEvidence definitionEvidence(ConstraintLogic &Logic) const {
+    llvm::SmallVector<const DefinitionDomain *, 4> Domains;
+    for (auto *D = CurrentDomain; D; D = D->Outer)
+      Domains.push_back(D);
+    DefinitionEvidence Evidence;
+    for (auto *D : llvm::reverse(Domains)) {
+      for (auto [I, P] : llvm::enumerate(D->Site.Parameters)) {
+        Evidence.Types.erase(P.Text);
+        Evidence.Values.erase(P.Text);
+        auto Identity = "$constraint." + std::to_string(P.At.Line) + "." +
+                        std::to_string(P.At.Column) + "." + std::to_string(I);
+        if (P.K == Node::TypeParam && !P.Pack)
+          Evidence.Types[P.Text] = scalarReceiver(Identity);
+        else if (!P.Pack)
+          if (auto Type = valueParameterType(P); !Type.empty())
+            Evidence.Values[P.Text] = {
+                std::move(Identity), std::move(Type), {}};
+      }
+      if (!D->Site.Conditions.empty()) {
+        auto VisibleValues = Evidence.Values;
+        for (const auto &Hidden : D->Site.ShadowedValues)
+          VisibleValues.erase(Hidden);
+        for (const auto &Clause : D->Site.Conditions)
+          if (auto Known = constraintFormula(Clause, D->Site, Evidence.Types,
+                                             Logic, 0, VisibleValues))
+            Evidence.Assumed = Logic.conjunction(Evidence.Assumed, *Known);
+      }
+    }
+
+    return Evidence;
+  }
+  ReceiverType refineReceiver(ReceiverType Type, const Token &At) const {
+    if (!CurrentDomain || !Type.Dependent || Type.TypeParameter.empty() ||
+        NominalReceivers.count(Type.TypeParameter) ||
+        HiddenTypes.count(Type.TypeParameter) ||
+        (!Type.Layers.empty() && Type.Layers != "*"))
+      return Type;
+    unsigned Steps = 0;
+    ConstraintLogic Logic([&](unsigned Depth) {
+      if (Depth > 128 || ++Steps > 2048)
+        throw ResourceExhausted{
+            {At, "constraint syntax binding resource exhausted"}};
+    });
+    try {
+      auto Evidence = definitionEvidence(Logic);
+      if (Evidence.Assumed < 2)
+        return Type;
+      auto Param = Evidence.Types.find(Type.TypeParameter);
+      if (Param == Evidence.Types.end())
+        return Type;
+      const std::string Symbol = typeIdentity(Param->second);
+      const ReceiverType *Bound = nullptr;
+      std::string Identity;
+      auto ImpliesEquality = [&](const std::string &L, const std::string &R) {
+        auto Atom = Logic.findVariable("SameType(" + L + ")(" + R + ")");
+        return Atom &&
+               Logic.conjunction(Evidence.Assumed, Logic.negate(*Atom)) == 0;
+      };
+      auto Equal = [&](const std::string &L, const std::string &R) {
+        return ImpliesEquality(L, R) || ImpliesEquality(R, L);
+      };
+      llvm::SmallVector<std::string, 4> Connected{Symbol};
+      std::set<std::string> Seen{Symbol};
+      for (size_t I = 0; I < Connected.size(); ++I) {
+        const auto Current = Connected[I];
+        for (const auto &[Name, Variable] : Evidence.Types) {
+          auto Other = typeIdentity(Variable);
+          if (!Seen.count(Other) && Equal(Current, Other)) {
+            Seen.insert(Other);
+            Connected.push_back(std::move(Other));
+          }
+        }
+      }
+      for (const auto &[Site, Candidate] : TypeArguments) {
+        if (!Candidate.ExactNominal)
+          continue;
+        auto Concrete = typeIdentity(Candidate);
+        if (Concrete.empty() || Concrete == Identity ||
+            llvm::none_of(Connected, [&](const auto &Prior) {
+              return Equal(Prior, Concrete);
+            }))
+          continue;
+        if (Bound)
+          return Type;
+        Identity = std::move(Concrete);
+        Bound = &Candidate;
+      }
+      if (Bound) {
+        if (Type.Layers.empty())
+          return substituteRequirementType(Type,
+                                           {{Type.TypeParameter, *Bound}});
+        if (Bound->Layers.empty() && Bound->Reference == ReferenceKind::None) {
+          auto Pointer = *Bound;
+          Pointer.Layers = "*";
+          Pointer.PointeeReadonly =
+              Pointer.Readonly || Type.PointeeReadonly.value_or(false);
+          Pointer.Readonly = Type.Readonly;
+          Pointer.Reference = Type.Reference;
+          return Pointer;
+        }
+      }
+    } catch (const ResourceExhausted &) {
+      // The caller can still have declaration-kind evidence independent of
+      // an exact receiver identity.
+    }
+    return Type;
+  }
+  std::optional<bool> requirementInDomain(const CallShape &Shape,
+                                          const Node &Callee,
+                                          llvm::ArrayRef<ReceiverType> Actual,
+                                          Receivers CandidateTypes) const {
+    if (!CurrentDomain)
+      return std::nullopt;
+    unsigned Steps = 0;
+    ConstraintLogic Logic([&](unsigned Depth) {
+      if (Depth > 128 || ++Steps > 2048)
+        throw ResourceExhausted{
+            {Callee.At, "constraint syntax binding resource exhausted"}};
+    });
+    try {
+      auto Evidence = definitionEvidence(Logic);
+      auto &DomainTypes = Evidence.Types;
+      auto &DomainValues = Evidence.Values;
+      const auto Assumed = Evidence.Assumed;
+      if (Assumed == 0)
+        return std::nullopt;
+      ValueTerms CandidateValues;
+      for (const auto &[Name, Binding] : ValueReceivers)
+        DomainValues.erase(Name);
+      for (const auto &[Name, Binding] :
+           llvm::make_early_inc_range(DomainTypes))
+        if (NominalReceivers.count(Name) || HiddenTypes.count(Name))
+          DomainTypes.erase(Name);
+      const auto &Target = *Shape.Requirements;
+      RequirementSite Caller;
+      Caller.Policy = PolicyContext;
+      for (auto [I, P] : llvm::enumerate(Target.Parameters)) {
+        if (I < Callee.TemplateArgs.size()) {
+          if (P.K == Node::TypeParam)
+            CandidateTypes[P.Text] =
+                requirementType(Callee.TemplateArgs[I], DomainTypes);
+          else if (auto V = symbolicTerm(Callee.TemplateArgs[I], Caller,
+                                         DomainValues, Logic, 0);
+                   V && V->Type == valueParameterType(P))
+            CandidateValues[P.Text] = std::move(*V);
+          continue;
+        }
+        auto Source = Shape.Deductions.find(P.Text);
+        if (P.K != Node::TypeParam || Source == Shape.Deductions.end())
+          continue;
+        std::string Identity;
+        ReceiverType Agreed;
+        for (auto Pos : Source->second) {
+          if (Pos >= Actual.size())
+            continue;
+          auto Type = substituteRequirementType(Actual[Pos], DomainTypes);
+          Type.Reference = ReferenceKind::None;
+          Type.Readonly = false;
+          auto Key = typeIdentity(Type);
+          if (Key.empty() || (!Identity.empty() && Key != Identity)) {
+            Identity.clear();
+            break;
+          }
+          Identity = std::move(Key);
+          Agreed = std::move(Type);
+        }
+        if (!Identity.empty())
+          CandidateTypes[P.Text] = std::move(Agreed);
+      }
+      auto Needed =
+          constraintFormula(Target.Conditions.front(), Target, CandidateTypes,
+                            Logic, 0, CandidateValues);
+      if (Needed && Logic.conjunction(Assumed, *Needed) == 0)
+        return false;
+      if (Needed && Logic.conjunction(Assumed, Logic.negate(*Needed)) == 0)
+        return true;
+    } catch (const ResourceExhausted &) {
+      // The semantic checker owns the configured proof budget and diagnostics.
     }
     return std::nullopt;
   }
@@ -747,7 +1134,8 @@ class Parser {
     std::optional<ReceiverType> Object;
     std::string Key;
     if (Callee.K == Node::Member) {
-      auto Base = receiverType(Callee.Children.front());
+      auto Base =
+          refineReceiver(receiverType(Callee.Children.front()), Callee.At);
       if (Base.Dependent)
         return Base;
       if (Base.Layers == (Callee.Definition ? "*" : "")) {
@@ -865,7 +1253,7 @@ class Parser {
             return C.Result == Viable.front().Result;
           }))
         return Viable.front().Result;
-      const ReceiverType *Uniform = nullptr;
+      llvm::SmallVector<ReceiverType, 4> Results;
       auto Better = [&](const Candidate &A, const Candidate &B) {
         bool Strict = false;
         bool Dominates = true;
@@ -882,12 +1270,9 @@ class Parser {
         if (llvm::any_of(Viable,
                          [&](const Candidate &O) { return Better(O, C); }))
           continue;
-        if (Uniform && !(*Uniform == C.Result))
-          return {};
-        Uniform = &C.Result;
+        Results.push_back(C.Result);
       }
-      if (Uniform)
-        return *Uniform;
+      return alternatives(Results);
     }
     return {};
   }
@@ -966,24 +1351,8 @@ class Parser {
       }
       return {};
     }
-    if (N.K == Node::Member) {
-      auto Base = receiverType(N.Children.front());
-      if (Base.Dependent)
-        return Base;
-      if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
-        return {};
-      if (auto I = FieldReceivers.find(indexedMember(Base.Owner, N.Text));
-          I != FieldReceivers.end()) {
-        if (N.Definition)
-          Base = pointee(std::move(Base));
-        auto Field = lvalue(I->second);
-        Field.Readonly |= Base.Readonly;
-        Field.QualificationUnknown |= Base.QualificationUnknown ||
-                                      Base.Reference != ReferenceKind::Lvalue;
-        return Field;
-      }
-      return {};
-    }
+    if (N.K == Node::Member)
+      return fieldReceiver(receiverType(N.Children.front()), N);
     if (N.K != Node::Unary && N.K != Node::Index)
       return {};
     auto Base = receiverType(N.Children.front());
@@ -1013,6 +1382,29 @@ class Parser {
       }
     }
     return {};
+  }
+  ReceiverType fieldReceiver(ReceiverType Base, const Node &N) const {
+    if (Base.Alternatives) {
+      llvm::SmallVector<ReceiverType, 4> Fields;
+      for (const auto &Alternative : *Base.Alternatives)
+        Fields.push_back(fieldReceiver(Alternative, N));
+      return alternatives(Fields);
+    }
+    Base = refineReceiver(std::move(Base), N.At);
+    if (Base.Dependent)
+      return Base;
+    if (Base.Owner.empty() || Base.Layers != (N.Definition ? "*" : ""))
+      return {};
+    auto I = FieldReceivers.find(indexedMember(Base.Owner, N.Text));
+    if (I == FieldReceivers.end())
+      return {};
+    if (N.Definition)
+      Base = pointee(std::move(Base));
+    auto Field = lvalue(I->second);
+    Field.Readonly |= Base.Readonly;
+    Field.QualificationUnknown |=
+        Base.QualificationUnknown || Base.Reference != ReferenceKind::Lvalue;
+    return Field;
   }
   bool canConfirmMember(const Node &Receiver) const {
     if (!BoundRelationalMembers)
@@ -1047,15 +1439,34 @@ class Parser {
               (Argument.Text == "true" || Argument.Text == "false"));
     });
   }
-  std::optional<std::string> memberFamily(const Node &N, const Token &Member,
-                                          bool Pointer) const {
-    auto Type = receiverType(N);
+  struct MemberSyntax {
+    std::string Key;
+    bool Generic = false;
+    bool Deferred = false;
+  };
+  std::optional<MemberSyntax>
+  memberFamily(ReceiverType Type, const Token &Member, bool Pointer) const {
+    if (Type.Alternatives) {
+      std::optional<MemberSyntax> Agreed;
+      for (const auto &Alternative : *Type.Alternatives) {
+        auto Found = memberFamily(Alternative, Member, Pointer);
+        if (!Found || (Agreed && Found->Generic != Agreed->Generic))
+          return std::nullopt;
+        if (!Agreed)
+          Agreed = std::move(Found);
+        else if (Agreed->Generic)
+          Agreed->Deferred |= Found->Deferred || Found->Key != Agreed->Key;
+      }
+      return Agreed;
+    }
+    Type = refineReceiver(std::move(Type), Member);
     if (!Type.Owner.empty() && Type.Layers == (Pointer ? "*" : "")) {
       auto Key = indexedMember(Type.Owner, Member.Text);
       if (Families.count(Key))
-        return Key;
+        return MemberSyntax{Key, true,
+                            ConflictingCallableSchemas.count(Key) != 0};
       if (!Key.empty())
-        return std::string();
+        return MemberSyntax{};
     }
     return std::nullopt;
   }
@@ -1692,6 +2103,8 @@ class Parser {
     } else if (eat("configured")) {
       N = Node(Node::Configured, T);
       N.Settings = settings(false);
+      llvm::SaveAndRestore ScopedPolicy(PolicyContext);
+      PolicyContext.push_back(sourceSite(T));
       expect("(");
       N.Children.push_back(expr());
       expect(")");
@@ -1761,14 +2174,13 @@ class Parser {
           Node M(Node::Member, Id);
           if (is("<") && (!BoundRelationalMembers ||
                           !BoundRelationalMembers->count(sourceSite(Id)))) {
-            auto Schema = memberFamily(N, Id, Ptr);
-            if (Schema && !Schema->empty()) {
-              M.TemplateArgs = ConflictingCallableSchemas.count(*Schema)
-                                   ? deferredTemplateArgs()
-                                   : templateArgs(*Schema);
+            auto Base = receiverType(N);
+            auto Schema = memberFamily(Base, Id, Ptr);
+            if (Schema && Schema->Generic) {
+              M.TemplateArgs = Schema->Deferred ? deferredTemplateArgs()
+                                                : templateArgs(Schema->Key);
               M.ExplicitApplication = true;
-            } else if (!Schema &&
-                       (Families.count(Id.Text) || receiverType(N).Dependent)) {
+            } else if (!Schema && (Families.count(Id.Text) || Base.Dependent)) {
               if (auto Arguments = deferredMemberApplication()) {
                 M.TemplateArgs = std::move(*Arguments);
                 M.ExplicitApplication = true;
@@ -2016,9 +2428,30 @@ class Parser {
     if (eat("if")) {
       Node N(Node::If, T);
       N.Required = eat("constexpr");
-      N.Children = {condition(), block()};
+      N.Children = {condition()};
+      auto Branch = [&](bool Else) {
+        DefinitionDomain Facts{{Namespace, {}, {}, T}, CurrentDomain};
+        llvm::SaveAndRestore DomainScope(CurrentDomain);
+        if (N.Required && CurrentDomain) {
+          auto Test = N.Children.front();
+          if (Else) {
+            Node Negated(Node::Unary, T);
+            Negated.Text = "!";
+            Negated.Children.push_back(std::move(Test));
+            Test = std::move(Negated);
+          }
+          Facts.Site.Conditions.push_back(std::move(Test));
+          Facts.Site.RecordScope = !CurrentReceiver.Owner.empty();
+          Facts.Site.Policy = PolicyContext;
+          for (const auto &[Name, Binding] : ValueReceivers)
+            Facts.Site.ShadowedValues.insert(Name);
+          CurrentDomain = &Facts;
+        }
+        return Else && is("if") ? statement() : block();
+      };
+      N.Children.push_back(Branch(false));
       if (eat("else"))
-        N.Children.push_back(is("if") ? statement() : block());
+        N.Children.push_back(Branch(true));
       return N;
     }
     if (eat("while")) {
@@ -2123,6 +2556,8 @@ class Parser {
         Pos = Start;
         return simple();
       }
+      llvm::SaveAndRestore ScopedPolicy(PolicyContext);
+      PolicyContext.push_back(sourceSite(T));
       if (is("{"))
         N.Children = {block()};
       else {
@@ -2235,10 +2670,11 @@ class Parser {
     do {
       auto T = peek();
       Node P(Node::TypeParam, T);
+      ReceiverType ValueType;
       if (!eat("type")) {
         expect("const");
         P.K = Node::ValueParam;
-        P.Type = type();
+        P.Type = type(nullptr, &ValueType);
       }
       P.Pack = eat("...");
       P.At = name();
@@ -2248,7 +2684,8 @@ class Parser {
       if (P.K == Node::TypeParam) {
         Types.insert(P.Text);
         TypeParameters.insert(P.Text);
-      }
+      } else
+        ParameterTypes[sourceSite(P.At)] = std::move(ValueType);
       if (eat("=")) {
         if (P.K == Node::TypeParam) {
           Node A(Node::TypeArg, peek());
@@ -2704,8 +3141,9 @@ class Parser {
       // The normal parse owns diagnostics for headers.
       return;
     }
-    TypeArguments.merge(Index.TypeArguments);
     importRecordMembers(Index, Header, Receiver, true);
+    TypeArguments.merge(Index.TypeArguments);
+    ParameterTypes.merge(Index.ParameterTypes);
   }
 
   Node declaration(bool Foreign = false, bool Member = false) {
@@ -2715,6 +3153,8 @@ class Parser {
     if (eat("configured")) {
       Node Policy(Node::Configured, T);
       Policy.Settings = settings(false);
+      llvm::SaveAndRestore ScopedPolicy(PolicyContext);
+      PolicyContext.push_back(sourceSite(T));
       auto D = declaration(Foreign, Member);
       D.Policies.insert(D.Policies.begin(), std::move(Policy));
       return D;
@@ -2731,6 +3171,7 @@ class Parser {
       Node N(Node::Config, T);
       N.Settings = settings(true);
       expect(";");
+      PolicyContext.push_back(sourceSite(T));
       return N;
     }
     if (eat("namespace") || eat("extern")) {
@@ -2752,6 +3193,7 @@ class Parser {
           llvm::SaveAndRestore NamespaceAliases(AliasSchemas);
           llvm::SaveAndRestore NamespaceTypes(NominalReceivers);
           llvm::SaveAndRestore NamespaceValues(ValueReceivers);
+          llvm::SaveAndRestore NamespacePolicy(PolicyContext);
           while (!eat("}"))
             N.Children.push_back(declaration(Foreign));
         } else
@@ -2816,13 +3258,15 @@ class Parser {
       auto Required = std::make_shared<RequirementSite>();
       Required->Scope = Namespace;
       Required->DefinedAt = N.At;
+      Required->RecordScope = !CurrentReceiver.Owner.empty();
+      Required->Policy = PolicyContext;
       Required->Parameters.append(N.Generics.begin(), N.Generics.end());
       for (const auto &Rule : N.Children) {
         if (Rule.Text != "requires") {
           Required->Pure = false;
-          break;
-        }
-        Required->Conditions.push_back(Rule.Children.front());
+          Required->Conditions.emplace_back(Node::Empty, Rule.At);
+        } else
+          Required->Conditions.push_back(Rule.Children.front());
       }
       NamedRequirements[Namespace + N.Text] = std::move(Required);
       Types = std::move(Saved);
@@ -2851,6 +3295,18 @@ class Parser {
     Node Requires;
     if (!G.empty() && eat("requires"))
       Requires = condition();
+    DefinitionDomain Domain{{Namespace, {}, {}, T}, CurrentDomain};
+    llvm::SaveAndRestore DomainScope(CurrentDomain);
+    if (!G.empty()) {
+      Domain.Site.Parameters.append(G.begin(), G.end());
+      if (Requires.K != Node::Empty)
+        Domain.Site.Conditions.push_back(Requires);
+      Domain.Site.RecordScope = Member || !CurrentReceiver.Owner.empty();
+      Domain.Site.Policy = PolicyContext;
+      for (const auto &[Name, Binding] : ValueReceivers)
+        Domain.Site.ShadowedValues.insert(Name);
+      CurrentDomain = &Domain;
+    }
     if (is("declare") && (peek(1).Text == "struct" || peek(1).Text == "class" ||
                           peek(1).Text == "union" || peek(1).Text == "enum")) {
       take();

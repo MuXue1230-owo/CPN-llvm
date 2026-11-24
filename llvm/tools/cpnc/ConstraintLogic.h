@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -25,6 +26,13 @@ public:
   Formula variable(const std::string &Key) {
     auto I = Atoms.try_emplace(Key, Atoms.size()).first;
     return node(I->second, 0, 1);
+  }
+
+  std::optional<Formula> findVariable(const std::string &Key) const {
+    auto I = Atoms.find(Key);
+    if (I == Atoms.end())
+      return std::nullopt;
+    return Unique.at({I->second, 0, 1});
   }
 
   Formula negate(Formula F, unsigned Depth = 0) {

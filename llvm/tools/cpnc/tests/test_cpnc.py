@@ -1990,6 +1990,7 @@ class CompilerTests(unittest.TestCase):
             struct Relation {Less get;};
             struct Generic {generic<const i32 N> i32 get() const {return N;}};
             consteval bool odd(i32 x) {return x%2!=0;}
+            consteval bool odd(i64 x) {return x%3==0;}
             generic<const i32 N> requires(!odd(N)) Relation choose(){return Relation();}
             generic<const i32 N> requires(odd(N)) Generic choose(){return Generic();}
             generic<type T> bool from_generic(T argument){
@@ -2006,6 +2007,121 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(checked.stderr.count("chained relational comparison"), 3)
         self.assertEqual(self.program(source), 42)
+
+    def test_generic_definition_facts_bind_member_syntax_across_instantiations(self):
+        declarations = """
+            struct Range {bool operator>(i32 v) const {return v==0;}};
+            struct Less {Range operator<(i32 v) const {return Range();}};
+            struct Relation {Less get;};
+            struct Generic {generic<const i32 N> i32 get() const {return N;}};
+            consteval bool odd(i32 x) {return x%2!=0;}
+            consteval bool odd(i64 x) {return x%3==0;}
+            generic<const i32 N> requires(!odd(N)) Relation choose(){return Relation();}
+            generic<const i32 N> requires(odd(N)) Generic choose(){return Generic();}
+        """
+        self.assertEqual(
+            self.program(
+                declarations
+                + """
+                namespace proof {
+                    alias Number=i32;
+                    constraint Even<const Number Value> {requires(!::odd(Value));};
+                }
+                generic<const i32 Input> requires(proof::Even<Input>)
+                bool declared(){return ::choose<Input>().get < 1 > (0);}
+                constraint IsRelation<type X> {requires(SameType<Relation,X>);};
+                generic<type T> requires(IsRelation<T>) bool known_type(T& value,T* ptr){
+                    return (value.get < 3 > (0)) && (ptr->get < 4 > (0));
+                }
+                generic<type T,type U> requires(SameType<T,U> && IsRelation<U>)
+                bool known_type_chain(T& value,U& other){return value.get < 8 > (0);}
+                generic<const i32 N> requires(N%2==0) Relation arithmetic(){return Relation();}
+                generic<const i32 N> requires(!(N%2==0)) Generic arithmetic(){return Generic();}
+                generic<const i32 N> requires(N%2==0) bool known_parity(){
+                    return arithmetic<N>().get < 5 > (0);
+                }
+                generic<const i32 N> requires(!odd(N+2)) bool known_argument(){
+                    return choose<N+2>().get < 6 > (0);
+                }
+                struct Witness {i32 item;};
+                constraint HasItem<type T>{expression(T& x){x.item -> i32&;}};
+                generic<type T> requires(HasItem<T>) Relation by_field(T& x){return Relation();}
+                generic<type T> requires(!HasItem<T>) Generic by_field(T& x){return Generic();}
+                generic<type U> requires(HasItem<U>) bool known_requirement(U& x){
+                    return by_field(x).get < 7 > (0);
+                }
+                generic<const i32 A> i32 guarded(){
+                    if constexpr (::odd(A)) {
+                        return choose<A>().get<21>();
+                    } else {
+                        return choose<A>().get < 2 > (0) ? 21 : 0;
+                    }
+                }
+                i32 main(){
+                    Relation object; Witness witness;
+                    if(!known_type(object,&object) || !known_type_chain(object,object)){return 2;}
+                    if(!known_parity<2>() || !known_argument<4>()){return 3;}
+                    if(!known_requirement(witness)){return 4;}
+                    if(!declared<2>() || !declared<8>()){return 1;}
+                    return guarded<4>()+guarded<5>();
+                }
+            """
+            ),
+            42,
+        )
+        different = self.compile(
+            declarations
+            + """
+            namespace other {
+                consteval bool odd(i32 x) {return x%3==0;}
+                generic<const i32 A> requires(!odd(A))
+                bool use(){return ::choose<A>().get < 1 > (0);}
+            }
+            i32 main(){return other::use<2>() ? 42 : 0;}
+        """,
+            "--check",
+        )
+        self.assertEqual(different.returncode, 1, different.stderr)
+        different_policy = self.compile(
+            declarations
+            + """
+            configured(numeric.integer.overflow=wrapping)
+            generic<const i8 N> requires(N+1>0) Relation limit(){return Relation();}
+            configured(numeric.integer.overflow=wrapping)
+            generic<const i8 N> requires(!(N+1>0)) Generic limit(){return Generic();}
+            configured(numeric.integer.overflow=saturating)
+            generic<const i8 N> requires(N+1>0) bool use(){
+                return limit<N>().get < 1 > (0);
+            }
+            i32 main(){return use<1>() ? 42 : 0;}
+        """,
+            "--check",
+        )
+        self.assertEqual(different_policy.returncode, 1, different_policy.stderr)
+
+    def test_candidate_result_types_can_agree_on_member_syntax(self):
+        self.assertEqual(
+            self.program("""
+                struct Range {bool operator>(i32 n) const {return n==0;}};
+                struct Less {Range operator<(i32 n) const {return Range();}};
+                struct A {Less get;}; struct B {Less get;};
+                struct First {A box;}; struct Second {B box;};
+                struct G1 {generic<const i32 N> i32 get() const {return N;}};
+                struct G2 {generic<const i32 N> i32 get() const {return N+1;}};
+                consteval bool odd(i32 n){return n%2!=0;}
+                generic<const i32 N> requires(!odd(N)) First boxes(){return First();}
+                generic<const i32 N> requires(odd(N)) Second boxes(){return Second();}
+                generic<const i32 N> requires(!odd(N)) G1 family(){return G1();}
+                generic<const i32 N> requires(odd(N)) G2 family(){return G2();}
+                generic<const i32 N> i32 use(){
+                    auto value(boxes<N>());
+                    if (!(value.box.get < 1 > (0))) {return 0;}
+                    return family<N>().get<20>();
+                }
+                i32 main(){return use<2>()+use<3>()+1;}
+            """),
+            42,
+        )
 
     def test_member_overload_argument_kinds_follow_caller_declarations(self):
         source = """
