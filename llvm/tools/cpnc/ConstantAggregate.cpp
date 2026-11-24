@@ -2,8 +2,28 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/ConstantFold.h"
+#include <limits>
 using namespace cpn;
 using llvm::StringRef;
+
+llvm::Constant *cpn::constantElement(llvm::Constant *C, uint64_t Index) {
+  // LLVM's aggregate operand API uses unsigned indices. A uniform array
+  // constant still represents every position in its full-width extent.
+  if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType())) {
+    if (Index >= Array->getNumElements())
+      return nullptr;
+    auto *Element = Array->getElementType();
+    if (llvm::isa<llvm::ConstantAggregateZero>(C))
+      return llvm::Constant::getNullValue(Element);
+    if (llvm::isa<llvm::PoisonValue>(C))
+      return llvm::PoisonValue::get(Element);
+    if (llvm::isa<llvm::UndefValue>(C))
+      return llvm::UndefValue::get(Element);
+  }
+  return Index <= std::numeric_limits<unsigned>::max()
+             ? C->getAggregateElement(unsigned(Index))
+             : nullptr;
+}
 
 void Context::chargeConstant(const Token &At, uint64_t Steps) {
   constexpr unsigned Limit = 100000;
@@ -233,6 +253,7 @@ Value Frame::constantCopy(Value Source, const Token &At, bool CheckInvariant,
   } else if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType());
              Array && U.aggregate(unconst(element(Type))) &&
              !StringRef(Type).ends_with("[0]")) {
+    U.chargeConstant(At, Array->getNumElements());
     std::vector<llvm::Constant *> Fields;
     for (unsigned I = 0; I < Array->getNumElements(); ++I)
       Fields.push_back(subobject(element(Type), I));
@@ -621,9 +642,10 @@ std::optional<ConstantPlace> Frame::constantPlace(const Node &N) {
       auto *I = llvm::dyn_cast_or_null<llvm::ConstantInt>(Index.IR);
       auto Count = llvm::cast<llvm::ArrayType>(U.ir(Type))->getNumElements();
       if (!integer(Index.Type) || !I || StringRef(Type).ends_with("[0]") ||
-          I->getValue().uge(Count) || !I->getValue().isIntN(32))
+          (signedType(Index.Type) && I->isNegative()) ||
+          I->getValue().uge(Count))
         fail(Part->At, "constant array index outside extent");
-      Indices.push_back({unsigned(I->getZExtValue())});
+      Indices.push_back({I->getZExtValue()});
       Type = element(Type);
     } else {
       if (!U.Records.count(Type))
@@ -660,8 +682,8 @@ void ConstantPlace::trackLifetime() {
   Lifetime = Identity;
 }
 
-std::vector<unsigned> ConstantPlace::indices() const {
-  std::vector<unsigned> Path;
+std::vector<uint64_t> ConstantPlace::indices() const {
+  std::vector<uint64_t> Path;
   Path.reserve(Steps.size());
   for (const auto &Step : Steps)
     Path.push_back(Step.Index);
@@ -702,7 +724,7 @@ void ConstantPlace::checkLifetime(const Token &At, bool ExtentOnly) const {
     fail(At, "ended object generation");
   if (Identity->Subobjects.empty())
     return;
-  std::vector<unsigned> Path;
+  std::vector<uint64_t> Path;
   for (const auto &Step : Steps) {
     Path.push_back(Step.Index);
     auto I = Identity->Subobjects.find(Path);
@@ -723,7 +745,9 @@ Value ConstantPlace::read(Frame &F, const Token &At) const {
       fail(At, "constant aggregate value required");
     if (S.Alternative)
       C = F.unpackVariant(*S.Alternative, C, At);
-    V = {Type, C->getAggregateElement(S.Index)};
+    V = {Type, constantElement(C, S.Index)};
+    if (!V.IR)
+      fail(At, "constant aggregate element is unavailable");
   }
   V.Type = Type;
   V.Readonly = Readonly;
@@ -750,12 +774,20 @@ void ConstantPlace::write(Frame &F, Value V, const Token &At) const {
     if (S.Alternative)
       C = F.unpackVariant(*S.Alternative, C, At);
     Parents.push_back(C);
-    C = C->getAggregateElement(S.Index);
+    C = constantElement(C, S.Index);
+    if (!C)
+      fail(At, "constant aggregate element is unavailable");
   }
+  auto *Previous = C;
   C = llvm::cast<llvm::Constant>(V.IR);
+  if (C == Previous)
+    return;
   for (auto S : llvm::reverse(Steps)) {
-    C = llvm::ConstantFoldInsertValueInstruction(Parents.pop_back_val(), C,
-                                                 {S.Index});
+    auto *Parent = Parents.pop_back_val();
+    if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(Parent->getType()))
+      F.U.chargeConstant(At, Array->getNumElements());
+    C = llvm::ConstantFoldInsertValueInstruction(Parent, C,
+                                                 {unsigned(S.Index)});
     if (S.Alternative)
       C = F.packVariant(*S.Alternative, C, At);
   }

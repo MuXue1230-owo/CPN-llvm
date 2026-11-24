@@ -1,5 +1,6 @@
 #include "Sema.h"
 #include "llvm/ADT/ScopeExit.h"
+#include <iterator>
 using namespace cpn;
 std::string Frame::directField(const Node &N) const {
   if (N.K == Node::Name) {
@@ -179,18 +180,41 @@ void Frame::retireConstantExtent(ConstantPlace Place, const Token &At,
   const auto &Storage = *Place.Root->ConstantIdentity.Storage;
   if (llvm::StringRef(Place.Type).ends_with("]")) {
     const auto Element = unconst(element(Place.Type));
-    if (!U.aggregate(Element) && Storage.Subobjects.empty())
+    bool AggregateElements = U.aggregate(Element);
+    if (!AggregateElements && Storage.Subobjects.empty())
       return;
     auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Place.Type, At));
     auto Count = llvm::StringRef(Place.Type).ends_with("[0]")
                      ? 0
                      : Array->getNumElements();
-    for (uint64_t I = Count; I; --I) {
+    auto Retire = [&](uint64_t Index) {
       U.chargeConstant(At);
       auto Child = Place;
       Child.Type = Element;
-      Child.Steps.push_back({unsigned(I - 1)});
+      Child.Steps.push_back({Index});
       retireConstantExtent(std::move(Child), At, false, Destroy);
+    };
+    if (AggregateElements) {
+      for (uint64_t I = Count; I; --I)
+        Retire(I - 1);
+      return;
+    }
+    // Scalar elements have no ordinary cleanup. Visit only registered slots,
+    // including replacements, in descending order of their original indices.
+    const auto Prefix = Place.indices();
+    auto Before = Prefix;
+    Before.push_back(Count);
+    while (Before.back()) {
+      auto Next = Storage.Subobjects.lower_bound(Before);
+      if (Next == Storage.Subobjects.begin())
+        break;
+      const auto &Path = std::prev(Next)->first;
+      if (Path.size() <= Prefix.size() ||
+          llvm::ArrayRef(Path).take_front(Prefix.size()) !=
+              llvm::ArrayRef(Prefix))
+        break;
+      Before.back() = Path[Prefix.size()];
+      Retire(Before.back());
     }
     return;
   }
@@ -259,8 +283,8 @@ void Frame::constantDrop(Value Object, const Token &At, bool AsBase,
   if (auto *Array = llvm::dyn_cast<llvm::ArrayType>(C->getType())) {
     auto E = element(Type);
     if (U.aggregate(unconst(E)) && !llvm::StringRef(Type).ends_with("[0]"))
-      for (size_t I = Array->getNumElements(); I; --I)
-        constantDrop({E, C->getAggregateElement(unsigned(I - 1))}, At);
+      for (uint64_t I = Array->getNumElements(); I; --I)
+        constantDrop({E, constantElement(C, I - 1)}, At);
     return;
   }
   auto &R = U.Records.at(Type);

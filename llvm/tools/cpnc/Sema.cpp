@@ -3,7 +3,9 @@
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/Support/Alignment.h"
 #include "llvm/Transforms/Utils/ModuleUtils.h"
+#include <limits>
 
 using namespace cpn;
 using llvm::StringRef;
@@ -63,6 +65,9 @@ std::vector<std::string> cpn::splitArguments(StringRef S) {
   return Out;
 }
 namespace {
+// LLVM's data layout represents object sizes in bits in a uint64_t.
+constexpr uint64_t MaxObjectBytes = std::numeric_limits<uint64_t>::max() / 8;
+
 std::string appliedName(std::string Name, const Family &Family,
                         const Substitution &S) {
   Name += "<";
@@ -135,7 +140,11 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     if (!llvm::ArrayType::isValidElementType(Element) || !Element->isSized())
       fail(At, "array requires a complete object element type");
     // Empty arrays reserve addressable, element-aligned storage on this target.
-    return llvm::ArrayType::get(Element, std::max<uint64_t>(1, N));
+    auto Count = std::max<uint64_t>(1, N);
+    auto Stride = M.getDataLayout().getTypeAllocSize(Element).getFixedValue();
+    if (Stride && Count > MaxObjectBytes / Stride)
+      fail(At, "array byte extent exceeds the target object layout domain");
+    return llvm::ArrayType::get(Element, Count);
   }
   if (Signatures.count(T))
     fail(At, "function type requires a pointer");
@@ -146,6 +155,24 @@ llvm::Type *Context::ir(const std::string &T, const Token &At) {
     return Records.at(T).IR;
   }
   fail(At, "unsupported or unknown type '" + T + "'");
+}
+
+void Context::checkRecordLayout(llvm::ArrayRef<llvm::Type *> Fields,
+                                const Token &At) const {
+  const auto &DL = M.getDataLayout();
+  llvm::Align Alignment;
+  uint64_t Size = 0;
+  for (auto *Field : Fields) {
+    auto FieldAlignment = DL.getABITypeAlign(Field);
+    Alignment = std::max(Alignment, FieldAlignment);
+    auto Start = llvm::alignTo(Size, FieldAlignment);
+    auto Bytes = DL.getTypeAllocSize(Field).getFixedValue();
+    if (Start > MaxObjectBytes || Bytes > MaxObjectBytes - Start)
+      fail(At, "record byte extent exceeds the target object layout domain");
+    Size = Start + Bytes;
+  }
+  if (llvm::alignTo(Size, Alignment) > MaxObjectBytes)
+    fail(At, "record byte extent exceeds the target object layout domain");
 }
 Frame::Frame(Context &U, Function *F, llvm::Function *IR, std::string P)
     : U(U), F(F), B(U.M), Opt(F ? F->Definition.Configuration : U.Opt),
@@ -531,10 +558,12 @@ std::string Frame::resolve(std::string S, const Token &At) {
       fail(At, "array extent requires a compile-time integer");
     auto *C = llvm::dyn_cast_or_null<llvm::ConstantInt>(N.IR);
     if (!C || (signedType(N.Type) && C->isNegative()) ||
-        C->getValue().getActiveBits() > 31)
+        C->getValue().getActiveBits() > width("usize"))
       fail(At, "array extent is outside the range of nonnegative extents");
-    return resolve(S.substr(0, I), At) + "[" +
-           std::to_string(C->getZExtValue()) + "]";
+    auto Array = resolve(S.substr(0, I), At) + "[" +
+                 std::to_string(C->getZExtValue()) + "]";
+    U.ir(Array, At);
+    return Array;
   }
   if (StringRef(S).ends_with("&") || StringRef(S).ends_with("*"))
     return resolve(element(S), At) + S.back();
@@ -1331,6 +1360,7 @@ void Context::record(const Node &N, const std::string &Name,
     Layout.insert(Layout.end(), R.VirtualCount, llvm::Type::getInt64Ty(C));
     Layout.push_back(llvm::Type::getInt32Ty(C));
     Layout.push_back(llvm::Type::getInt1Ty(C));
+    checkRecordLayout(Layout, N.At);
     R.Layer = llvm::StructType::create(C, Layout, "cpn.layer." + Name);
     // Align the tail after the full size of the embedded nonvirtual prefix.
     Layout.push_back(llvm::ArrayType::get(R.Layer, 0));
@@ -1338,6 +1368,7 @@ void Context::record(const Node &N, const std::string &Name,
       Layout.push_back(Records.at(R.Bases[I]).Layer);
     Layout.push_back(llvm::ArrayType::get(ownerRecordType(), R.VirtualCount));
   }
+  checkRecordLayout(Layout, N.At);
   R.IR->setBody(Layout);
   R.Complete = true;
   completeMemberTypes(N.Children, Name);

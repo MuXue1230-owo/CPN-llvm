@@ -53,6 +53,7 @@ Value Frame::closure(const Node &N) {
     }
     if (Fields.empty())
       Fields.push_back(B.getInt8Ty());
+    U.checkRecordLayout(Fields, N.At);
     R.IR->setBody(Fields);
     Node Op = N;
     Op.K = Node::Function;

@@ -376,7 +376,7 @@ Value Frame::subscript(const Node &N) {
   auto *Array = llvm::cast<llvm::ArrayType>(U.ir(Base.Type));
   auto Count = ends(Base.Type, "[0]") ? 0 : Array->getNumElements();
   if (auto *K = llvm::dyn_cast<llvm::ConstantInt>(Index.IR)) {
-    if (K->getValue().uge(Count))
+    if ((signedType(Index.Type) && K->isNegative()) || K->getValue().uge(Count))
       fail(N.At, "array index outside extent");
   }
   if (!IR) {
@@ -559,11 +559,12 @@ Value Frame::eval(const Node &N, std::string Expected, llvm::Value *Dest) {
       auto *I = llvm::dyn_cast_or_null<llvm::ConstantInt>(Index.IR);
       if (!ends(Base.Type, "]") || !Array || !integer(Index.Type) || !I ||
           ends(Base.Type, "[0]") ||
+          (signedType(Index.Type) && I->isNegative()) ||
           I->getValue().uge(
               llvm::cast<llvm::ArrayType>(Array->getType())->getNumElements()))
         fail(N.At, "constant array element requires a valid constant index");
       return {unconst(element(Base.Type)),
-              Array->getAggregateElement(unsigned(I->getZExtValue()))};
+              constantElement(Array, I->getZExtValue())};
     }
     return load(subscript(N), N.At);
   case Node::Member:
@@ -1995,16 +1996,16 @@ void Frame::rollbackConstructionPrefix(Value Object, llvm::Value *Count) {
 
 Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
                        const Token &At, llvm::Value *Dest, const Node *Tail,
-                       bool AsBase) {
+                       bool AsBase, llvm::function_ref<void()> Admit) {
   if (InPredicate && U.aggregate(T))
     fail(At, "contract predicates cannot construct aggregate temporaries");
   if ((T == StorageViewType || memoryIdentity(T)) && Args.empty())
     fail(At, "memory capability requires an authorized source");
   if (!Args.empty() && Args.back().K == Node::Tail)
     return construct(T, {Args.begin(), Args.end() - 1}, At, Dest, &Args.back(),
-                     AsBase);
+                     AsBase, Admit);
   if (auto Mutable = unconst(T); Mutable != T) {
-    auto V = construct(Mutable, Args, At, Dest, Tail, AsBase);
+    auto V = construct(Mutable, Args, At, Dest, Tail, AsBase, Admit);
     V.Readonly = true;
     return V;
   }
@@ -2015,6 +2016,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
       fail(At, "invalid scalar construction");
     Value V = Args.empty() ? Value{T, llvm::ConstantFP::get(U.ir(T), 0.0)}
                            : floatingConvert(eval(Args[0], T), T, At, true);
+    if (Admit)
+      Admit();
     if (Dest)
       B.CreateStore(V.IR, Dest);
     runConstructionTail({T, nullptr, Dest}, Tail);
@@ -2023,6 +2026,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   auto *Ty = U.ir(T, At);
   if (!Ty->isSized())
     fail(At, "construction requires a complete object type");
+  if (Admit && U.aggregate(T))
+    Admit();
   if (!IR && U.aggregate(T))
     return constantAggregate(T, Args, At, Tail);
   if (ends(T, "]")) {
@@ -2305,6 +2310,8 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
     else
       V = convert(Source, T, At);
   }
+  if (Admit)
+    Admit();
   if (Dest) {
     if (carriesPointerBounds(T))
       saveBounds(storedPointerCell(Dest), V);
@@ -2314,7 +2321,14 @@ Value Frame::construct(const std::string &T, const std::vector<Node> &Args,
   return V;
 }
 void Frame::drop(Value V, bool AsBase) {
-  if (!IR || !V.Address)
+  if (!IR)
+    return;
+  if (V.ConstructionReservation) {
+    B.CreateCall(U.M.getFunction("cpn.slot.unreserve"),
+                 {V.ConstructionReservation});
+    return;
+  }
+  if (!V.Address)
     return;
   V = V.objectDesignation();
   requirePredicateCleanup(V.Type, F ? F->Decl.At : Token{});

@@ -33,7 +33,7 @@ constexpr StringRef OperationEffects = "cpn.effect";
 constexpr StringRef BoundaryEffects = "cpn.boundary.effects";
 constexpr StringRef BoundaryScope = "cpn.boundary";
 constexpr StringRef StorageRetire = StorageRetirementBundle;
-constexpr StringRef StorageReplace = "cpn.storage.replace";
+constexpr StringRef StorageReplace = StorageReplacementBundle;
 constexpr StringRef StorageWrite = "cpn.storage.write";
 constexpr StringRef StorageView = "cpn.storage.view";
 
@@ -941,9 +941,11 @@ void Context::checkEffects() {
           // Borrow checking still needs the destination's captured generation.
           continue;
         }
-        Descriptor = Call->getOperandBundle(StorageReplace);
-        if (!Descriptor)
-          Descriptor = Call->getOperandBundle(StorageView);
+        // Lifetime analysis also needs the registration of a committed
+        // replacement.
+        if (Call->getOperandBundle(StorageReplace))
+          continue;
+        Descriptor = Call->getOperandBundle(StorageView);
         if (Descriptor) {
           auto *Native = llvm::CallBase::removeOperandBundle(
               Call, Descriptor->getTagID(), Call->getIterator());

@@ -3397,6 +3397,60 @@ class CompilerTests(unittest.TestCase):
             self.compile("i32 main(){i32[0] a;return a[0];}", "--check").returncode, 0
         )
 
+    def test_wide_array_count_and_checked_object_layout(self):
+        source = """
+            alias Wide = i8[4294967298];
+            generic<type T, const usize N> usize extent(T[N]& array){return N;}
+            usize array_extent(Wide& array){return extent(array);}
+            consteval i32 last(){
+                Wide array;
+                const<i8>& element(array[4294967296]);
+                auto first(storage_of(array[0]));
+                auto last(storage_of(array[4294967297]));
+                if(first.identity() == last.identity()){return 1;}
+                destroy(array[4294967297]);
+                auto fresh(construct_at<i8>(last,7));
+                return i32(element) + i32(*fresh) - 7;
+            }
+            constexpr i32 result(last());
+            i32 main(){
+                Wide* pointer(nullptr);
+                if(pointer != nullptr || sizeof(Wide) != 4294967298){return 1;}
+                if(sizeof(i8[2147483648][2]) != 4294967296){return 2;}
+                return result+42;
+            }
+        """
+        self.assertEqual(self.program(source), 42)
+        overflow = (
+            ("alias T = i8[18446744073709551616];", "nonnegative extents"),
+            ("alias T = i8[-1];", "nonnegative extents"),
+            ("alias T = i64[288230376151711744]*;", "array byte extent"),
+            ("alias T = i64[2147483647][2147483647];", "array byte extent"),
+            (
+                "struct T { i8[2305843009213693951] first; i8 last; };",
+                "record byte extent",
+            ),
+            (
+                "union T { case Value(i8[2305843009213693951] bytes); };",
+                "record byte extent",
+            ),
+            ("declare struct T; alias Invalid = T[2]*;", "incomplete record element"),
+            (
+                "i32 at(i8[4294967298]& a){return i32(a[i8(-1)]);}",
+                "array index outside extent",
+            ),
+            (
+                "consteval i8 at(i8 n){i8[4294967298] a;return a[n];}"
+                "constexpr i8 value(at(i8(-1)));",
+                "constant array index outside extent",
+            ),
+        )
+        for text, diagnostic in overflow:
+            with self.subTest(text=text):
+                result = self.compile(text, "--check")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(diagnostic, result.stderr)
+
     def test_pointer_call_bounds_and_returned_generations(self):
         calls = """
           [[returns_borrowed_from(p)]] i32* offset(i32* p,i32 n){return p+n;}
@@ -7871,6 +7925,62 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(
             self.program(conditional.replace("INPUT", "false")), -signal.SIGILL
         )
+        selected = """
+            i32 replace(bool first) {
+                FIRST tiny;
+                SECOND other;
+                auto view(first ? storage_of(tiny) : storage_of(other));
+                destroy(tiny);
+                destroy(other);
+                REPLACE
+            }
+            i32 main(){return replace(INPUT);}
+        """
+        for first, second, operation in (
+            ("i8", "i16", "return *construct_at<i64>(view,42)==42 ? 42 : 1;"),
+            (
+                "i64",
+                "i8[32]",
+                "auto fresh(construct_at<i64[2]>(view,1,42));"
+                "return (*fresh)[1]==42 ? 42 : 1;",
+            ),
+        ):
+            with self.subTest(first=first, second=second):
+                source = (
+                    selected.replace("FIRST", first)
+                    .replace("SECOND", second)
+                    .replace("REPLACE", operation)
+                    .replace("INPUT", "true")
+                )
+                for candidate in (
+                    source,
+                    source.replace(
+                        "auto view(first ? storage_of(tiny) : storage_of(other));",
+                        "auto view(storage_of(tiny));"
+                        "if(!first){view=storage_of(other);}",
+                    ),
+                ):
+                    checked = self.compile(candidate, "--check")
+                    self.assertEqual(checked.returncode, 1, checked.stderr)
+                    self.assertIn("insufficient storage capacity", checked.stderr)
+        mixed = (
+            selected.replace("FIRST", "i64")
+            .replace("SECOND", "i8")
+            .replace("REPLACE", "return *construct_at<i64>(view,42)==42 ? 42 : 1;")
+        )
+        self.assertEqual(self.program(mixed.replace("INPUT", "true")), 42)
+        self.assertEqual(self.program(mixed.replace("INPUT", "false")), -signal.SIGILL)
+        rebound = (
+            selected.replace("FIRST", "i8")
+            .replace("SECOND", "i64")
+            .replace(
+                "auto view(first ? storage_of(tiny) : storage_of(other));",
+                "auto view(storage_of(tiny));if(!first){view=storage_of(other);}",
+            )
+            .replace("REPLACE", "return *construct_at<i64>(view,42)==42 ? 42 : 1;")
+        )
+        self.assertEqual(self.program(rebound.replace("INPUT", "false")), 42)
+        self.assertEqual(self.program(rebound.replace("INPUT", "true")), -signal.SIGILL)
         self.assertEqual(
             self.program("""
                 void retire(i32& value){destroy(value);}
@@ -7881,6 +7991,131 @@ class CompilerTests(unittest.TestCase):
                     return *construct_at<i32>(view,42);
                 }
             """),
+            42,
+        )
+
+    def test_native_reconstruction_protects_pending_storage(self):
+        nested = """
+            struct Replacement {
+                i8 value;
+                Replacement(std::mem::StorageView extent) {
+                    construct_at<i8>(extent,1);
+                    init value(42);
+                }
+            };
+            i32 main() {
+                i8 backing; i8 other;
+                auto extent(storage_of(backing));
+                auto independent(storage_of(other));
+                destroy(backing); destroy(other);
+                auto result(construct_at<Replacement>(extent, INNER));
+                if(result->value!=42){return 1;}
+                destroy(*result);
+                return *construct_at<i8>(extent,42);
+            }
+        """
+        self.assertEqual(
+            self.program(nested.replace("INNER", "extent")), -signal.SIGILL
+        )
+        self.assertEqual(self.program(nested.replace("INNER", "independent")), 42)
+        self.assertEqual(
+            self.program("""
+                struct Box {i8 element;};
+                struct Replacement {
+                    i8 value;
+                    Replacement(Box& parent) {destroy(parent);init value(42);}
+                };
+                i32 main() {
+                    Box parent;
+                    auto extent(storage_of(parent.element));
+                    destroy(parent.element);
+                    return construct_at<Replacement>(extent,parent)->value;
+                }
+            """),
+            -signal.SIGILL,
+        )
+        self.assertEqual(
+            self.program("""
+                i32 trace;
+                i8 backing;
+                declare struct Outer;
+                declare void request(Outer* owner);
+                struct Parent {~Parent(){trace=trace*10+1;}};
+                struct Stage {~Stage(){trace=trace*10+2;}};
+                struct Work {
+                    Stage finished;
+                    Work(Outer* owner){request(owner);}
+                    ~Work(){trace=trace*10+9;}
+                };
+                struct Outer:Parent {
+                    Complete base<Parent>;
+                    ~Outer(){
+                        auto area(storage_of(backing));
+                        destroy(backing);
+                        construct_at<Work>(area,this);
+                        trace=trace*10+7;
+                    }
+                    cleanup{
+                        auto resumed(construct_at<i8>(storage_of(backing),42));
+                        if(*resumed==42){trace=trace*10+3;}
+                    }
+                };
+                void request(Outer* owner){destroy_base<Parent>(owner);}
+                i32 main(){{Outer value;}return trace==123 ? 42 : 1;}
+            """),
+            42,
+        )
+
+    def test_scalar_reconstruction_evaluates_operand_before_admission(self):
+        self.assertEqual(
+            self.program("""
+                constexpr i32 retire(i32& value) {destroy(value);return 42;}
+                constexpr i32 evaluate(){
+                    i32 original;
+                    return *construct_at<i32>(storage_of(original),retire(original));
+                }
+                constexpr i32 constant(evaluate());
+                i32 main(){
+                    if(constant!=42){return 1;}
+                    i32 original;
+                    return *construct_at<i32>(storage_of(original),retire(original));
+                }
+            """),
+            42,
+        )
+        self.assertEqual(
+            self.program(
+                """
+                extern "C" i64 operand();
+                extern "C" i32 replace_scalar(bool use_small){
+                    i8 small;
+                    i64 large;
+                    auto view(use_small ? storage_of(small) : storage_of(large));
+                    destroy(small);
+                    destroy(large);
+                    return *construct_at<i64>(view,operand())==42 ? 42 : 1;
+                }
+                """,
+                host="""
+                #include <stdbool.h>
+                #include <signal.h>
+                #include <stdint.h>
+                #include <stdlib.h>
+                extern int32_t replace_scalar(bool use_small);
+                static volatile sig_atomic_t evaluated;
+                int64_t operand(void) { ++evaluated; return 42; }
+                static void rejected(int reason) {
+                    _Exit(reason == SIGILL && evaluated == 1 ? 42 : 1);
+                }
+                int main(void) {
+                    if (replace_scalar(false) != 42 || evaluated != 1) return 2;
+                    evaluated = 0;
+                    if (signal(SIGILL, rejected) == SIG_ERR) return 3;
+                    replace_scalar(true);
+                    return 4;
+                }
+                """,
+            ),
             42,
         )
 

@@ -11,6 +11,7 @@ inline constexpr char StorageViewType[] = "$cpn.storage";
 inline constexpr char StorageIdentityType[] = "$cpn.storage_identity";
 inline constexpr char StorageArgumentBundle[] = "cpn.storage.arguments";
 inline constexpr char StorageRetirementBundle[] = "cpn.storage.retire";
+inline constexpr char StorageReplacementBundle[] = "cpn.storage.replace";
 inline constexpr char StorageProjectionBundle[] = "cpn.storage.projection";
 inline constexpr char IncomingPointerStorage[] = "cpn.storage.incoming.pointer";
 inline constexpr char IncomingArrayStorage[] = "cpn.storage.incoming.array";
@@ -30,6 +31,7 @@ struct JumpCleanups {
 };
 std::string unconst(const std::string &T);
 std::string qualifyConst(const std::string &T);
+llvm::Constant *constantElement(llvm::Constant *, uint64_t Index);
 std::string nativeLinkName(const llvm::Module &, llvm::StringRef Category,
                            llvm::ArrayRef<llvm::StringRef> Components);
 std::string externalIRName(llvm::StringRef Symbol);
@@ -45,7 +47,7 @@ struct ConstantStorageSlot {
 };
 struct ConstantStorage : ConstantStorageSlot {
   std::vector<llvm::GlobalVariable *> Designations;
-  std::map<std::vector<unsigned>, ConstantStorageSlot> Subobjects;
+  std::map<std::vector<uint64_t>, ConstantStorageSlot> Subobjects;
   std::shared_ptr<ConstantPlace> OriginalExtent;
 };
 // Each evaluation-local object has its own lifetime. Copying its value creates
@@ -105,6 +107,7 @@ struct Value {
   bool BaseView = false, Prvalue = false;
   bool Rollback = false;
   llvm::Value *ConstructionProgress = nullptr;
+  llvm::Value *ConstructionReservation = nullptr;
   const Case *ConstructionCase = nullptr;
   Value() = default;
   Value(std::string T, llvm::Value *V = nullptr, llvm::Value *A = nullptr,
@@ -226,7 +229,7 @@ struct Case {
 // Paths into evaluation-local values survive immutable LLVM aggregate updates.
 struct ConstantPlace {
   struct Step {
-    unsigned Index;
+    uint64_t Index;
     const Case *Alternative = nullptr;
     std::string BaseOwner;
     bool operator==(const Step &Other) const {
@@ -241,7 +244,7 @@ struct ConstantPlace {
   std::shared_ptr<Value> SymbolicRoot;
   std::optional<std::weak_ptr<ConstantStorage>> Lifetime;
   void trackLifetime();
-  std::vector<unsigned> indices() const;
+  std::vector<uint64_t> indices() const;
   const ConstantStorageSlot *registeredExtent() const;
   ConstantStorageSlot &registerExtent() const;
   bool hasLiveExtent() const;
@@ -346,6 +349,7 @@ struct Context {
   explicit Context(llvm::Module &M, Options O)
       : M(M), C(M.getContext()), Opt(std::move(O)) {}
   llvm::Type *ir(const std::string &T, const Token &At = {});
+  void checkRecordLayout(llvm::ArrayRef<llvm::Type *>, const Token &) const;
   bool cScalarType(const std::string &T) const;
   Function *declare(const Node &, const std::string &, const std::string &,
                     const Substitution &, const std::string &Owner = "");
@@ -707,7 +711,7 @@ public:
                                           llvm::Value *);
   Value construct(const std::string &, const std::vector<Node> &, const Token &,
                   llvm::Value *Dest = nullptr, const Node *Tail = nullptr,
-                  bool AsBase = false);
+                  bool AsBase = false, llvm::function_ref<void()> Admit = {});
   void localType(const Node &);
   void runConstructionTail(Value, const Node *, bool BoundSlots = false);
   void checkAccess(const Node &, const std::string &Owner, const Token &);

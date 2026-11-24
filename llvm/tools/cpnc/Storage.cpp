@@ -126,14 +126,19 @@ void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
 }
 
 void markStorageSite(llvm::CallBase &Check, llvm::StringRef Kind,
-                     const Token &Source) {
+                     const Token &Source,
+                     llvm::ArrayRef<uint64_t> Requirements = {}) {
   auto &Context = Check.getContext();
   auto *I32 = llvm::Type::getInt32Ty(Context);
-  llvm::Metadata *Location[] = {
+  llvm::SmallVector<llvm::Metadata *, 4> Fields{
       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(I32, Source.Line)),
       llvm::ConstantAsMetadata::get(
           llvm::ConstantInt::get(I32, Source.Column))};
-  Check.setMetadata(Kind, llvm::MDNode::get(Context, Location));
+  auto *I64 = llvm::Type::getInt64Ty(Context);
+  for (auto Requirement : Requirements)
+    Fields.push_back(llvm::ConstantAsMetadata::get(
+        llvm::ConstantInt::get(I64, Requirement)));
+  Check.setMetadata(Kind, llvm::MDNode::get(Context, Fields));
 }
 } // namespace
 llvm::Value *Frame::slotFor(Value V) {
@@ -296,8 +301,9 @@ llvm::Value *Frame::replaceGeneration(const Value &V, const std::string &T) {
   B.CreateStore(U.typeID(T), B.CreateStructGEP(U.SlotType, S, CurrentType));
   auto *Entry = destructor(*this, T);
   B.CreateStore(Entry, B.CreateStructGEP(U.SlotType, S, Destructor));
-  llvm::Value *Operands[] = {V.IR, S, Entry};
-  llvm::OperandBundleDef Effects("cpn.storage.replace", Operands);
+  llvm::Value *Operands[] = {V.IR, S, Entry,
+                             V.Generation ? V.Generation : B.getInt64(0)};
+  llvm::OperandBundleDef Effects(StorageReplacementBundle, Operands);
   auto *StampValue =
       B.CreateCall(U.M.getFunction("cpn.new.generation"), {}, {Effects});
   B.CreateStore(StampValue, B.CreateStructGEP(U.SlotType, S, Stamp));
@@ -311,32 +317,39 @@ llvm::Value *Frame::replaceGeneration(const Value &V, const std::string &T) {
 
 Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
   if (C.Text == "construct_at") {
-    auto Extent = constantExtent(*this, eval(Args.front()), C.At);
-    auto &Storage = Extent.registerExtent();
-    if (Storage.Constructing)
-      fail(C.At, "storage has a construction in progress");
-    if (Storage.Retiring ||
-        (Storage.Replacement &&
-         Storage.Replacement->ConstantIdentity.Storage->Retiring))
-      fail(C.At, "storage has a destruction in progress");
-    if (!Storage.Ended ||
-        (Storage.Replacement &&
-         !Storage.Replacement->ConstantIdentity.Storage->Ended))
-      fail(C.At, "storage contains a live generation");
+    auto View = eval(Args.front());
     const auto &RequestedType = C.TemplateArgs.front();
     auto Type = resolve(RequestedType.Type, RequestedType.At);
     auto *Requested = U.ir(Type, C.At);
-    auto *Existing = U.ir(Extent.Type, C.At);
     if (!Requested->isSized())
       fail(C.At, "replacement requires a complete object type");
-    const auto &Layout = U.M.getDataLayout();
-    if (Layout.getTypeAllocSize(Requested).getFixedValue() >
-        Layout.getTypeAllocSize(Existing).getFixedValue())
-      fail(C.At, "insufficient storage capacity");
-    if (Layout.getABITypeAlign(Requested) > Layout.getABITypeAlign(Existing))
-      fail(C.At, "insufficient storage alignment");
-    llvm::SaveAndRestore Construction(Storage.Constructing, true);
-    auto Built = construct(Type, {Args.begin() + 1, Args.end()}, C.At);
+    std::optional<ConstantPlace> Extent;
+    std::optional<llvm::SaveAndRestore<bool>> Construction;
+    ConstantStorageSlot *Storage = nullptr;
+    auto Admit = [&] {
+      Extent = constantExtent(*this, View, C.At);
+      Storage = &Extent->registerExtent();
+      if (Storage->Constructing)
+        fail(C.At, "storage has a construction in progress");
+      if (Storage->Retiring ||
+          (Storage->Replacement &&
+           Storage->Replacement->ConstantIdentity.Storage->Retiring))
+        fail(C.At, "storage has a destruction in progress");
+      if (!Storage->Ended ||
+          (Storage->Replacement &&
+           !Storage->Replacement->ConstantIdentity.Storage->Ended))
+        fail(C.At, "storage contains a live generation");
+      auto *Existing = U.ir(Extent->Type, C.At);
+      const auto &Layout = U.M.getDataLayout();
+      if (Layout.getTypeAllocSize(Requested).getFixedValue() >
+          Layout.getTypeAllocSize(Existing).getFixedValue())
+        fail(C.At, "insufficient storage capacity");
+      if (Layout.getABITypeAlign(Requested) > Layout.getABITypeAlign(Existing))
+        fail(C.At, "insufficient storage alignment");
+      Construction.emplace(Storage->Constructing, true);
+    };
+    auto Built = construct(Type, {Args.begin() + 1, Args.end()}, C.At, nullptr,
+                           nullptr, false, Admit);
     consume(Built);
     Built.Location.reset();
     Built.ConstantTemporary.reset();
@@ -346,8 +359,8 @@ Value Frame::constantStorageCall(const Node &C, const std::vector<Node> &Args) {
         Replacement.get(), {}, Replacement->Type, Replacement->Readonly};
     New.trackLifetime();
     Replacement->ConstantIdentity.Storage->OriginalExtent =
-        std::make_shared<ConstantPlace>(Extent);
-    Storage.Replacement = std::move(Replacement);
+        std::make_shared<ConstantPlace>(*Extent);
+    Storage->Replacement = std::move(Replacement);
     return constantAddress(New, C.At);
   }
 
@@ -442,19 +455,6 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
     auto S = eval(Args.front());
     if (S.Type != StorageViewType || !S.Slot)
       fail(C.At, "storage view required");
-    if (!S.Subobject)
-      if (auto State = Active.find(S.Storage);
-          State != Active.end() &&
-          (State->second > 0 || State->second == LiveGeneration))
-        fail(C.At, "storage contains a live generation");
-    auto *Extent = B.CreateCall(U.M.getFunction("cpn.extent.valid"),
-                                {S.Slot, S.Generation});
-    if (S.Subobject)
-      markStorageSite(*Extent, "cpn.storage.construct.use", C.At);
-    guard(B.CreateNot(Extent));
-    auto *Current =
-        B.CreateCall(U.M.getFunction("cpn.generation"), {S.Slot, B.getFalse()});
-    guard(B.CreateTrunc(Current, B.getInt1Ty()));
     const auto &RequestedType = C.TemplateArgs.front();
     const auto T = resolve(RequestedType.Type, RequestedType.At);
     const auto &DL = U.M.getDataLayout();
@@ -463,22 +463,40 @@ Value Frame::storageCall(const Node &C, const std::vector<Node> &Args) {
       fail(C.At, "replacement requires a complete object type");
     auto Size = DL.getTypeAllocSize(Ty).getFixedValue(),
          Align = DL.getABITypeAlign(Ty).value();
-    if (!S.ExtentType.empty()) {
-      auto *Extent = U.ir(S.ExtentType);
-      if (DL.getTypeAllocSize(Extent).getFixedValue() < Size ||
-          DL.getABITypeAlign(Extent).value() < Align)
-        fail(C.At, "insufficient storage capacity");
-    }
-    auto loadBound = [&](SlotField Index) {
-      return B.CreateLoad(B.getInt64Ty(),
-                          B.CreateStructGEP(U.SlotType, S.Slot, Index));
-    };
-    guard(B.CreateOr(B.CreateICmpULT(loadBound(Capacity), B.getInt64(Size)),
+    llvm::IRBuilder<> Entry(IR->getEntryBlock().begin());
+    auto *Reservation = Entry.CreateAlloca(
+        llvm::StructType::getTypeByName(U.C, "cpn.reconstruction"));
+    Value Release;
+    Release.ConstructionReservation = Reservation;
+    auto Admit = [&] {
+      auto *Extent = B.CreateCall(U.M.getFunction("cpn.extent.valid"),
+                                  {S.Slot, S.Generation});
+      markStorageSite(*Extent, "cpn.storage.construct.use", C.At,
+                      {Size, Align});
+      guard(B.CreateNot(Extent));
+      auto *Current = B.CreateCall(U.M.getFunction("cpn.generation"),
+                                   {S.Slot, B.getFalse()});
+      guard(B.CreateTrunc(Current, B.getInt1Ty()));
+      auto loadBound = [&](SlotField Index) {
+        return B.CreateLoad(B.getInt64Ty(),
+                            B.CreateStructGEP(U.SlotType, S.Slot, Index));
+      };
+      guard(
+          B.CreateOr(B.CreateICmpULT(loadBound(Capacity), B.getInt64(Size)),
                      B.CreateICmpULT(loadBound(Alignment), B.getInt64(Align))));
-    construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR);
+      auto *Reserved = B.CreateCall(U.M.getFunction("cpn.slot.reserve"),
+                                    {Reservation, S.Slot});
+      guard(B.CreateNot(Reserved));
+      Scopes.back().Drops.push_back(Release);
+    };
+    construct(T, {Args.begin() + 1, Args.end()}, C.At, S.IR, nullptr, false,
+              Admit);
+    assert(Scopes.back().Drops.back().ConstructionReservation == Reservation);
+    Scopes.back().Drops.pop_back();
     Value P{T + "*", S.IR};
     P.borrow(S);
     P.Generation = replaceGeneration(S, T);
+    drop(Release);
     return P;
   }
   bool Storage = C.Text == "storage_of";

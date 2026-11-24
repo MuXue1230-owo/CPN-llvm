@@ -111,6 +111,7 @@ void Context::tagged(const Node &D, const std::string &Name,
       V.Types.push_back(unconst(T));
       Fields.push_back(Ty);
     }
+    checkRecordLayout(Fields, Decl.At);
     V.Payload = llvm::StructType::get(C, Fields);
     Size = std::max(Size, DL.getTypeAllocSize(V.Payload).getFixedValue());
     if (DL.getABITypeAlign(V.Payload) > DL.getABITypeAlign(AlignType))
@@ -124,8 +125,11 @@ void Context::tagged(const Node &D, const std::string &Name,
   // link-time pointer relocation as one constant initializer.
   unsigned Unit = DL.getABITypeAlign(AlignType).value();
   auto *Word = llvm::IntegerType::get(C, Unit * 8);
-  R.IR->setBody({llvm::Type::getInt32Ty(C), llvm::ArrayType::get(AlignType, 0),
-                 llvm::ArrayType::get(Word, llvm::divideCeil(Size, Unit))});
+  llvm::Type *Layout[] = {
+      llvm::Type::getInt32Ty(C), llvm::ArrayType::get(AlignType, 0),
+      llvm::ArrayType::get(Word, llvm::divideCeil(Size, Unit))};
+  checkRecordLayout(Layout, D.At);
+  R.IR->setBody(Layout);
   R.Layer = R.IR;
   R.Complete = true;
   completeMemberTypes(D.Children, Name);

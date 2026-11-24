@@ -3,8 +3,10 @@
 ; initial generation, current generation, destructor, capacity, alignment,
 ; parent's generation at birth and a destruction-in-progress flag.
 %cpn.slot = type { ptr, ptr, ptr, ptr, ptr, ptr, i64, i64, ptr, i64, i64, i64, i1 }
+%cpn.reconstruction = type { ptr, ptr }
 @cpn.slots = internal thread_local global ptr null
 @cpn.epoch = internal thread_local global i64 1
+@cpn.reconstructions = internal thread_local global ptr null
 declare ptr @malloc(i64)
 declare void @free(ptr)
 declare void @llvm.trap()
@@ -171,6 +173,58 @@ end:
   ret void
 }
 
+; A pending reconstruction belongs to its storage registration until commit
+; or rollback. Search only pending operations and their containing extents.
+define internal i1 @cpn.slot.constructing(ptr %extent) {
+entry:
+  %head = load ptr, ptr @cpn.reconstructions
+  br label %scan
+scan:
+  %entry.slot = phi ptr [ %head, %entry ], [ %next, %advance ]
+  %empty = icmp eq ptr %entry.slot, null
+  br i1 %empty, label %absent, label %lookup
+lookup:
+  %storage = getelementptr %cpn.reconstruction, ptr %entry.slot, i32 0, i32 1
+  %registered = load ptr, ptr %storage
+  br label %ancestry
+ancestry:
+  %slot = phi ptr [ %registered, %lookup ], [ %parent, %up ]
+  %same = icmp eq ptr %slot, %extent
+  br i1 %same, label %found, label %up
+up:
+  %link = getelementptr %cpn.slot, ptr %slot, i32 0, i32 2
+  %parent = load ptr, ptr %link
+  %root = icmp eq ptr %parent, null
+  br i1 %root, label %advance, label %ancestry
+advance:
+  %next = load ptr, ptr %entry.slot
+  br label %scan
+found:
+  ret i1 true
+absent:
+  ret i1 false
+}
+
+define internal i1 @cpn.slot.reserve(ptr %entry, ptr %slot) {
+  %occupied = call i1 @cpn.slot.constructing(ptr %slot)
+  br i1 %occupied, label %blocked, label %commit
+blocked:
+  ret i1 false
+commit:
+  %previous = load ptr, ptr @cpn.reconstructions
+  store ptr %previous, ptr %entry
+  %storage = getelementptr %cpn.reconstruction, ptr %entry, i32 0, i32 1
+  store ptr %slot, ptr %storage
+  store ptr %entry, ptr @cpn.reconstructions
+  ret i1 true
+}
+
+define internal void @cpn.slot.unreserve(ptr %entry) {
+  %previous = load ptr, ptr %entry
+  store ptr %previous, ptr @cpn.reconstructions
+  ret void
+}
+
 define internal void @cpn.slot.retire(ptr %s, i1 %destroy) {
   %generation = call i64 @cpn.generation(ptr %s, i1 false)
   %live = trunc i64 %generation to i1
@@ -178,7 +232,13 @@ define internal void @cpn.slot.retire(ptr %s, i1 %destroy) {
 begin:
   %busy = getelementptr %cpn.slot, ptr %s, i32 0, i32 12
   %running = load i1, ptr %busy
-  br i1 %running, label %done, label %end
+  br i1 %running, label %done, label %check
+check:
+  %constructing = call i1 @cpn.slot.constructing(ptr %s)
+  br i1 %constructing, label %blocked, label %end
+blocked:
+  call void @llvm.trap()
+  unreachable
 end:
   store i1 true, ptr %busy
   %dp = getelementptr %cpn.slot, ptr %s, i32 0, i32 8

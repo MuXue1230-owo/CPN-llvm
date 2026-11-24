@@ -1097,8 +1097,51 @@ class EscapeCheck {
     return Callees;
   }
 
-  // A local pointer's sidecar has a known registration and cannot be written
-  // via an alias when every use of its address is visible here.
+  // Collect the writes to selected sidecar fields when the associated cell
+  // cannot be reached through an alias.
+  bool collectSidecarStores(llvm::Value *Base, llvm::ArrayRef<int64_t> Offsets,
+                            llvm::MutableArrayRef<SidecarStores> Stores) const {
+    auto *Field = llvm::dyn_cast<llvm::CallBase>(Base);
+    auto *Callee = Field ? Field->getCalledFunction() : nullptr;
+    if (!Callee || Callee->getName() != "cpn.pointer.field")
+      return false;
+    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Field->getArgOperand(0));
+    if (!isolatedPointerCell(Object))
+      return false;
+    for (auto *User : Object->users()) {
+      auto *Call = llvm::dyn_cast<llvm::CallBase>(User);
+      auto *F = Call ? Call->getCalledFunction() : nullptr;
+      if (!F || F->getName() != "cpn.pointer.field")
+        continue;
+      for (auto *Address : Call->users()) {
+        auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(Address);
+        if (!GEP || !GEP->hasAllConstantIndices())
+          return false;
+        auto Location = slot(GEP);
+        if (Location.Base != Call || Location.Offset < 0 ||
+            uint64_t(Location.Offset) % DL.getPointerSize() ||
+            GEP->getNumUses() > 128)
+          return false;
+        auto Offset = llvm::find(Offsets, Location.Offset);
+        for (auto *User : GEP->users()) {
+          if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(User);
+              Load && Load->isSimple())
+            continue;
+          auto *Store = llvm::dyn_cast<llvm::StoreInst>(User);
+          if (!Store || !Store->isSimple() ||
+              Store->getPointerOperand() != GEP ||
+              (!Store->getValueOperand()->getType()->isPointerTy() &&
+               !Store->getValueOperand()->getType()->isIntegerTy(64)))
+            return false;
+          if (Offset != Offsets.end())
+            Stores[Offset - Offsets.begin()].try_emplace(
+                Store, Store->getValueOperand());
+        }
+      }
+    }
+    return true;
+  }
+
   std::pair<llvm::Value *, llvm::Value *>
   savedGeneration(llvm::Value *Registration, llvm::Value *Generation,
                   const llvm::DominatorTree &Dominance) const {
@@ -1109,47 +1152,11 @@ class EscapeCheck {
       return {};
     const auto Locator = slot(SlotLoad->getPointerOperand());
     const auto Stamp = slot(StampLoad->getPointerOperand());
-    auto *Field = llvm::dyn_cast<llvm::CallBase>(Locator.Base);
-    auto *Callee = Field ? Field->getCalledFunction() : nullptr;
-    if (!Callee || Callee->getName() != "cpn.pointer.field" ||
-        Locator.Base != Stamp.Base)
-      return {};
-    auto *Object = llvm::dyn_cast<llvm::AllocaInst>(Field->getArgOperand(0));
-    if (!isolatedPointerCell(Object))
-      return {};
     SidecarStores Stores[2];
-    for (auto *User : Object->users()) {
-      auto *Call = llvm::dyn_cast<llvm::CallBase>(User);
-      auto *F = Call ? Call->getCalledFunction() : nullptr;
-      if (!F || F->getName() != "cpn.pointer.field")
-        continue;
-      for (auto *Address : Call->users()) {
-        auto *GEP = llvm::dyn_cast<llvm::GetElementPtrInst>(Address);
-        if (!GEP || !GEP->hasAllConstantIndices())
-          return {};
-        auto Location = slot(GEP);
-        if (Location.Base != Call || Location.Offset < 0 ||
-            uint64_t(Location.Offset) % DL.getPointerSize() ||
-            GEP->getNumUses() > 128)
-          return {};
-        for (auto *User : GEP->users()) {
-          if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(User);
-              Load && Load->isSimple())
-            continue;
-          auto *Store = llvm::dyn_cast<llvm::StoreInst>(User);
-          if (!Store || !Store->isSimple() ||
-              Store->getPointerOperand() != GEP ||
-              (!Store->getValueOperand()->getType()->isPointerTy() &&
-               !Store->getValueOperand()->getType()->isIntegerTy(64)))
-            return {};
-          if (Location.Offset != Locator.Offset &&
-              Location.Offset != Stamp.Offset)
-            continue;
-          unsigned I = Location.Offset == Locator.Offset ? 0 : 1;
-          Stores[I].try_emplace(Store, Store->getValueOperand());
-        }
-      }
-    }
+    if (Locator.Base != Stamp.Base ||
+        !collectSidecarStores(Locator.Base, {Locator.Offset, Stamp.Offset},
+                              Stores))
+      return {};
     auto *Source = reachingSidecarValue(*SlotLoad, Stores[0], Dominance);
     if (Source)
       if (auto *Stamp = reachingSidecarValue(*StampLoad, Stores[1], Dominance))
@@ -1210,7 +1217,7 @@ class EscapeCheck {
   using MemberPathRef = llvm::ArrayRef<MemberPath::value_type>;
   using StorageRegistration =
       std::tuple<llvm::Value *, llvm::Value *, MemberPath>;
-  using RetirementsByStorage =
+  using OperationsByStorage =
       std::map<StorageRegistration,
                llvm::SmallVector<const llvm::CallBase *, 2>>;
   std::optional<StorageRegistration> storageRegistration(llvm::Value *V) const {
@@ -1241,7 +1248,7 @@ class EscapeCheck {
   }
 
   static llvm::SmallVector<const llvm::CallBase *, 4>
-  endingOperations(StorageRegistration Key, const RetirementsByStorage &Ended,
+  endingOperations(StorageRegistration Key, const OperationsByStorage &Ended,
                    bool IncludeSelectedExtent) {
     llvm::SmallVector<const llvm::CallBase *, 4> Operations;
     auto *Parent = std::get<0>(Key);
@@ -1386,13 +1393,18 @@ class EscapeCheck {
     return Key;
   }
 
-  static std::optional<uint64_t> registrationSize(llvm::Value *Slot) {
+  static std::optional<uint64_t> registrationBound(llvm::Value *Slot,
+                                                   unsigned Field) {
     if (auto *Child = llvm::dyn_cast<llvm::CallBase>(Slot)) {
-      if (auto *Size =
-              llvm::dyn_cast<llvm::ConstantInt>(Child->getArgOperand(4)))
-        return Size->getZExtValue();
+      auto *F = Child->getCalledFunction();
+      if (F && F->getName() == "cpn.slot.child")
+        if (auto *Bound =
+                llvm::dyn_cast<llvm::ConstantInt>(Child->getArgOperand(Field)))
+          return Bound->getZExtValue();
       return std::nullopt;
     }
+    if (!llvm::isa<llvm::AllocaInst, llvm::GlobalVariable>(Slot))
+      return std::nullopt;
     std::optional<uint64_t> Size;
     for (auto *Use : Slot->users()) {
       auto *Begin = llvm::dyn_cast<llvm::CallBase>(Use);
@@ -1400,10 +1412,11 @@ class EscapeCheck {
       if (!F || F->getName() != "cpn.slot.begin" ||
           Begin->getArgOperand(0) != Slot)
         continue;
-      auto *Bytes = llvm::dyn_cast<llvm::ConstantInt>(Begin->getArgOperand(4));
-      if (!Bytes || (Size && *Size != Bytes->getZExtValue()))
+      auto *Bound =
+          llvm::dyn_cast<llvm::ConstantInt>(Begin->getArgOperand(Field));
+      if (!Bound || (Size && *Size != Bound->getZExtValue()))
         return std::nullopt;
-      Size = Bytes->getZExtValue();
+      Size = Bound->getZExtValue();
     }
     return Size;
   }
@@ -1441,7 +1454,7 @@ class EscapeCheck {
       if (!Known || (Array && *Array != *Known))
         break;
       if (!Size)
-        Size = registrationSize(P.Array);
+        Size = registrationBound(P.Array, 4);
       if (!Size)
         break;
       Array = std::move(Known);
@@ -1450,6 +1463,53 @@ class EscapeCheck {
       Generation = P.Generation;
     }
     return std::nullopt;
+  }
+
+  bool incompatibleExtent(llvm::Value *Slot, uint64_t Bytes, uint64_t Alignment,
+                          std::optional<llvm::DominatorTree> &Tree,
+                          unsigned &Budget) const {
+    if (!Budget)
+      return false;
+    --Budget;
+    auto Capacity = registrationBound(Slot, 4);
+    auto GuaranteedAlignment = registrationBound(Slot, 5);
+    if ((Capacity && *Capacity < Bytes) ||
+        (GuaranteedAlignment && *GuaranteedAlignment < Alignment))
+      return true;
+    auto Rejects = [&](llvm::Value *Choice) {
+      return incompatibleExtent(Choice, Bytes, Alignment, Tree, Budget);
+    };
+    if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(Slot);
+        Load && Load->isSimple()) {
+      const auto Locator = slot(Load->getPointerOperand());
+      SidecarStores Stores;
+      if (!collectSidecarStores(Locator.Base, {Locator.Offset}, {&Stores, 1}))
+        return false;
+      if (!Tree)
+        Tree.emplace(Root);
+      return visitReachingValues(*Load, Stores, *Tree, Rejects);
+    }
+    if (auto *Select = llvm::dyn_cast<llvm::SelectInst>(Slot)) {
+      if (auto *Condition =
+              llvm::dyn_cast<llvm::ConstantInt>(Select->getCondition()))
+        return Rejects(Select->getOperand(Condition->isZero() ? 2 : 1));
+      return Rejects(Select->getTrueValue()) &&
+             Rejects(Select->getFalseValue());
+    }
+    auto *Position = llvm::dyn_cast<llvm::PHINode>(Slot);
+    if (!Position)
+      return false;
+    bool Reached = false;
+    for (unsigned I = 0; I != Position->getNumIncomingValues(); ++I) {
+      auto *Block = Position->getIncomingBlock(I);
+      auto *Next = successor(Block);
+      if (!Reachable.contains(Block) || (Next && Next != Position->getParent()))
+        continue;
+      Reached = true;
+      if (!Rejects(Position->getIncomingValue(I)))
+        return false;
+    }
+    return Reached;
   }
 
   // A successful parent check fixes the epoch in which the compiler selected
@@ -1539,6 +1599,7 @@ class EscapeCheck {
     // invoking a source-level cleanup operation.
     auto Name = F->getName();
     if (Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
+        Name == "cpn.slot.reserve" || Name == "cpn.slot.unreserve" ||
         Name == "cpn.slot.child" || Name == "cpn.slot.find" ||
         Name == "cpn.slot.linked" || Name == "cpn.generation" ||
         Name == "cpn.borrow.valid" || Name == "cpn.extent.valid" ||
@@ -1589,8 +1650,10 @@ class EscapeCheck {
                llvm::cast<llvm::CallBase>(Slot)->getArgOperand(3));
   }
 
-  bool initializedWithoutRetirement(llvm::CallBase &Use,
-                                    const StorageRegistration &Target) const {
+  bool
+  initializedWithoutRetirement(llvm::CallBase &Use,
+                               const StorageRegistration &Target,
+                               const OperationsByStorage &Replacements) const {
     const auto &[Registration, Object, Path] = Target;
     struct Position {
       llvm::BasicBlock *Block;
@@ -1601,6 +1664,7 @@ class EscapeCheck {
     llvm::SmallPtrSet<llvm::Function *, 8> Visiting, Verified;
     unsigned Budget = 2048;
     bool Initialized = false;
+    auto Replacing = Replacements.find(Target);
     while (!Work.empty()) {
       auto [BB, Cursor] = Work.pop_back_val();
       bool AtBirth = false;
@@ -1611,9 +1675,11 @@ class EscapeCheck {
         if (!Call)
           continue;
         auto *F = Call->getCalledFunction();
-        if (F && F->getName() == "cpn.slot.begin" &&
-            Call->getArgOperand(0) == Registration &&
-            Call->getArgOperand(1) == Object) {
+        if ((F && F->getName() == "cpn.slot.begin" &&
+             Call->getArgOperand(0) == Registration &&
+             (!Object || Call->getArgOperand(1) == Object)) ||
+            (Replacing != Replacements.end() &&
+             llvm::is_contained(Replacing->second, Call))) {
           Initialized = AtBirth = true;
           break;
         }
@@ -1762,7 +1828,8 @@ class EscapeCheck {
     llvm::SmallVector<llvm::CallBase *> Uses;
     llvm::SmallVector<llvm::CallBase *> Calls;
     std::map<StorageRegistration, std::set<StorageRegistration>> Subobjects;
-    RetirementsByStorage Retirements;
+    OperationsByStorage Retirements;
+    OperationsByStorage Replacements;
     ArgumentRetirementCache ArgumentRetirements;
     std::optional<llvm::DominatorTree> Dominance;
     for (auto &BB : Root)
@@ -1793,6 +1860,11 @@ class EscapeCheck {
           }
           if (Call->getOperandBundle(StorageArgumentBundle))
             Calls.push_back(Call);
+          if (auto Effect = Call->getOperandBundle(StorageReplacementBundle))
+            if (auto Key =
+                    resolvedRegistration(Effect->Inputs[1].get(),
+                                         Effect->Inputs[3].get(), Dominance))
+              Replacements[*Key].push_back(Call);
         }
     if (Uses.empty())
       return;
@@ -1871,6 +1943,20 @@ class EscapeCheck {
     for (auto *Use : Uses) {
       auto *Slot = Use->getArgOperand(0);
       auto *Generation = Use->getArgOperand(1);
+      const auto *Construct = Use->getMetadata(ConstructStorageUse);
+      if (Construct) {
+        auto Required = [&](unsigned Field) {
+          return llvm::mdconst::extract<llvm::ConstantInt>(
+                     Construct->getOperand(Field))
+              ->getZExtValue();
+        };
+        unsigned Budget = 64;
+        if (incompatibleExtent(Slot, Required(2), Required(3), Dominance,
+                               Budget))
+          fail(Token{At.Text, callSetting(*Construct, 0),
+                     callSetting(*Construct, 1)},
+               "insufficient storage capacity");
+      }
       const bool Saved = llvm::isa<llvm::LoadInst>(Slot);
       if (Saved)
         resolveSavedGeneration(Slot, Generation, Root, Dominance);
@@ -1879,12 +1965,10 @@ class EscapeCheck {
         continue;
       auto &[Parent, Object, Path] = *Key;
       auto *Read = generationRead(Generation, Slot);
-      const auto *Construct = Use->getMetadata(ConstructStorageUse);
       if (const auto *Extent =
               Construct ? Construct : Use->getMetadata(ExtentStorageUse)) {
+        Token Source{At.Text, callSetting(*Extent, 0), callSetting(*Extent, 1)};
         if (!Path.empty()) {
-          Token Source{At.Text, callSetting(*Extent, 0),
-                       callSetting(*Extent, 1)};
           if (Read && readsBirth(*Read) && Dominance->dominates(Read, Use)) {
             auto Ancestors = endingOperations(*Key, Retirements, false);
             if (!Ancestors.empty() &&
@@ -1892,10 +1976,10 @@ class EscapeCheck {
               fail(Source,
                    "storage view designates an ended containing generation");
           }
-          if (Construct && llvm::isa<llvm::AllocaInst>(Parent) &&
-              initializedWithoutRetirement(*Use, *Key))
-            fail(Source, "storage contains a live generation");
         }
+        if (Construct && llvm::isa<llvm::AllocaInst>(Parent) &&
+            initializedWithoutRetirement(*Use, *Key, Replacements))
+          fail(Source, "storage contains a live generation");
         continue;
       }
       if (Retirements.empty())
@@ -2229,6 +2313,8 @@ void Context::checkBorrowEscapes() {
           auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
           if (!Bundle)
             Bundle = Call->getOperandBundle(StorageRetirementBundle);
+          if (!Bundle)
+            Bundle = Call->getOperandBundle(StorageReplacementBundle);
           if (!Bundle)
             Bundle = Call->getOperandBundle(StorageProjectionBundle);
           if (Bundle) {
