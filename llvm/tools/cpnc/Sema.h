@@ -10,6 +10,8 @@ namespace cpn {
 inline constexpr char StorageViewType[] = "$cpn.storage";
 inline constexpr char StorageIdentityType[] = "$cpn.storage_identity";
 inline constexpr char StorageArgumentBundle[] = "cpn.storage.arguments";
+inline constexpr char StorageRetirementBundle[] = "cpn.storage.retire";
+inline constexpr char IncomingPointerStorage[] = "cpn.storage.incoming.pointer";
 inline constexpr char RetiredReference[] = "cpn.storage.reference.retire";
 inline bool memoryIdentity(llvm::StringRef T) {
   return T == StorageIdentityType;
@@ -598,6 +600,9 @@ public:
   void receivePointerCall();
   llvm::Value *incomingPointerCell(size_t);
   void publishPointerResult(const Value &);
+  llvm::SmallVector<llvm::OperandBundleDef, 1>
+  storageArgumentBundles(llvm::ArrayRef<std::string>, llvm::ArrayRef<Value>,
+                         unsigned ABIHeaders);
   PointerCall openPointerCall(llvm::Value *, const std::string &,
                               llvm::ArrayRef<std::string>,
                               llvm::ArrayRef<Value>);

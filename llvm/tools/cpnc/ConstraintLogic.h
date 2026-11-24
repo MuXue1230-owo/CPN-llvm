@@ -24,9 +24,13 @@ public:
   void chargeVisit(unsigned Depth) const { Charge(Depth); }
 
   Formula variable(const std::string &Key) {
-    auto I = Atoms.try_emplace(Key, Atoms.size()).first;
+    auto [I, Inserted] = Atoms.try_emplace(Key, NextAtom);
+    if (Inserted)
+      ++NextAtom;
     return node(I->second, 0, 1);
   }
+
+  Formula freshVariable() { return node(NextAtom++, 0, 1); }
 
   std::optional<Formula> findVariable(const std::string &Key) const {
     auto I = Atoms.find(Key);
@@ -78,6 +82,7 @@ public:
 private:
   using Decision = std::tuple<unsigned, Formula, Formula>;
   std::function<void(unsigned)> Charge;
+  unsigned NextAtom = 0;
   std::map<std::string, unsigned> Atoms;
   std::vector<Decision> Nodes{{}, {}};
   std::map<Decision, Formula> Unique;

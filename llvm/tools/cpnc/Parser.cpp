@@ -676,7 +676,8 @@ class Parser {
       return std::nullopt;
     StringRef Op(N.Text);
     if (N.K == Node::Unary) {
-      if (integer(L->Type) && (Op == "+" || Op == "-"))
+      if (integer(L->Type) &&
+          (Op == "+" || Op == "-" || (Op == "~" && L->Type != "integer")))
         return ValueTerm{
             "unary" + N.Text + Policy + "(" + L->Identity + ")", L->Type, {}};
       return std::nullopt;
@@ -689,6 +690,12 @@ class Parser {
     if (Op == "==" || Op == "!=" || Op == "<" || Op == ">" || Op == "<=" ||
         Op == ">=")
       return ValueTerm{Key, "bool", {}};
+    if ((Op == "<<" || Op == ">>") &&
+        (L->Type != "integer" || R->Type == "integer"))
+      return ValueTerm{Key, std::move(L->Type), {}};
+    if ((Op == "&" || Op == "|" || Op == "^") &&
+        (L->Type == R->Type || L->Type == "integer" || R->Type == "integer"))
+      return ValueTerm{Key, L->Type == "integer" ? R->Type : L->Type, {}};
     if (Op == "+" || Op == "-" || Op == "*" || Op == "/" || Op == "%") {
       auto Type = integerCommonType(L->Type, R->Type);
       if (!Type.empty())
@@ -757,10 +764,15 @@ class Parser {
   std::optional<Formula>
   constraintFormula(const Node &N, const RequirementSite &At,
                     const Receivers &Bindings, ConstraintLogic &Logic,
-                    unsigned Depth, const ValueTerms &Values = {}) const {
+                    unsigned Depth, const ValueTerms &Values = {},
+                    bool AllowOpaque = false) const {
     Logic.chargeVisit(Depth);
+    auto Unknown = [&]() -> std::optional<Formula> {
+      return AllowOpaque ? std::optional(Logic.freshVariable()) : std::nullopt;
+    };
     auto Build = [&](const Node &Child) {
-      return constraintFormula(Child, At, Bindings, Logic, Depth + 1, Values);
+      return constraintFormula(Child, At, Bindings, Logic, Depth + 1, Values,
+                               AllowOpaque);
     };
     if (N.K == Node::Unary && N.Text == "!") {
       if (auto Value = Build(N.Children.front()))
@@ -773,7 +785,8 @@ class Parser {
         return N.Text == "&&" ? Logic.conjunction(*L, *R)
                               : Logic.disjunction(*L, *R);
     } else if (N.K == Node::Call) {
-      return computedAtom(N, At, Values, Logic, Depth);
+      if (auto Value = computedAtom(N, At, Values, Logic, Depth))
+        return Value;
     } else if (N.K == Node::Binary) {
       if (auto Term = symbolicTerm(N, At, Values, Logic, Depth + 1);
           Term && Term->Type == "bool")
@@ -792,7 +805,7 @@ class Parser {
         for (const auto &A : N.TemplateArgs) {
           auto Type = typeIdentity(requirementType(A, Bindings));
           if (Type.empty() || A.Pack)
-            return std::nullopt;
+            return Unknown();
           Symbolic |= StringRef(Type).contains("$constraint.");
           Key += "(" + Type + ")";
         }
@@ -803,7 +816,7 @@ class Parser {
           return unsigned(*Value);
       } else if (const auto *Named = namedRequirement(At, N.Text)) {
         if (Named->Parameters.size() != N.TemplateArgs.size())
-          return std::nullopt;
+          return Unknown();
         Receivers Nested;
         ValueTerms NestedValues;
         std::string Application =
@@ -812,7 +825,7 @@ class Parser {
         bool KnownArguments = true;
         for (auto [I, P] : llvm::enumerate(Named->Parameters)) {
           if (P.Pack || N.TemplateArgs[I].Pack)
-            return std::nullopt;
+            return Unknown();
           if (P.K == Node::TypeParam) {
             auto T = requirementType(N.TemplateArgs[I], Bindings);
             auto Key = typeIdentity(T);
@@ -834,9 +847,11 @@ class Parser {
           if (Clause.K == Node::Empty) {
             if (KnownArguments)
               F = Logic.variable(Application + "/" + std::to_string(Index));
+            else
+              F = Unknown();
           } else {
             F = constraintFormula(Clause, *Named, Nested, Logic, Depth + 1,
-                                  NestedValues);
+                                  NestedValues, AllowOpaque);
           }
           if (!F)
             return std::nullopt;
@@ -847,7 +862,7 @@ class Parser {
         return Result;
       }
     }
-    return std::nullopt;
+    return Unknown();
   }
   std::string valueParameterType(const Node &P) const {
     auto Found = ParameterTypes.find(sourceSite(P.At));
@@ -884,7 +899,7 @@ class Parser {
           VisibleValues.erase(Hidden);
         for (const auto &Clause : D->Site.Conditions)
           if (auto Known = constraintFormula(Clause, D->Site, Evidence.Types,
-                                             Logic, 0, VisibleValues))
+                                             Logic, 0, VisibleValues, true))
             Evidence.Assumed = Logic.conjunction(Evidence.Assumed, *Known);
       }
     }
@@ -1031,7 +1046,7 @@ class Parser {
       }
       auto Needed =
           constraintFormula(Target.Conditions.front(), Target, CandidateTypes,
-                            Logic, 0, CandidateValues);
+                            Logic, 0, CandidateValues, true);
       if (Needed && Logic.conjunction(Assumed, *Needed) == 0)
         return false;
       if (Needed && Logic.conjunction(Assumed, Logic.negate(*Needed)) == 0)

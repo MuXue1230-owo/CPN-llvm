@@ -2043,6 +2043,21 @@ class CompilerTests(unittest.TestCase):
                 generic<const i32 N> requires(!odd(N+2)) bool known_argument(){
                     return choose<N+2>().get < 6 > (0);
                 }
+                consteval bool positive(i64 value){return value > 0;}
+                constraint Filter<const i32 N>{
+                    requires(((~N >> 1)&1)==0);
+                    requires(positive(N));
+                };
+                generic<const i32 N> requires(((~N >> 1)&1)==0) Relation bits(){
+                    return Relation();
+                }
+                generic<const i32 N>
+                requires(!(((~N >> 1)&1)==0) && positive(N)) Generic bits(){
+                    return Generic();
+                }
+                generic<const i32 N> requires(Filter<N>) bool known_bits(){
+                    return bits<N>().get < 9 > (0);
+                }
                 struct Witness {i32 item;};
                 constraint HasItem<type T>{expression(T& x){x.item -> i32&;}};
                 generic<type T> requires(HasItem<T>) Relation by_field(T& x){return Relation();}
@@ -2061,6 +2076,7 @@ class CompilerTests(unittest.TestCase):
                     Relation object; Witness witness;
                     if(!known_type(object,&object) || !known_type_chain(object,object)){return 2;}
                     if(!known_parity<2>() || !known_argument<4>()){return 3;}
+                    if(!known_bits<2>() || !known_bits<6>()){return 5;}
                     if(!known_requirement(witness)){return 4;}
                     if(!declared<2>() || !declared<8>()){return 1;}
                     return guarded<4>()+guarded<5>();
@@ -2082,6 +2098,17 @@ class CompilerTests(unittest.TestCase):
             "--check",
         )
         self.assertEqual(different.returncode, 1, different.stderr)
+        disjunction = self.compile(
+            declarations
+            + """
+            consteval bool positive(i64 value){return value>0;}
+            generic<const i32 A> requires(!odd(A) || positive(A))
+            bool use(){return choose<A>().get < 1 > (0);}
+            i32 main(){return use<3>() ? 42 : 0;}
+            """,
+            "--check",
+        )
+        self.assertEqual(disjunction.returncode, 1, disjunction.stderr)
         different_policy = self.compile(
             declarations
             + """
@@ -7551,6 +7578,74 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(
             self.program(conditional_helper.replace("read(false)", "read(true)")),
             -signal.SIGILL,
+        )
+        pointer_helper = (
+            helper.replace("i32& value", "i32* value")
+            .replace("destroy(value)", "destroy(*value)")
+            .replace("abandon(value)", "abandon(*value)")
+            .replace("forward_finish(values[0]", "forward_finish(&values[0]")
+        )
+        stale = self.compile(pointer_helper.replace("EXPR", "values[0]"), "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        self.assertEqual(self.program(pointer_helper.replace("EXPR", "values[1]")), 42)
+        indirect = pointer_helper.replace(
+            "forward_finish(&values[0],flag);",
+            "function<void(i32*,bool)>* selected(&forward_finish);"
+            "selected(&values[0],flag);",
+        )
+        stale = self.compile(indirect.replace("EXPR", "values[0]"), "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        self.assertEqual(self.program(indirect.replace("EXPR", "values[1]")), 42)
+        dispatch = """
+            void finish(i32* value){destroy(*value);}
+            void observe(i32* value){}
+            i32 read(bool pick){
+                i32[2] values(42,1);
+                function<void(i32*)>* selected(&observe);
+                if(pick){selected=&finish;}
+                selected(&values[0]);
+                return values[0];
+            }
+            i32 main(){return read(INPUT);}
+        """
+        self.assertEqual(self.program(dispatch.replace("INPUT", "false")), 42)
+        self.assertEqual(
+            self.program(dispatch.replace("INPUT", "true")), -signal.SIGILL
+        )
+        rebound = """
+            void finish(i32* value,i32* other){
+                value=other;
+                destroy(*value);
+            }
+            i32 main(){
+                i32[2] values(42,1);
+                auto pointer(&values[0]);
+                pointer=&values[1];
+                finish(&values[0],pointer);
+                return values[INDEX];
+            }
+        """
+        self.assertEqual(self.program(rebound.replace("INDEX", "0")), 42)
+        stale = self.compile(rebound.replace("INDEX", "1"), "--check")
+        self.assertEqual(stale.returncode, 1, stale.stderr)
+        self.assertIn("ended object generation", stale.stderr)
+        ambiguous = """
+            void finish(i32* value,i32* other,bool pick){
+                if(pick){value=other;}
+                destroy(*value);
+            }
+            i32 run(bool pick){
+                i32[2] values(1,42);
+                finish(&values[0],&values[1],pick);
+                return values[1];
+            }
+            i32 main(){return run(INPUT);}
+        """
+        self.assertEqual(self.program(ambiguous.replace("INPUT", "false")), 42)
+        self.assertEqual(
+            self.program(ambiguous.replace("INPUT", "true")), -signal.SIGILL
         )
 
     def test_storage_view_after_ending_complete_object(self):

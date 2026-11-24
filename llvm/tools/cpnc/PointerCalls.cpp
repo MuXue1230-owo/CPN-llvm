@@ -60,6 +60,31 @@ static llvm::Value *row(llvm::IRBuilder<> &B, llvm::Value *Rows, size_t I) {
   return B.CreateGEP(B.getPtrTy(), Rows, B.getInt32(I));
 }
 
+llvm::SmallVector<llvm::OperandBundleDef, 1>
+Frame::storageArgumentBundles(llvm::ArrayRef<std::string> Params,
+                              llvm::ArrayRef<Value> Arguments,
+                              unsigned ABIHeaders) {
+  llvm::SmallVector<llvm::Value *, 6> StorageArguments;
+  if (TracksStorage)
+    for (auto [I, Type] : llvm::enumerate(Params)) {
+      const bool Reference = StringRef(Type).ends_with("&");
+      if (!Reference && !StringRef(Type).ends_with("*"))
+        continue;
+      auto Designation =
+          Reference ? Arguments[I].objectDesignation() : Arguments[I];
+      if (!Designation.Slot)
+        continue;
+      StorageArguments.push_back(B.getInt32(ABIHeaders + I));
+      StorageArguments.push_back(Designation.Slot);
+      StorageArguments.push_back(Designation.Generation ? Designation.Generation
+                                                        : B.getInt64(0));
+    }
+  llvm::SmallVector<llvm::OperandBundleDef, 1> Bundles;
+  if (!StorageArguments.empty())
+    Bundles.emplace_back(StorageArgumentBundle, StorageArguments);
+  return Bundles;
+}
+
 PointerCall Frame::openPointerCall(llvm::Value *Target,
                                    const std::string &Result,
                                    llvm::ArrayRef<std::string> Params,

@@ -114,10 +114,13 @@ void registeredRetirement(Frame &F, const Value &V, llvm::Value *Slot,
   auto *Entry = MayRunCleanup ? destructor(F, CompleteType)
                               : llvm::ConstantPointerNull::get(F.B.getPtrTy());
   llvm::Value *Operands[] = {
-      V.Address, Entry, F.B.getInt1(Explicit),
+      V.Address,
+      Entry,
+      F.B.getInt1(Explicit),
       F.B.getInt1(MayRunCleanup && !Explicit),
-      F.B.getInt1(MayRunCleanup && V.BaseView && V.ExtentType.empty())};
-  llvm::OperandBundleDef Effects("cpn.storage.retire", Operands);
+      F.B.getInt1(MayRunCleanup && V.BaseView && V.ExtentType.empty()),
+      V.Generation ? V.Generation : F.B.getInt64(0)};
+  llvm::OperandBundleDef Effects(StorageRetirementBundle, Operands);
   F.B.CreateCall(F.U.M.getFunction("cpn.slot.retire"),
                  {Slot, F.B.getInt1(Destroy)}, {Effects});
 }

@@ -32,7 +32,7 @@ constexpr StringRef CallEffects = "cpn.call.effects";
 constexpr StringRef OperationEffects = "cpn.effect";
 constexpr StringRef BoundaryEffects = "cpn.boundary.effects";
 constexpr StringRef BoundaryScope = "cpn.boundary";
-constexpr StringRef StorageRetire = "cpn.storage.retire";
+constexpr StringRef StorageRetire = StorageRetirementBundle;
 constexpr StringRef StorageReplace = "cpn.storage.replace";
 constexpr StringRef StorageWrite = "cpn.storage.write";
 constexpr StringRef StorageView = "cpn.storage.view";
@@ -923,28 +923,30 @@ void Context::checkEffects() {
           continue;
         }
         auto Descriptor = Call->getOperandBundle(StorageRetire);
-        if (!Descriptor)
-          Descriptor = Call->getOperandBundle(StorageReplace);
-        if (!Descriptor)
-          Descriptor = Call->getOperandBundle(StorageView);
         if (Descriptor) {
-          auto *Native = llvm::CallBase::removeOperandBundle(
-              Call, Descriptor->getTagID(), Call->getIterator());
-          if (Descriptor->getTagName() == StorageRetire &&
-              llvm::cast<llvm::ConstantInt>(Descriptor->Inputs[2].get())
+          if (llvm::cast<llvm::ConstantInt>(Descriptor->Inputs[2].get())
                   ->isOne()) {
             if (llvm::isa<llvm::GlobalVariable>(Call->getArgOperand(0)))
-              Native->setMetadata("cpn.storage.original.retire",
-                                  llvm::MDNode::get(M.getContext(), {}));
+              Call->setMetadata("cpn.storage.original.retire",
+                                llvm::MDNode::get(M.getContext(), {}));
             if (auto *Reference = llvm::dyn_cast<llvm::Argument>(
                     Descriptor->Inputs.front().get()))
-              Native->setMetadata(
+              Call->setMetadata(
                   RetiredReference,
                   llvm::MDNode::get(
                       C,
                       llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
                           llvm::Type::getInt32Ty(C), Reference->getArgNo()))));
           }
+          // Borrow checking still needs the destination's captured generation.
+          continue;
+        }
+        Descriptor = Call->getOperandBundle(StorageReplace);
+        if (!Descriptor)
+          Descriptor = Call->getOperandBundle(StorageView);
+        if (Descriptor) {
+          auto *Native = llvm::CallBase::removeOperandBundle(
+              Call, Descriptor->getTagID(), Call->getIterator());
           Native->takeName(Call);
           Call->replaceAllUsesWith(Native);
           Call->eraseFromParent();

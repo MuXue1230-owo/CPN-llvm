@@ -926,13 +926,51 @@ class EscapeCheck {
                               Exact);
   }
 
+  using SidecarStores = llvm::DenseMap<llvm::Instruction *, llvm::Value *>;
+
+  llvm::Value *
+  reachingSidecarValue(llvm::LoadInst &Load, const SidecarStores &Stores,
+                       const llvm::DominatorTree &Dominance) const {
+    using Location = std::pair<llvm::BasicBlock *, llvm::BasicBlock::iterator>;
+    llvm::SmallVector<Location, 4> Work{{Load.getParent(), Load.getIterator()}};
+    llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    llvm::Value *Value = nullptr;
+    unsigned Budget = 2048;
+    while (!Work.empty()) {
+      auto [BB, Cursor] = Work.pop_back_val();
+      bool Found = false;
+      while (Cursor != BB->begin()) {
+        if (!Budget--)
+          return nullptr;
+        auto It = Stores.find(&*--Cursor);
+        if (It == Stores.end())
+          continue;
+        if (Value && Value != It->second)
+          return nullptr;
+        Value = It->second;
+        Found = true;
+        break;
+      }
+      if (Found)
+        continue;
+      if (BB == &Load.getFunction()->getEntryBlock())
+        return nullptr;
+      for (auto *Pred : llvm::predecessors(BB))
+        if (auto *Next = successor(Pred);
+            Dominance.isReachableFromEntry(Pred) && (!Next || Next == BB) &&
+            Visited.insert(Pred).second)
+          Work.emplace_back(Pred, Pred->end());
+    }
+    return Value;
+  }
+
   // A local pointer's sidecar has a known registration and cannot be written
   // via an alias when every use of its address is visible here.
   std::pair<llvm::Value *, llvm::Value *>
-  savedGeneration(const llvm::CallBase &Use,
+  savedGeneration(llvm::Value *Registration, llvm::Value *Generation,
                   const llvm::DominatorTree &Dominance) const {
-    auto *SlotLoad = llvm::dyn_cast<llvm::LoadInst>(Use.getArgOperand(0));
-    auto *StampLoad = llvm::dyn_cast<llvm::LoadInst>(Use.getArgOperand(1));
+    auto *SlotLoad = llvm::dyn_cast<llvm::LoadInst>(Registration);
+    auto *StampLoad = llvm::dyn_cast<llvm::LoadInst>(Generation);
     if (!SlotLoad || !StampLoad || !SlotLoad->isSimple() ||
         !StampLoad->isSimple())
       return {};
@@ -947,8 +985,7 @@ class EscapeCheck {
     if (!Object || !Object->getAllocatedType()->isPointerTy() ||
         !Object->getMetadata("cpn.object") || Object->getNumUses() > 128)
       return {};
-    llvm::Value *Values[] = {nullptr, nullptr};
-    bool Written[] = {false, false};
+    SidecarStores Stores[2];
     for (auto *Access : Object->users()) {
       if (auto *Load = llvm::dyn_cast<llvm::LoadInst>(Access);
           Load && Load->isSimple())
@@ -959,6 +996,10 @@ class EscapeCheck {
         continue;
       auto *Call = llvm::dyn_cast<llvm::CallBase>(Access);
       auto *F = Call ? Call->getCalledFunction() : nullptr;
+      if (F && F->getName() == "cpn.slot.retire" &&
+          Call->getOperandBundle(StorageRetirementBundle) &&
+          Call->getArgOperand(0) != Object)
+        continue;
       if (F && F->getName() == "cpn.slot.begin" &&
           Call->getArgOperand(1) == Object) {
         // A storage view can expose the pointer cell indirectly through the
@@ -1005,18 +1046,42 @@ class EscapeCheck {
               Location.Offset != Stamp.Offset)
             continue;
           unsigned I = Location.Offset == Locator.Offset ? 0 : 1;
-          auto *Value = Store->getValueOperand();
-          if (Values[I] && Values[I] != Value)
-            return {};
-          Values[I] = Value;
-          Written[I] |=
-              Dominance.dominates(Store, I == 0 ? SlotLoad : StampLoad);
+          Stores[I].try_emplace(Store, Store->getValueOperand());
         }
       }
     }
-    if (Written[0] && Written[1])
-      return {Values[0], Values[1]};
+    auto *Source = reachingSidecarValue(*SlotLoad, Stores[0], Dominance);
+    if (Source)
+      if (auto *Stamp = reachingSidecarValue(*StampLoad, Stores[1], Dominance))
+        return {Source, Stamp};
     return {};
+  }
+
+  void resolveSavedGeneration(llvm::Value *&Slot, llvm::Value *&Generation,
+                              llvm::Function &F,
+                              std::optional<llvm::DominatorTree> &Tree) const {
+    for (unsigned Depth = 0; Depth != 16; ++Depth) {
+      auto *Saved = llvm::dyn_cast<llvm::LoadInst>(Slot);
+      if (!Saved || Saved->getMetadata(IncomingPointerStorage))
+        break;
+      if (!Tree)
+        Tree.emplace(F);
+      auto [Source, Stamp] = savedGeneration(Slot, Generation, *Tree);
+      if (!Source || Source == Slot)
+        break;
+      Slot = Source;
+      Generation = Stamp;
+    }
+  }
+
+  bool isArgumentRegistration(llvm::Value *Slot, llvm::Value *Generation,
+                              llvm::Function &F, unsigned Argument,
+                              std::optional<llvm::DominatorTree> &Tree) const {
+    resolveSavedGeneration(Slot, Generation, F, Tree);
+    auto *Load = llvm::dyn_cast<llvm::LoadInst>(Slot);
+    const auto *Source =
+        Load ? Load->getMetadata(IncomingPointerStorage) : nullptr;
+    return Source && callSetting(*Source, 0) == Argument;
   }
 
   bool mayReachBeforeRetirement(
@@ -1279,18 +1344,19 @@ class EscapeCheck {
     return Initialized;
   }
 
-  using ReferenceRetirementCache =
+  using ArgumentRetirementCache =
       std::map<std::pair<llvm::Function *, unsigned>, bool>;
 
-  bool retiresReferenceOnReturn(llvm::Function &F, unsigned Argument,
-                                ReferenceRetirementCache &Cache,
-                                unsigned &Budget) const {
+  bool retiresArgumentOnReturn(llvm::Function &F, unsigned Argument,
+                               ArgumentRetirementCache &Cache,
+                               unsigned &Budget) const {
     // A recursive edge supplies no independent proof of retirement.
     auto [Summary, First] = Cache.try_emplace({&F, Argument}, false);
     if (!First)
       return Summary->second;
     llvm::SmallVector<llvm::BasicBlock *> Work{&F.getEntryBlock()};
     llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    std::optional<llvm::DominatorTree> Dominance;
     bool Retired = false;
     while (!Work.empty()) {
       auto *BB = Work.pop_back_val();
@@ -1307,18 +1373,34 @@ class EscapeCheck {
           break;
         }
         auto *Forward = llvm::dyn_cast<llvm::CallBase>(&I);
-        auto *Callee = Forward ? Forward->getCalledFunction() : nullptr;
-        if (!Callee || !Definitions.contains(Callee))
+        if (!Forward)
           continue;
+        if (auto Retirement =
+                Forward->getOperandBundle(StorageRetirementBundle);
+            Retirement &&
+            llvm::cast<llvm::ConstantInt>(Retirement->Inputs[2].get())
+                ->isOne() &&
+            isArgumentRegistration(Forward->getArgOperand(0),
+                                   Retirement->Inputs[5].get(), F, Argument,
+                                   Dominance)) {
+          Retired = Ends = true;
+          break;
+        }
         auto Bundle = Forward->getOperandBundle(StorageArgumentBundle);
         if (!Bundle)
           continue;
-        for (size_t J = 0; J < Bundle->Inputs.size(); J += 2) {
+        auto *Callee = knownTarget(*Forward, Budget, nullptr);
+        if (!Callee || !Definitions.contains(Callee))
+          continue;
+        for (size_t J = 0; J < Bundle->Inputs.size(); J += 3) {
           unsigned Position =
               llvm::cast<llvm::ConstantInt>(Bundle->Inputs[J].get())
                   ->getZExtValue();
-          if (Forward->getArgOperand(Position) == F.getArg(Argument) &&
-              retiresReferenceOnReturn(*Callee, Position, Cache, Budget)) {
+          if ((Forward->getArgOperand(Position) == F.getArg(Argument) ||
+               isArgumentRegistration(Bundle->Inputs[J + 1].get(),
+                                      Bundle->Inputs[J + 2].get(), F, Argument,
+                                      Dominance)) &&
+              retiresArgumentOnReturn(*Callee, Position, Cache, Budget)) {
             Retired = Ends = true;
             break;
           }
@@ -1340,7 +1422,8 @@ class EscapeCheck {
   void verifyCheckedStorage(const Token &At) const {
     llvm::SmallVector<llvm::CallBase *> Uses;
     RetirementsByStorage Retirements;
-    ReferenceRetirementCache ReferenceRetirements;
+    ArgumentRetirementCache ArgumentRetirements;
+    std::optional<llvm::DominatorTree> Dominance;
     for (auto &BB : Root)
       if (Reachable.contains(&BB))
         for (auto &I : BB) {
@@ -1356,31 +1439,38 @@ class EscapeCheck {
             if (auto Key = storageRegistration(Call->getArgOperand(0)))
               Retirements[*Key].push_back(Call);
           auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
-          auto *F = Call->getCalledFunction();
-          if (!Bundle || !F || !Definitions.contains(F))
+          if (!Bundle)
             continue;
-          for (size_t I = 0; I < Bundle->Inputs.size(); I += 2) {
-            auto Key = storageRegistration(Bundle->Inputs[I + 1].get());
+          unsigned TargetBudget = 256;
+          auto *F = knownTarget(*Call, TargetBudget, nullptr);
+          if (!F || !Definitions.contains(F))
+            continue;
+          for (size_t I = 0; I < Bundle->Inputs.size(); I += 3) {
+            auto *Slot = Bundle->Inputs[I + 1].get();
+            auto *Generation = Bundle->Inputs[I + 2].get();
+            resolveSavedGeneration(Slot, Generation, Root, Dominance);
+            auto Key = storageRegistration(Slot);
             if (!Key || !llvm::isa<llvm::AllocaInst>(std::get<0>(*Key)))
               continue;
             unsigned Argument =
                 llvm::cast<llvm::ConstantInt>(Bundle->Inputs[I].get())
                     ->getZExtValue();
             unsigned Budget = 2048;
-            if (retiresReferenceOnReturn(*F, Argument, ReferenceRetirements,
-                                         Budget))
+            if (retiresArgumentOnReturn(*F, Argument, ArgumentRetirements,
+                                        Budget))
               Retirements[*Key].push_back(Call);
           }
         }
     if (Uses.empty())
       return;
-    llvm::DominatorTree Dominance(Root);
+    if (!Dominance)
+      Dominance.emplace(Root);
     for (auto *Use : Uses) {
       auto *Slot = Use->getArgOperand(0);
       auto *Generation = Use->getArgOperand(1);
       const bool Saved = llvm::isa<llvm::LoadInst>(Slot);
       if (Saved)
-        std::tie(Slot, Generation) = savedGeneration(*Use, Dominance);
+        resolveSavedGeneration(Slot, Generation, Root, Dominance);
       auto Key = storageRegistration(Slot);
       if (!Key)
         continue;
@@ -1393,7 +1483,7 @@ class EscapeCheck {
           Token Source{At.Text, callSetting(*Extent, 0),
                        callSetting(*Extent, 1)};
           if (Capture && readsBirth(*Capture) &&
-              Dominance.dominates(Capture, Use)) {
+              Dominance->dominates(Capture, Use)) {
             auto Ancestors = endingOperations(*Key, Retirements, false);
             if (!Ancestors.empty() &&
                 !mayReachBeforeRetirement(Capture, *Use, Ancestors))
@@ -1422,7 +1512,7 @@ class EscapeCheck {
           continue;
         Capture = *Birth;
       }
-      if (Capture && !Dominance.dominates(Capture, Use))
+      if (Capture && !Dominance->dominates(Capture, Use))
         continue;
       auto Ended = endingOperations(*Key, Retirements, true);
       if (Ended.empty())
@@ -1434,7 +1524,7 @@ class EscapeCheck {
             return F && F->getName() == "cpn.slot.begin" &&
                    Begin->getArgOperand(0) == Parent &&
                    (!Object || Begin->getArgOperand(1) == Object) &&
-                   Dominance.dominates(Begin, Capture);
+                   Dominance->dominates(Begin, Capture);
           })))
         continue;
       if (mayReachBeforeRetirement(Capture, *Use, Ended))
@@ -1723,14 +1813,19 @@ void Context::checkBorrowEscapes() {
         I.setMetadata(ConstructStorageUse, nullptr);
         I.setMetadata(ExtentStorageUse, nullptr);
         I.setMetadata(RetiredReference, nullptr);
-        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I))
-          if (auto Bundle = Call->getOperandBundle(StorageArgumentBundle)) {
+        I.setMetadata(IncomingPointerStorage, nullptr);
+        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I)) {
+          auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
+          if (!Bundle)
+            Bundle = Call->getOperandBundle(StorageRetirementBundle);
+          if (Bundle) {
             auto *Native = llvm::CallBase::removeOperandBundle(
                 Call, Bundle->getTagID(), Call->getIterator());
             Native->takeName(Call);
             Call->replaceAllUsesWith(Native);
             Call->eraseFromParent();
           }
+        }
       }
     }
   for (auto &F : llvm::make_early_inc_range(M))

@@ -207,6 +207,11 @@ void Frame::bindParams() {
       V.BoundsCell = incomingPointerCell(J + 1);
       if (!ends(T, "&")) {
         readBounds(V, V.BoundsCell);
+        if (ends(T, "*") && V.Slot)
+          llvm::cast<llvm::Instruction>(V.Slot)->setMetadata(
+              IncomingPointerStorage,
+              llvm::MDNode::get(U.C, llvm::ConstantAsMetadata::get(
+                                         B.getInt32(A->getArgNo()))));
         V.BoundsCell = storedPointerCell(V.Address);
         saveBounds(V.BoundsCell, V);
       }
@@ -1515,17 +1520,9 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
   auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
   unsigned ABIHeaders =
       (ResultStorage != nullptr) + (!D.Owner.empty() && !D.isStatic());
-  llvm::SmallVector<llvm::Value *, 4> StorageArguments;
-  if (TracksStorage && !D.Decl.Foreign && llvm::isa<llvm::Function>(Target))
-    for (auto [I, Ty] : llvm::enumerate(D.Params))
-      if (ends(Ty, "&"))
-        if (auto *Registration = Cells[I].objectDesignation().Slot) {
-          StorageArguments.push_back(B.getInt32(ABIHeaders + I));
-          StorageArguments.push_back(Registration);
-        }
   llvm::SmallVector<llvm::OperandBundleDef, 1> Bundles;
-  if (!StorageArguments.empty())
-    Bundles.emplace_back(StorageArgumentBundle, StorageArguments);
+  if (!D.Decl.Foreign)
+    Bundles = storageArgumentBundles(D.Params, Cells, ABIHeaders);
   auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values, Bundles);
   bool MayWriteCallStorage =
       ResultStorage || D.MayWhole || !D.Consumes.empty() ||

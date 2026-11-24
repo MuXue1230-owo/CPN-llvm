@@ -647,7 +647,9 @@ Value Frame::indirect(Value Ptr, const std::vector<Node> &Args,
   auto *Before = wholeEpoch();
   auto Metadata = openPointerCall(Ptr.IR, Sig.front(),
                                   llvm::ArrayRef(Sig).drop_front(), Actual);
-  auto *Call = B.CreateCall(FT, Ptr.IR, Vals);
+  auto Bundles = storageArgumentBundles(llvm::ArrayRef(Sig).drop_front(),
+                                        Actual, !!Storage);
+  auto *Call = B.CreateCall(FT, Ptr.IR, Vals, Bundles);
   Call->setAttributes(U.scalarCallABI(
       Sig.front(), llvm::ArrayRef(Sig).drop_front(), !!Storage));
   llvm::SmallVector<unsigned> ValueAggregates;
