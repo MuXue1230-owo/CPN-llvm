@@ -4585,6 +4585,41 @@ class CompilerTests(unittest.TestCase):
             ("generic<type... Ts=i32> void f(){}", "cannot have a default"),
             ("generic<type... Ts> i32 f(Ts... xs){return xs;}", "unexpanded pack"),
             ("void f(i32... xs){}", "requires a generic pack"),
+            ("generic<type... Ts> void f(i32... xs){}", "requires a generic pack"),
+            (
+                "void sink(i32 x){} generic<type T> void f(T x){sink(x...);}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type... Ts> void sink(){} "
+                "generic<type T> void f(){sink<T...>();}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type... Ts> struct Types{}; "
+                "generic<type... Ts> void sink(){} "
+                "generic<type... Ts> void f(){sink<Types<Ts...>...>();}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type... Ts> struct Types{}; "
+                "generic<type T> struct Unused{alias Bad=Types<T...>;};",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "generic<type T> void f(function<void(T...)>* fn){}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "namespace lib{i32 values;} void sink(i32 x){} "
+                "generic<const i32... values> void f(){sink(lib::values...);}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
+            (
+                "struct R{i32 values;}; void sink(i32 x){} "
+                "generic<type... Ts> void f(R r,Ts... values){sink(r.values...);}",
+                "pack expansion requires an unexpanded pack binding",
+            ),
             ("void f(forward i32 x){}", "forward requires"),
         ]:
             with self.subTest(source=source):
@@ -7500,13 +7535,16 @@ class CompilerTests(unittest.TestCase):
         for setup, extent in (
             ("", "storage_of(values[0])"),
             ("auto view(storage_of(values[0]));", "view"),
+            ("observe();", "storage_of(values[0])"),
+            ("abandon(values[1]);", "storage_of(values[0])"),
+            ("destroy(values[1]);", "storage_of(values[0])"),
         ):
             checked = self.compile(
-                "i32 main(){i32[2] values(10,42);"
+                "void observe(){} i32 main(){i32[2] values(10,42);"
                 + setup
                 + "construct_at<i32>("
                 + extent
-                + ",1);return values[1];}",
+                + ",1);return 42;}",
                 "--check",
             )
             self.assertEqual(checked.returncode, 1, checked.stderr)
@@ -7523,6 +7561,18 @@ class CompilerTests(unittest.TestCase):
         self.assertEqual(self.program(conditional.replace("INPUT", "true")), 42)
         self.assertEqual(
             self.program(conditional.replace("INPUT", "false")), -signal.SIGILL
+        )
+        self.assertEqual(
+            self.program("""
+                void retire(i32& value){destroy(value);}
+                i32 main(){
+                    i32[2] values(1,2);
+                    auto view(storage_of(values[0]));
+                    retire(values[0]);
+                    return *construct_at<i32>(view,42);
+                }
+            """),
+            42,
         )
 
     def test_static_members_and_modifier_order(self):

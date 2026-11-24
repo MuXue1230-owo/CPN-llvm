@@ -1170,15 +1170,80 @@ class EscapeCheck {
     return std::nullopt;
   }
 
+  bool
+  preservesStorageGeneration(llvm::CallBase &Call,
+                             llvm::SmallPtrSetImpl<llvm::Function *> &Visiting,
+                             llvm::SmallPtrSetImpl<llvm::Function *> &Verified,
+                             unsigned &Budget) const {
+    if (Call.onlyReadsMemory())
+      return true;
+    auto *F = Call.getCalledFunction();
+    if (!F)
+      return false;
+    // These operations update internal tables without ending a generation or
+    // invoking a source-level cleanup operation.
+    auto Name = F->getName();
+    if (Name == "cpn.slot.begin" || Name == "cpn.slot.link" ||
+        Name == "cpn.slot.child" || Name == "cpn.slot.find" ||
+        Name == "cpn.slot.linked" || Name == "cpn.generation" ||
+        Name == "cpn.borrow.valid" || Name == "cpn.extent.valid" ||
+        Name == "cpn.pointer.field" ||
+        F->getIntrinsicID() == llvm::Intrinsic::trap)
+      return true;
+    if (Verified.contains(F))
+      return true;
+    if (!Definitions.contains(F) || !Visiting.insert(F).second)
+      return false;
+    for (auto &I : llvm::instructions(F)) {
+      if (!Budget)
+        return false;
+      --Budget;
+      if (auto *Nested = llvm::dyn_cast<llvm::CallBase>(&I);
+          Nested &&
+          !preservesStorageGeneration(*Nested, Visiting, Verified, Budget))
+        return false;
+    }
+    Visiting.erase(F);
+    Verified.insert(F);
+    return true;
+  }
+
+  bool retiresOnlyOtherStorage(const llvm::CallBase &Call,
+                               const StorageRegistration &Target) const {
+    auto *F = Call.getCalledFunction();
+    if (!F || F->getName() != "cpn.slot.retire")
+      return false;
+    auto *Slot = Call.getArgOperand(0);
+    auto Ended = storageRegistration(Slot);
+    auto *Destroy = llvm::dyn_cast<llvm::ConstantInt>(Call.getArgOperand(1));
+    if (!Ended || !Destroy)
+      return false;
+    const auto &[Root, Object, Path] = Target;
+    const auto &[EndedRoot, EndedObject, EndedPath] = *Ended;
+    if (EndedRoot == Root &&
+        (EndedPath.empty() ||
+         (EndedObject == Object && EndedPath.size() <= Path.size() &&
+          std::equal(EndedPath.begin(), EndedPath.end(), Path.begin()))))
+      return false;
+    if (Destroy->isZero())
+      return true;
+    // A sibling with no original destructor has no cleanup in this proof:
+    // any replacement after the containing object's birth blocks the walk.
+    return EndedRoot == Root && !EndedPath.empty() &&
+           llvm::isa<llvm::ConstantPointerNull>(
+               llvm::cast<llvm::CallBase>(Slot)->getArgOperand(3));
+  }
+
   bool initializedWithoutRetirement(llvm::CallBase &Use,
-                                    llvm::Value *Registration,
-                                    llvm::Value *Object) const {
+                                    const StorageRegistration &Target) const {
+    const auto &[Registration, Object, Path] = Target;
     struct Position {
       llvm::BasicBlock *Block;
       llvm::BasicBlock::iterator Cursor;
     };
     llvm::SmallVector<Position> Work{{Use.getParent(), Use.getIterator()}};
     llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    llvm::SmallPtrSet<llvm::Function *, 8> Visiting, Verified;
     unsigned Budget = 2048;
     bool Initialized = false;
     while (!Work.empty()) {
@@ -1188,25 +1253,17 @@ class EscapeCheck {
         if (!Budget--)
           return false;
         auto *Call = llvm::dyn_cast<llvm::CallBase>(&*--Cursor);
-        if (!Call || Call->onlyReadsMemory())
+        if (!Call)
           continue;
         auto *F = Call->getCalledFunction();
-        if (!F)
-          return false;
-        auto Name = F->getName();
-        if (Name == "cpn.slot.begin" &&
+        if (F && F->getName() == "cpn.slot.begin" &&
             Call->getArgOperand(0) == Registration &&
             Call->getArgOperand(1) == Object) {
           Initialized = AtBirth = true;
           break;
         }
-        // These operations may update internal tables. They do not end a
-        // generation or invoke a source-level cleanup operation.
-        if (Name != "cpn.slot.begin" && Name != "cpn.slot.link" &&
-            Name != "cpn.slot.child" && Name != "cpn.slot.find" &&
-            Name != "cpn.slot.linked" && Name != "cpn.generation" &&
-            Name != "cpn.borrow.valid" && Name != "cpn.extent.valid" &&
-            Name != "cpn.pointer.field")
+        if (!retiresOnlyOtherStorage(*Call, Target) &&
+            !preservesStorageGeneration(*Call, Visiting, Verified, Budget))
           return false;
       }
       if (AtBirth)
@@ -1269,7 +1326,7 @@ class EscapeCheck {
                    "storage view designates an ended containing generation");
           }
           if (Construct && llvm::isa<llvm::AllocaInst>(Parent) &&
-              initializedWithoutRetirement(*Use, Parent, Object))
+              initializedWithoutRetirement(*Use, *Key))
             fail(Source, "storage contains a live generation");
         }
         continue;
@@ -1585,8 +1642,12 @@ void Context::checkBorrowEscapes() {
     for (auto &I : llvm::make_early_inc_range(llvm::instructions(F))) {
       if (I.getMetadata(TemporaryEnd))
         I.eraseFromParent();
-      else
+      else {
         I.setMetadata(BorrowMetadata, nullptr);
+        I.setMetadata(CheckedStorageUse, nullptr);
+        I.setMetadata(ConstructStorageUse, nullptr);
+        I.setMetadata(ExtentStorageUse, nullptr);
+      }
     }
   for (auto &F : llvm::make_early_inc_range(M))
     if (F.getIntrinsicID() == llvm::Intrinsic::lifetime_end && F.use_empty())

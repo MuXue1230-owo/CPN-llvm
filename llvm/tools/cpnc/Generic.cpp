@@ -116,12 +116,14 @@ struct PackExpansion {
 
 void unexpandedNames(StringRef Text, llvm::function_ref<void(StringRef)> Use) {
   auto Words = [&](StringRef S) {
+    const auto *Begin = S.data();
     while (!S.empty()) {
       if (S.front() == '\'' || S.front() == '"')
         S = S.drop_front(quotedSpelling(S).size());
       else if (identifierByte(S.front())) {
         auto Name = S.take_while(identifierByte);
-        Use(Name);
+        if (S.data() - Begin < 2 || StringRef(S.data() - 2, 2) != "::")
+          Use(Name);
         S = S.drop_front(Name.size());
       } else
         S = S.drop_front();
@@ -146,7 +148,7 @@ void unexpandedNames(StringRef Text, llvm::function_ref<void(StringRef)> Use) {
 }
 
 void unexpandedNames(const Node &N, llvm::function_ref<void(StringRef)> Use) {
-  if (N.K != Node::Parameter)
+  if (N.K != Node::Parameter && N.K != Node::Member)
     unexpandedNames(N.Text, Use);
   unexpandedNames(N.Type, Use);
   for (const auto &C : N.Children)
@@ -155,6 +157,13 @@ void unexpandedNames(const Node &N, llvm::function_ref<void(StringRef)> Use) {
   for (const auto &A : N.TemplateArgs)
     if (!A.Pack)
       unexpandedNames(A, Use);
+}
+
+template <typename Pattern>
+bool usesPack(const Pattern &P, llvm::function_ref<bool(StringRef)> IsPack) {
+  bool Found = false;
+  unexpandedNames(P, [&](StringRef Name) { Found = Found || IsPack(Name); });
+  return Found;
 }
 
 template <typename Operand>
@@ -1144,6 +1153,37 @@ PatternMatch compareSpecializationHeads(Frame &F, const Family &General,
   return Outcome;
 }
 } // namespace
+bool cpn::containsUnexpandedPack(
+    const Node &Pattern, llvm::function_ref<bool(llvm::StringRef)> IsPack) {
+  return usesPack(Pattern, IsPack);
+}
+bool cpn::containsUnexpandedPack(
+    llvm::StringRef Pattern, llvm::function_ref<bool(llvm::StringRef)> IsPack) {
+  return usesPack(Pattern, IsPack);
+}
+
+void cpn::validateTypePackExpansions(
+    llvm::StringRef Type, const Token &At,
+    llvm::function_ref<bool(llvm::StringRef)> IsPack) {
+  if (!Type.contains("..."))
+    return;
+  auto Open = Type.find('<');
+  auto Close = Open == StringRef::npos ? StringRef::npos : angleEnd(Type, Open);
+  if (Close == StringRef::npos)
+    return;
+  auto Callable = splitCallableType(Type.take_front(Close + 1));
+  if (Callable)
+    validateTypePackExpansions(Callable->Result, At, IsPack);
+  auto List = Callable ? Callable->Parameters : Type.slice(Open + 1, Close);
+  for (const auto &Spelling : splitArguments(List)) {
+    StringRef Argument = Spelling;
+    if (Argument.consume_back("...") && !usesPack(Argument, IsPack))
+      fail(At, "pack expansion requires an unexpanded pack binding");
+    validateTypePackExpansions(Argument, At, IsPack);
+  }
+  validateTypePackExpansions(Type.drop_front(Close + 1), At, IsPack);
+}
+
 std::string cpn::rebindTypeNames(llvm::StringRef Text, const Node &Old,
                                  const Node &New) {
   return substituteBinders(Text, Old, &New);

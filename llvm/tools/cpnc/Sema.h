@@ -442,6 +442,12 @@ std::optional<CallableTypeParts> splitCallableType(llvm::StringRef);
 bool sameGenericSignature(const Node &, const Node &);
 bool sameGenericResult(const Node &, const Node &);
 bool sameGenericValueContracts(const Node &, const Node &);
+bool containsUnexpandedPack(const Node &,
+                            llvm::function_ref<bool(llvm::StringRef)>);
+bool containsUnexpandedPack(llvm::StringRef,
+                            llvm::function_ref<bool(llvm::StringRef)>);
+void validateTypePackExpansions(llvm::StringRef, const Token &,
+                                llvm::function_ref<bool(llvm::StringRef)>);
 std::optional<std::vector<size_t>>
 matchOwnerBinders(llvm::ArrayRef<Node> Pattern, llvm::ArrayRef<Node> Arguments,
                   llvm::ArrayRef<Node> Formals, llvm::ArrayRef<Node> Binders,

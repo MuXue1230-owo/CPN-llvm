@@ -16,6 +16,7 @@ struct Binding {
     ValueParameter
   } K = Object;
   NominalType Type;
+  bool Pack = false;
 };
 using Scope = std::map<std::string, Binding>;
 using Path = std::vector<const Node *>;
@@ -34,6 +35,35 @@ struct Check {
   std::string Prefix, Owner;
   Scope Names;
   const Node *SyntaxOwner = nullptr;
+  const Substitution *Captured = nullptr;
+
+  bool isPack(llvm::StringRef Name) const {
+    auto Key = Name.str();
+    if (auto I = Names.find(Key); I != Names.end())
+      return I->second.Pack;
+    if (Captured && Captured->PackLengths.count(Key))
+      return true;
+    auto Enclosing =
+        Owner.empty() ? llvm::StringRef(Prefix).rtrim(':').str() : Owner;
+    if (auto I = U.Records.find(Enclosing);
+        I != U.Records.end() && I->second.Env.PackLengths.count(Key))
+      return true;
+    return SyntaxOwner &&
+           llvm::any_of(SyntaxOwner->Generics, [&](const Node &G) {
+             return G.Pack && G.Text == Name;
+           });
+  }
+
+  template <typename Operand>
+  bool referencesPack(const Operand &Pattern) const {
+    return containsUnexpandedPack(
+        Pattern, [&](llvm::StringRef Name) { return isPack(Name); });
+  }
+
+  void typePacks(llvm::StringRef Type, const Token &At) const {
+    validateTypePackExpansions(
+        Type, At, [&](llvm::StringRef Name) { return isPack(Name); });
+  }
 
   bool known(const std::string &S) const {
     static const std::set<std::string> Intrinsics = {"std::move",
@@ -218,24 +248,30 @@ struct Check {
   }
 
   void generic(const Node &G) {
+    typePacks(G.Type, G.At);
     for (const auto &Default : G.Children)
       visit(Default, true);
     Names[G.Text] = {G.K == Node::TypeParam ? Binding::TypeParameter
                                             : Binding::ValueParameter,
-                     nominalType(G.Type)};
+                     nominalType(G.Type), G.Pack};
   }
 
   void parameters(const std::vector<Node> &Params) {
     for (const auto &P : Params) {
+      typePacks(P.Type, P.At);
+      if (P.Pack && !referencesPack(P.Type))
+        fail(P.At, "parameter expansion requires a generic pack in its type");
       for (const auto &Default : P.Children)
         visit(Default, true);
       if (!P.Text.empty())
-        Names[P.Text] = {Binding::Object, nominalType(P.Type)};
+        Names[P.Text] = {Binding::Object, nominalType(P.Type), P.Pack};
     }
   }
 
   void members(const Node &N) {
     llvm::SaveAndRestore RecordScope(SyntaxOwner, &N);
+    for (const auto &Base : N.TemplateArgs)
+      typePacks(Base.Type, Base.At);
     for (const auto &Member : N.Children) {
       llvm::SaveAndRestore MemberScope(Names);
       if (nominalRecord(Member)) {
@@ -244,6 +280,7 @@ struct Check {
       }
       for (const auto &G : Member.Generics)
         generic(G);
+      typePacks(Member.Type, Member.At);
       if (callable(Member))
         parameters(Member.Params);
       for (const auto &Condition : Member.TemplateArgs)
@@ -254,6 +291,11 @@ struct Check {
   }
 
   void visit(const Node &N, bool Bind) {
+    if (N.Pack && !referencesPack(N))
+      fail(N.At, "pack expansion requires an unexpanded pack binding");
+    typePacks(N.Type, N.At);
+    if (N.K == Node::Name)
+      typePacks(N.Text, N.At);
     const auto &A = N.Children;
     Bind |= N.K == Node::If && N.Required;
     if (N.K == Node::Lambda) {
@@ -324,7 +366,7 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
                                const std::string &Owner,
                                const Node *FamilyOwner,
                                const Substitution *Captured) {
-  Check Ch{*this, P, Owner, {}, FamilyOwner};
+  Check Ch{*this, P, Owner, {}, FamilyOwner, Captured};
   if (Captured) {
     for (const auto &[Name, Type] : Captured->Types)
       Ch.Names[Name] = {Binding::Alias, Ch.nominalType(Type)};
@@ -360,10 +402,8 @@ JumpCleanups Context::validate(const Node &N, const std::string &P,
     }
     Ch.generic(G);
   }
+  Ch.typePacks(N.Type, N.At);
   for (auto &Arg : N.Params) {
-    bool HasPack = !N.Generics.empty() && N.Generics.back().Pack;
-    if (Arg.Pack && !HasPack)
-      fail(Arg.At, "parameter expansion requires a generic pack");
     if (llvm::StringRef(Arg.Type).starts_with("forward ") &&
         llvm::none_of(N.Generics, [&](auto &G) {
           return G.K == Node::TypeParam && G.Text == Arg.Type.substr(8);
