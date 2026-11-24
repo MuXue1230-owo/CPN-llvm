@@ -1513,9 +1513,20 @@ Value Frame::invoke(Function &D, std::vector<Value> Actual, const Token &T,
     Target = B.CreateLoad(B.getPtrTy(), Slot);
   }
   auto Metadata = openPointerCall(Target, D.Result, D.Params, Cells);
-  auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values);
   unsigned ABIHeaders =
       (ResultStorage != nullptr) + (!D.Owner.empty() && !D.isStatic());
+  llvm::SmallVector<llvm::Value *, 4> StorageArguments;
+  if (TracksStorage && !D.Decl.Foreign && llvm::isa<llvm::Function>(Target))
+    for (auto [I, Ty] : llvm::enumerate(D.Params))
+      if (ends(Ty, "&"))
+        if (auto *Registration = Cells[I].objectDesignation().Slot) {
+          StorageArguments.push_back(B.getInt32(ABIHeaders + I));
+          StorageArguments.push_back(Registration);
+        }
+  llvm::SmallVector<llvm::OperandBundleDef, 1> Bundles;
+  if (!StorageArguments.empty())
+    Bundles.emplace_back(StorageArgumentBundle, StorageArguments);
+  auto *Call = B.CreateCall(D.IR->getFunctionType(), Target, Values, Bundles);
   bool MayWriteCallStorage =
       ResultStorage || D.MayWhole || !D.Consumes.empty() ||
       llvm::any_of(D.Params,

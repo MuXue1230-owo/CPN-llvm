@@ -7523,6 +7523,35 @@ class CompilerTests(unittest.TestCase):
                 self.assertEqual(checked.returncode, 1, checked.stderr)
                 self.assertIn("ended object generation", checked.stderr)
         self.assertEqual(self.program(nested.replace("EXPR", "box.items[1]")), 42)
+        helper = """
+            void finish(i32& value,bool flag){
+                if(flag){destroy(value);}else{abandon(value);}
+            }
+            void forward_finish(i32& value,bool flag){finish(value,flag);}
+            i32 read(bool flag){
+                i32[2] values(1,42);
+                CALL(values[0],flag);
+                return EXPR;
+            }
+            i32 main(){return read(false);}
+        """
+        for callee in ("finish", "forward_finish"):
+            checked = self.compile(
+                helper.replace("CALL", callee).replace("EXPR", "values[0]"),
+                "--check",
+            )
+            self.assertEqual(checked.returncode, 1, checked.stderr)
+            self.assertIn("ended object generation", checked.stderr)
+        helper = helper.replace("CALL", "forward_finish")
+        self.assertEqual(self.program(helper.replace("EXPR", "values[1]")), 42)
+        conditional_helper = helper.replace("else{abandon(value);}", "")
+        conditional_helper = conditional_helper.replace("values(1,42)", "values(42,1)")
+        conditional_helper = conditional_helper.replace("EXPR", "values[0]")
+        self.assertEqual(self.program(conditional_helper), 42)
+        self.assertEqual(
+            self.program(conditional_helper.replace("read(false)", "read(true)")),
+            -signal.SIGILL,
+        )
 
     def test_storage_view_after_ending_complete_object(self):
         self.assertEqual(

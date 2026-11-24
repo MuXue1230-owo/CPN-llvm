@@ -1279,9 +1279,68 @@ class EscapeCheck {
     return Initialized;
   }
 
+  using ReferenceRetirementCache =
+      std::map<std::pair<llvm::Function *, unsigned>, bool>;
+
+  bool retiresReferenceOnReturn(llvm::Function &F, unsigned Argument,
+                                ReferenceRetirementCache &Cache,
+                                unsigned &Budget) const {
+    // A recursive edge supplies no independent proof of retirement.
+    auto [Summary, First] = Cache.try_emplace({&F, Argument}, false);
+    if (!First)
+      return Summary->second;
+    llvm::SmallVector<llvm::BasicBlock *> Work{&F.getEntryBlock()};
+    llvm::SmallPtrSet<llvm::BasicBlock *, 16> Visited;
+    bool Retired = false;
+    while (!Work.empty()) {
+      auto *BB = Work.pop_back_val();
+      if (!Visited.insert(BB).second)
+        continue;
+      bool Ends = false;
+      for (const auto &I : *BB) {
+        if (!Budget || llvm::isa<llvm::ReturnInst>(I))
+          return false;
+        --Budget;
+        if (const auto *Reference = I.getMetadata(RetiredReference);
+            Reference && callSetting(*Reference, 0) == Argument) {
+          Retired = Ends = true;
+          break;
+        }
+        auto *Forward = llvm::dyn_cast<llvm::CallBase>(&I);
+        auto *Callee = Forward ? Forward->getCalledFunction() : nullptr;
+        if (!Callee || !Definitions.contains(Callee))
+          continue;
+        auto Bundle = Forward->getOperandBundle(StorageArgumentBundle);
+        if (!Bundle)
+          continue;
+        for (size_t J = 0; J < Bundle->Inputs.size(); J += 2) {
+          unsigned Position =
+              llvm::cast<llvm::ConstantInt>(Bundle->Inputs[J].get())
+                  ->getZExtValue();
+          if (Forward->getArgOperand(Position) == F.getArg(Argument) &&
+              retiresReferenceOnReturn(*Callee, Position, Cache, Budget)) {
+            Retired = Ends = true;
+            break;
+          }
+        }
+        if (Ends)
+          break;
+      }
+      if (Ends)
+        continue;
+      if (auto *Next = successor(BB))
+        Work.push_back(Next);
+      else
+        llvm::append_range(Work, llvm::successors(BB));
+    }
+    Summary->second = Retired;
+    return Retired;
+  }
+
   void verifyCheckedStorage(const Token &At) const {
     llvm::SmallVector<llvm::CallBase *> Uses;
     RetirementsByStorage Retirements;
+    ReferenceRetirementCache ReferenceRetirements;
     for (auto &BB : Root)
       if (Reachable.contains(&BB))
         for (auto &I : BB) {
@@ -1296,6 +1355,22 @@ class EscapeCheck {
               F && F->getName() == "cpn.slot.retire")
             if (auto Key = storageRegistration(Call->getArgOperand(0)))
               Retirements[*Key].push_back(Call);
+          auto Bundle = Call->getOperandBundle(StorageArgumentBundle);
+          auto *F = Call->getCalledFunction();
+          if (!Bundle || !F || !Definitions.contains(F))
+            continue;
+          for (size_t I = 0; I < Bundle->Inputs.size(); I += 2) {
+            auto Key = storageRegistration(Bundle->Inputs[I + 1].get());
+            if (!Key || !llvm::isa<llvm::AllocaInst>(std::get<0>(*Key)))
+              continue;
+            unsigned Argument =
+                llvm::cast<llvm::ConstantInt>(Bundle->Inputs[I].get())
+                    ->getZExtValue();
+            unsigned Budget = 2048;
+            if (retiresReferenceOnReturn(*F, Argument, ReferenceRetirements,
+                                         Budget))
+              Retirements[*Key].push_back(Call);
+          }
         }
     if (Uses.empty())
       return;
@@ -1647,6 +1722,15 @@ void Context::checkBorrowEscapes() {
         I.setMetadata(CheckedStorageUse, nullptr);
         I.setMetadata(ConstructStorageUse, nullptr);
         I.setMetadata(ExtentStorageUse, nullptr);
+        I.setMetadata(RetiredReference, nullptr);
+        if (auto *Call = llvm::dyn_cast<llvm::CallBase>(&I))
+          if (auto Bundle = Call->getOperandBundle(StorageArgumentBundle)) {
+            auto *Native = llvm::CallBase::removeOperandBundle(
+                Call, Bundle->getTagID(), Call->getIterator());
+            Native->takeName(Call);
+            Call->replaceAllUsesWith(Native);
+            Call->eraseFromParent();
+          }
       }
     }
   for (auto &F : llvm::make_early_inc_range(M))

@@ -931,11 +931,20 @@ void Context::checkEffects() {
           auto *Native = llvm::CallBase::removeOperandBundle(
               Call, Descriptor->getTagID(), Call->getIterator());
           if (Descriptor->getTagName() == StorageRetire &&
-              llvm::isa<llvm::GlobalVariable>(Call->getArgOperand(0)) &&
               llvm::cast<llvm::ConstantInt>(Descriptor->Inputs[2].get())
-                  ->isOne())
-            Native->setMetadata("cpn.storage.original.retire",
-                                llvm::MDNode::get(M.getContext(), {}));
+                  ->isOne()) {
+            if (llvm::isa<llvm::GlobalVariable>(Call->getArgOperand(0)))
+              Native->setMetadata("cpn.storage.original.retire",
+                                  llvm::MDNode::get(M.getContext(), {}));
+            if (auto *Reference = llvm::dyn_cast<llvm::Argument>(
+                    Descriptor->Inputs.front().get()))
+              Native->setMetadata(
+                  RetiredReference,
+                  llvm::MDNode::get(
+                      C,
+                      llvm::ConstantAsMetadata::get(llvm::ConstantInt::get(
+                          llvm::Type::getInt32Ty(C), Reference->getArgNo()))));
+          }
           Native->takeName(Call);
           Call->replaceAllUsesWith(Native);
           Call->eraseFromParent();

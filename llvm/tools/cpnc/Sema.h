@@ -9,6 +9,8 @@
 namespace cpn {
 inline constexpr char StorageViewType[] = "$cpn.storage";
 inline constexpr char StorageIdentityType[] = "$cpn.storage_identity";
+inline constexpr char StorageArgumentBundle[] = "cpn.storage.arguments";
+inline constexpr char RetiredReference[] = "cpn.storage.reference.retire";
 inline bool memoryIdentity(llvm::StringRef T) {
   return T == StorageIdentityType;
 }
